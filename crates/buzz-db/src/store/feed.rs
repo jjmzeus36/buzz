@@ -1178,15 +1178,10 @@ mod postgres_tests {
         let tags: Vec<Tag> = (1..=mention_count)
             .map(|n| Tag::parse(["p", &format!("{n:064x}"), "", "member"]).expect("p tag"))
             .collect();
-        let event = store_feed_event(
-            &pool,
-            community,
-            KIND_STREAM_MESSAGE,
-            "",
-            Some(channel),
-            tags,
-        )
-        .await;
+        // Direct-DB non-kind-9 fixture: bulk mention batching past the bind
+        // cap. Kind 9 remains capped at 64 p-tags.
+        let event =
+            store_feed_event(&pool, community, KIND_TEXT_NOTE, "", Some(channel), tags).await;
 
         let indexed: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM event_mentions WHERE community_id = $1 AND event_id = $2",

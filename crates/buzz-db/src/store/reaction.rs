@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     error::Result,
-    event::{insert_event_with_thread_metadata_tx, ThreadMetadataParams},
+    event::{insert_event_with_thread_metadata_already_validated, ThreadMetadataParams},
     Db,
 };
 use buzz_core::{CommunityId, StoredEvent};
@@ -178,6 +178,7 @@ pub async fn insert_reaction_event_with_thread_metadata(
     actor_pubkey: &[u8],
     emoji: &str,
 ) -> Result<ReactionEventInsertOutcome> {
+    let enforced = crate::runtime::enforce_kind9_p_tag_limit(reaction_event)?;
     let connection = crate::observability::acquire_writer(
         pool,
         crate::observability::WriterOperation::EventWrite,
@@ -218,14 +219,20 @@ pub async fn insert_reaction_event_with_thread_metadata(
         return Ok(ReactionEventInsertOutcome::Duplicate);
     }
 
-    let (stored_event, was_inserted) = insert_event_with_thread_metadata_tx(
+    let (stored_event, was_inserted) = insert_event_with_thread_metadata_already_validated(
         &mut tx,
         community_id,
         reaction_event,
         channel_id,
         thread_meta,
+        enforced,
     )
     .await?;
+
+    if was_inserted {
+        crate::insert_mentions_in_transaction(&mut tx, community_id, reaction_event, channel_id)
+            .await?;
+    }
 
     tx.commit().await?;
 
@@ -567,7 +574,7 @@ impl Db {
         actor_pubkey: &[u8],
         emoji: &str,
     ) -> Result<ReactionEventInsertOutcome> {
-        let outcome = crate::reaction::insert_reaction_event_with_thread_metadata(
+        crate::reaction::insert_reaction_event_with_thread_metadata(
             &self.pool,
             community_id,
             event,
@@ -577,18 +584,7 @@ impl Db {
             actor_pubkey,
             emoji,
         )
-        .await?;
-        if let ReactionEventInsertOutcome::Inserted {
-            was_inserted: true, ..
-        } = &outcome
-        {
-            if let Err(e) =
-                crate::insert_mentions(&self.pool, community_id, event, channel_id).await
-            {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-            }
-        }
-        Ok(outcome)
+        .await
     }
 
     /// Add (or re-activate) a reaction.
@@ -735,14 +731,8 @@ mod postgres_tests {
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
-
     async fn setup_pool() -> PgPool {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
-
-        PgPool::connect(&database_url)
+        PgPool::connect(&crate::test_support::database_url())
             .await
             .expect("connect to test DB")
     }
@@ -1085,7 +1075,7 @@ mod postgres_tests {
                 event_created_at,
                 &pubkey,
                 emoji,
-                None
+                None,
             )
             .await
             .expect("add reaction under A"),
@@ -1099,7 +1089,7 @@ mod postgres_tests {
                 event_created_at,
                 &pubkey,
                 emoji,
-                None
+                None,
             )
             .await
             .expect("duplicate reaction under A"),
@@ -1148,7 +1138,7 @@ mod postgres_tests {
                 event_created_at,
                 &pubkey,
                 emoji,
-                None
+                None,
             )
             .await
             .expect("add reaction under B"),
@@ -1185,5 +1175,245 @@ mod postgres_tests {
             groups_a_after.is_empty(),
             "A's reaction must be gone after A removes it"
         );
+    }
+
+    fn mention_hex(n: u16) -> String {
+        format!("{n:064x}")
+    }
+
+    fn make_reaction_event_with_p(
+        keys: &Keys,
+        target_id_hex: &str,
+        emoji: &str,
+        p_hex: &str,
+    ) -> nostr::Event {
+        let nonce = Uuid::new_v4().to_string();
+        EventBuilder::new(Kind::Custom(7), emoji)
+            .tags(vec![
+                Tag::parse(["e", target_id_hex]).expect("reaction e tag"),
+                Tag::parse(["p", p_hex]).expect("reaction p tag"),
+                Tag::parse(["nonce", nonce.as_str()]).expect("nonce tag"),
+            ])
+            .sign_with_keys(keys)
+            .expect("sign reaction event")
+    }
+
+    async fn install_community_mention_insert_failure(
+        pool: &PgPool,
+        community: Uuid,
+    ) -> (String, String) {
+        let suffix = community.simple().to_string();
+        let fn_name = format!("buzz_fail_reaction_mentions_{suffix}");
+        let trig_name = format!("buzz_fail_reaction_mentions_{suffix}");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE FUNCTION {fn_name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced mention insertion failure' USING ERRCODE = 'integrity_constraint_violation'; END; $$"
+        )))
+        .execute(pool)
+        .await
+        .expect("create mention-fail function");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER {trig_name} BEFORE INSERT ON event_mentions FOR EACH ROW WHEN (NEW.community_id = '{community}') EXECUTE FUNCTION {fn_name}()"
+        )))
+        .execute(pool)
+        .await
+        .expect("create mention-fail trigger");
+        (fn_name, trig_name)
+    }
+
+    async fn uninstall_community_mention_insert_failure(
+        pool: &PgPool,
+        trig_name: &str,
+        fn_name: &str,
+    ) {
+        let drop_trigger = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER IF EXISTS {trig_name} ON event_mentions"
+        )))
+        .execute(pool)
+        .await;
+        let drop_function = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP FUNCTION IF EXISTS {fn_name}()"
+        )))
+        .execute(pool)
+        .await;
+        match (drop_trigger, drop_function) {
+            (Ok(_), Ok(_)) => {}
+            (trigger, function) => {
+                panic!("mention-fail cleanup failed: trigger={trigger:?} function={function:?}");
+            }
+        }
+    }
+
+    async fn reaction_mention_count(pool: &PgPool, community: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM event_mentions WHERE community_id = $1")
+            .bind(community)
+            .fetch_one(pool)
+            .await
+            .expect("count mentions")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn reaction_mention_failure_rolls_back_coupled_state() {
+        let pool = setup_pool().await;
+        let db = Db::from_pool(pool.clone());
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let target = make_text_event("reaction mention target");
+        insert_event(&pool, community, &target, None)
+            .await
+            .expect("insert target");
+        let actor = Keys::generate();
+        let actor_pubkey = actor.public_key().to_bytes();
+        let p_hex = mention_hex(7);
+        let reaction = make_reaction_event_with_p(&actor, &target.id.to_hex(), "👍", &p_hex);
+        let target_created_at = DateTime::from_timestamp(target.created_at.as_secs() as i64, 0)
+            .expect("target timestamp");
+        let (fn_name, trig_name) =
+            install_community_mention_insert_failure(&pool, community_uuid).await;
+        let result = db
+            .insert_reaction_event_with_thread_metadata(
+                community,
+                &reaction,
+                None,
+                None,
+                target.id.as_bytes(),
+                &actor_pubkey,
+                "👍",
+            )
+            .await;
+        uninstall_community_mention_insert_failure(&pool, &trig_name, &fn_name).await;
+        result.expect_err("mention failure must fail the reaction writer");
+        assert!(
+            get_event_by_id(&pool, community, reaction.id.as_bytes())
+                .await
+                .expect("lookup reaction event")
+                .is_none(),
+            "reaction event must roll back with mention failure"
+        );
+        assert!(
+            crate::reaction::get_active_reaction_record(
+                &pool,
+                community,
+                target.id.as_bytes(),
+                target_created_at,
+                &actor_pubkey,
+                "👍",
+            )
+            .await
+            .expect("lookup reaction row")
+            .is_none(),
+            "reaction row must roll back with mention failure"
+        );
+        assert_eq!(reaction_mention_count(&pool, community_uuid).await, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn reaction_mention_retry_succeeds_after_trigger_removed() {
+        let pool = setup_pool().await;
+        let db = Db::from_pool(pool.clone());
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let target = make_text_event("reaction retry target");
+        insert_event(&pool, community, &target, None)
+            .await
+            .expect("insert target");
+        let actor = Keys::generate();
+        let actor_pubkey = actor.public_key().to_bytes();
+        let p_hex = mention_hex(8);
+        let reaction = make_reaction_event_with_p(&actor, &target.id.to_hex(), "👍", &p_hex);
+        let (fn_name, trig_name) =
+            install_community_mention_insert_failure(&pool, community_uuid).await;
+        let failed = db
+            .insert_reaction_event_with_thread_metadata(
+                community,
+                &reaction,
+                None,
+                None,
+                target.id.as_bytes(),
+                &actor_pubkey,
+                "👍",
+            )
+            .await;
+        uninstall_community_mention_insert_failure(&pool, &trig_name, &fn_name).await;
+        failed.expect_err("trigger must reject the first reaction write");
+        let outcome = db
+            .insert_reaction_event_with_thread_metadata(
+                community,
+                &reaction,
+                None,
+                None,
+                target.id.as_bytes(),
+                &actor_pubkey,
+                "👍",
+            )
+            .await
+            .expect("retry after trigger removal");
+        assert!(matches!(
+            outcome,
+            ReactionEventInsertOutcome::Inserted {
+                was_inserted: true,
+                ..
+            }
+        ));
+        assert_eq!(reaction_mention_count(&pool, community_uuid).await, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn reaction_mention_duplicate_does_not_rerun_mention_insert() {
+        let pool = setup_pool().await;
+        let db = Db::from_pool(pool.clone());
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let target = make_text_event("reaction duplicate target");
+        insert_event(&pool, community, &target, None)
+            .await
+            .expect("insert target");
+        let actor = Keys::generate();
+        let actor_pubkey = actor.public_key().to_bytes();
+        let p_hex = mention_hex(9);
+        let first = make_reaction_event_with_p(&actor, &target.id.to_hex(), "👍", &p_hex);
+        let second = make_reaction_event_with_p(&actor, &target.id.to_hex(), "👍", &p_hex);
+        assert!(matches!(
+            db.insert_reaction_event_with_thread_metadata(
+                community,
+                &first,
+                None,
+                None,
+                target.id.as_bytes(),
+                &actor_pubkey,
+                "👍",
+            )
+            .await
+            .expect("first reaction"),
+            ReactionEventInsertOutcome::Inserted {
+                was_inserted: true,
+                ..
+            }
+        ));
+        let (fn_name, trig_name) =
+            install_community_mention_insert_failure(&pool, community_uuid).await;
+        let result = db
+            .insert_reaction_event_with_thread_metadata(
+                community,
+                &second,
+                None,
+                None,
+                target.id.as_bytes(),
+                &actor_pubkey,
+                "👍",
+            )
+            .await;
+        uninstall_community_mention_insert_failure(&pool, &trig_name, &fn_name).await;
+        assert!(matches!(
+            result.expect("active duplicate must short-circuit before mention insert"),
+            ReactionEventInsertOutcome::Duplicate
+        ));
+        assert_eq!(reaction_mention_count(&pool, community_uuid).await, 1);
+        assert!(get_event_by_id(&pool, community, second.id.as_bytes())
+            .await
+            .expect("lookup duplicate reaction event")
+            .is_none());
     }
 }

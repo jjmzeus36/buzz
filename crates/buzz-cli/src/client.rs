@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag};
 use sha2::{Digest, Sha256};
 
@@ -75,6 +76,53 @@ const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 /// Maximum file size for video uploads (500 MB).
 const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
 
+/// Inclusive byte ceiling for NIP-11 public-metadata reads.
+///
+/// A document of exactly this size is accepted. A declared `Content-Length`
+/// greater than this value is rejected before any body bytes are read. When
+/// length is missing, chunked, or dishonest, reads stop at the first chunk
+/// that would pass this ceiling.
+pub const NIP11_PUBLIC_METADATA_MAX_BYTES: usize = 64 * 1024;
+
+/// Inclusive byte ceiling for keyed POST /events response bodies.
+///
+/// A body of exactly this size is accepted. A declared `Content-Length`
+/// greater than this value is rejected before any body bytes are read. When
+/// length is missing, chunked, or dishonest, reads stop at the first chunk
+/// that would pass this ceiling. Used only by keyed POST /events responses.
+pub const KEYED_RESPONSE_MAX_BYTES: usize = 64 * 1024;
+
+/// Fixed non-success text for the keyed NIP-11 preflight.
+///
+/// In-bound error bodies are discarded so a hostile relay cannot echo
+/// attacker-controlled text through [`CliError`] Display, Debug, or
+/// structured JSON.
+const BOUNDED_PUBLIC_METADATA_ERROR: &str = "public metadata request failed";
+
+fn public_metadata_oversize(limit: usize) -> CliError {
+    CliError::PublicMetadataTooLarge { limit }
+}
+
+fn declared_public_metadata_too_large(content_length: Option<u64>, limit: usize) -> bool {
+    content_length.is_some_and(|len| len > limit as u64)
+}
+
+fn public_metadata_chunk_exceeds_limit(current: usize, chunk_len: usize, limit: usize) -> bool {
+    current.saturating_add(chunk_len) > limit
+}
+
+fn keyed_response_oversize(limit: usize) -> CliError {
+    CliError::KeyedResponseTooLarge { limit }
+}
+
+fn declared_keyed_response_too_large(content_length: Option<u64>, limit: usize) -> bool {
+    content_length.is_some_and(|len| len > limit as u64)
+}
+
+fn keyed_response_chunk_exceeds_limit(current: usize, chunk_len: usize, limit: usize) -> bool {
+    current.saturating_add(chunk_len) > limit
+}
+
 /// Sign a NIP-98 HTTP auth event (kind:27235) and return the Authorization header value.
 ///
 /// The event includes:
@@ -121,6 +169,14 @@ fn relay_server_tag(relay_url: &str) -> Option<String> {
 /// Maximum number of attempts per request (initial attempt + two retries).
 const RETRY_MAX_ATTEMPTS: u32 = 3;
 
+/// Keyed stored-event POST attempts (initial attempt + three retries).
+///
+/// Three consecutive `Retry-After: 5` responses reach the 15-second legal
+/// writer-capacity window on the fourth attempt, still inside the 90-second
+/// keyed operation deadline. Generic (non-keyed) operations keep
+/// [`RETRY_MAX_ATTEMPTS`].
+const KEYED_RETRY_MAX_ATTEMPTS: u32 = 4;
+
 /// Base sleep durations for full-jitter exponential backoff.
 /// `RETRY_BASE_SECS[i]` is the ceiling for attempt `i` before attempt `i+1`.
 const RETRY_BASE_SECS: [f64; 2] = [0.5, 1.5];
@@ -129,9 +185,33 @@ const RETRY_BASE_SECS: [f64; 2] = [0.5, 1.5];
 /// Defensive cap against pathological hints; real relay hints observed up to ~24 s.
 const RETRY_IN_MAX_SECS: u64 = 30;
 
+/// Outer bound for a keyed POST /events operation, including Retry-After waits.
+const KEYED_OPERATION_DEADLINE_SECS: u64 = 90;
+
+/// HTTP `Retry-After` classification for keyed 503 retries.
+///
+/// `Representable` is a nonnegative whole-second wait floor from either
+/// delay-seconds or a GMT HTTP-date converted relative to header-receipt time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryAfterHint {
+    MissingOrMalformed,
+    Representable(u64),
+    Overflow,
+}
+
 /// Returns a full-jitter delay for attempt `i`: a random duration in `[0, RETRY_BASE_SECS[i])`.
 fn jitter_delay(attempt: u32) -> Duration {
     Duration::from_secs_f64(RETRY_BASE_SECS[attempt as usize] * rand::random::<f64>())
+}
+
+/// Full-jitter delay for keyed retries.
+///
+/// Extra keyed attempts reuse the last generic jitter ceiling so they never
+/// index past [`RETRY_BASE_SECS`].
+fn keyed_jitter_delay(attempt: u32) -> Duration {
+    let max_idx = RETRY_BASE_SECS.len().saturating_sub(1);
+    let idx = (attempt as usize).min(max_idx);
+    Duration::from_secs_f64(RETRY_BASE_SECS[idx] * rand::random::<f64>())
 }
 
 /// Read an env var as a `u64` of seconds and return the corresponding `Duration`.
@@ -144,6 +224,231 @@ fn env_duration_secs(name: &str, default: u64) -> Duration {
         .filter(|&n| n > 0)
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(default))
+}
+
+/// Unauthenticated public-read client. Redirects are refused in place so a
+/// NIP-11 preflight cannot be steered at loopback or a private target.
+fn public_no_redirect_client() -> Result<reqwest::Client, CliError> {
+    reqwest::Client::builder()
+        .timeout(env_duration_secs("BUZZ_TIMEOUT_SECS", 30))
+        .connect_timeout(env_duration_secs("BUZZ_CONNECT_TIMEOUT_SECS", 15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| CliError::Other(e.to_string()))
+}
+
+/// Parse an HTTP `Retry-After` value as delay-seconds or HTTP-date.
+///
+/// All-digit delay-seconds are honoured exactly, including values larger
+/// than `u64` ([`RetryAfterHint::Overflow`]). The three HTTP-date forms
+/// clients must understand (IMF-fixdate, obsolete RFC 850, and obsolete
+/// asctime) are interpreted as GMT and converted to a nonnegative
+/// whole-second delay relative to the time the response headers are
+/// received, rounding any positive fractional remainder up so a retry
+/// cannot start before the absolute time. A date at or before now is
+/// [`RetryAfterHint::Representable`] `0`. Empty values and any other
+/// malformed text are [`RetryAfterHint::MissingOrMalformed`] so the caller
+/// can fall back to keyed jitter. Unrepresentable date conversions are
+/// [`RetryAfterHint::Overflow`] and must not retry early.
+fn parse_retry_after_hint(headers: &reqwest::header::HeaderMap) -> RetryAfterHint {
+    parse_retry_after_hint_at(headers, Utc::now())
+}
+
+/// Deterministic `Retry-After` parser against a supplied UTC `now`.
+fn parse_retry_after_hint_at(
+    headers: &reqwest::header::HeaderMap,
+    now: DateTime<Utc>,
+) -> RetryAfterHint {
+    let Some(value) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return RetryAfterHint::MissingOrMalformed;
+    };
+    parse_retry_after_value(value, now)
+}
+
+fn parse_retry_after_value(value: &str, now: DateTime<Utc>) -> RetryAfterHint {
+    if value.is_empty() {
+        return RetryAfterHint::MissingOrMalformed;
+    }
+    if value.bytes().all(|b| b.is_ascii_digit()) {
+        return match value.parse::<u64>() {
+            Ok(secs) => RetryAfterHint::Representable(secs),
+            Err(_) => RetryAfterHint::Overflow,
+        };
+    }
+    match parse_http_date_gmt(value) {
+        Some(when) => http_date_to_retry_after_hint(when, now),
+        None => RetryAfterHint::MissingOrMalformed,
+    }
+}
+
+/// IMF-fixdate, obsolete RFC 850, and obsolete asctime, with GMT semantics.
+fn parse_http_date_gmt(value: &str) -> Option<DateTime<Utc>> {
+    const FORMATS: &[&str] = &[
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%A, %d-%b-%y %H:%M:%S GMT",
+        "%a %b %e %H:%M:%S %Y",
+        "%a %b %_d %H:%M:%S %Y",
+    ];
+    for fmt in FORMATS {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(value, fmt) {
+            return Some(ndt.and_utc());
+        }
+    }
+    None
+}
+
+/// Convert a future HTTP-date to a whole-second delay, ceiling any positive
+/// fraction so the client never retries before the absolute time.
+fn http_date_to_retry_after_hint(when: DateTime<Utc>, now: DateTime<Utc>) -> RetryAfterHint {
+    if when <= now {
+        return RetryAfterHint::Representable(0);
+    }
+    let Ok(delta) = when.signed_duration_since(now).to_std() else {
+        return RetryAfterHint::Overflow;
+    };
+    let mut secs = delta.as_secs();
+    if delta.subsec_nanos() > 0 {
+        match secs.checked_add(1) {
+            Some(ceiled) => secs = ceiled,
+            None => return RetryAfterHint::Overflow,
+        }
+    }
+    RetryAfterHint::Representable(secs)
+}
+
+#[cfg(test)]
+fn parse_retry_after_delta_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    match parse_retry_after_hint(headers) {
+        RetryAfterHint::Representable(secs) => Some(secs),
+        RetryAfterHint::MissingOrMalformed | RetryAfterHint::Overflow => None,
+    }
+}
+
+/// Retry sleeps must strictly fit inside the remaining bound so a deadline
+/// tie cannot start another in-flight request.
+fn delay_strictly_fits(delay: Duration, remaining: Duration) -> bool {
+    delay < remaining
+}
+
+fn keyed_503_retry_delay(
+    hint: RetryAfterHint,
+    jitter: Duration,
+    remaining: Duration,
+) -> Option<Duration> {
+    match hint {
+        RetryAfterHint::MissingOrMalformed => {
+            let delay = delay_from_retry_after_and_jitter(None, jitter)?;
+            delay_strictly_fits(delay, remaining).then_some(delay)
+        }
+        RetryAfterHint::Overflow => None,
+        RetryAfterHint::Representable(secs) => {
+            let delay = delay_from_retry_after_and_jitter(Some(secs), jitter)?;
+            delay_strictly_fits(delay, remaining).then_some(delay)
+        }
+    }
+}
+
+/// Map a keyed 503 after the retry loop cannot start another attempt.
+///
+/// A valid positive representable Retry-After — delay-seconds or a
+/// date-derived whole-second floor — is preserved as
+/// [`CliError::RelayDeferred`] so an outer caller cannot undercut the relay
+/// wait floor, including on the last attempt when no internal delay remains.
+/// `Retry-After: 0` (including an HTTP-date at or before now) has no wait
+/// floor and stays ordinary retryable [`CliError::Relay`]. Missing and
+/// malformed Retry-After keep the original [`CliError::Relay`]. Overflow
+/// Retry-After — an all-digit delay above `u64` or an unrepresentable
+/// HTTP-date conversion — is [`CliError::RelayRetryAfterOverflow`]:
+/// explicitly nonretryable, same relay-error status/body, and no invented
+/// finite wait.
+fn keyed_exhausted_error(error: CliError, retry_after: RetryAfterHint) -> CliError {
+    match (&error, retry_after) {
+        (CliError::Relay { status: 503, body }, RetryAfterHint::Representable(secs))
+            if secs > 0 =>
+        {
+            CliError::RelayDeferred {
+                status: 503,
+                body: body.clone(),
+                retry_after_seconds: secs,
+            }
+        }
+        (CliError::Relay { status: 503, body }, RetryAfterHint::Overflow) => {
+            CliError::RelayRetryAfterOverflow {
+                status: 503,
+                body: body.clone(),
+            }
+        }
+        _ => error,
+    }
+}
+
+/// Classify an already-known keyed error after the operation deadline has
+/// been crossed. In-flight request/body expiry is [`keyed_deadline_unknown`].
+/// A retry-sleep (or remaining-bound) crossing must not invent ambiguity:
+/// keyed 503 with a positive representable Retry-After stays deferred with
+/// that exact floor; keyed 503 with a zero or missing/malformed hint stays
+/// [`CliError::Relay`]; keyed 503 with overflow is
+/// [`CliError::RelayRetryAfterOverflow`]; a definitive connect failure stays
+/// the network error; a transport-uncertain timeout/request/body/decode
+/// outcome is [`CliError::DeliveryUnknown`].
+fn keyed_deadline_after_known_error(
+    error: CliError,
+    retry_after: RetryAfterHint,
+    kind_u16: u16,
+) -> CliError {
+    match &error {
+        CliError::Network(net_err)
+            if !net_err.is_connect()
+                && (net_err.is_timeout()
+                    || net_err.is_request()
+                    || net_err.is_body()
+                    || net_err.is_decode()) =>
+        {
+            keyed_deadline_unknown(kind_u16)
+        }
+        _ => keyed_exhausted_error(error, retry_after),
+    }
+}
+
+fn keyed_deadline_unknown(kind_u16: u16) -> CliError {
+    CliError::DeliveryUnknown(format!(
+        "stored event (kind {kind_u16}) outcome unknown: keyed operation deadline exceeded"
+    ))
+}
+
+/// 301–303/307/308 are returned in place. They are not 503 and must not enter
+/// the keyed retry loop. The message is fixed so a hostile 3xx body is not echoed.
+fn keyed_redirect_refused(status: reqwest::StatusCode) -> Option<CliError> {
+    match status.as_u16() {
+        301 | 302 | 303 | 307 | 308 => Some(CliError::Relay {
+            status: status.as_u16(),
+            body: "redirect refused".into(),
+        }),
+        _ => None,
+    }
+}
+
+/// Combine a valid HTTP `Retry-After` delta with full jitter.
+///
+/// A parsed hint is a floor: the delay is never shorter than that delta.
+/// Bounded nonnegative jitter for the retry attempt is then added. A valid
+/// representable hint is never clipped. If hint + jitter cannot be represented
+/// as a [`Duration`], returns `None` so the caller can surface the 503 without
+/// retrying early. Missing or malformed headers pass `None` for the hint and
+/// keep the jitter-only fallback.
+fn delay_from_retry_after_and_jitter(
+    retry_after: Option<u64>,
+    jitter: Duration,
+) -> Option<Duration> {
+    let max_jitter = Duration::from_secs_f64(RETRY_BASE_SECS.into_iter().fold(0.0_f64, f64::max));
+    let jitter = jitter.min(max_jitter);
+    match retry_after {
+        Some(secs) => Duration::from_secs(secs).checked_add(jitter),
+        None => Some(jitter),
+    }
 }
 
 /// Scan a plain-text string for a `retry in <N>s` pattern and return `N`.
@@ -518,8 +823,149 @@ fn advance_query_cursor(
     Ok(())
 }
 
+async fn read_bounded_public_metadata_body(
+    mut resp: reqwest::Response,
+    limit: usize,
+) -> Result<String, CliError> {
+    if declared_public_metadata_too_large(resp.content_length(), limit) {
+        return Err(public_metadata_oversize(limit));
+    }
+
+    let mut collected = Vec::new();
+    if let Some(declared) = resp.content_length() {
+        collected.reserve(declared as usize);
+    }
+
+    while let Some(chunk) = resp.chunk().await? {
+        if public_metadata_chunk_exceeds_limit(collected.len(), chunk.len(), limit) {
+            return Err(public_metadata_oversize(limit));
+        }
+        collected.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(collected).map_err(|_| CliError::Other("public metadata is not UTF-8".into()))
+}
+
+/// Typed non-success mapping for the keyed NIP-11 preflight.
+///
+/// Preserves HTTP status and the caller-facing family (`Conflict` for 409,
+/// otherwise `Relay`). The message is always [`BOUNDED_PUBLIC_METADATA_ERROR`].
+fn bounded_public_metadata_status_error(status: reqwest::StatusCode) -> CliError {
+    let message = BOUNDED_PUBLIC_METADATA_ERROR.to_string();
+    if status.as_u16() == 409 {
+        CliError::Conflict(message)
+    } else {
+        CliError::Relay {
+            status: status.as_u16(),
+            body: message,
+        }
+    }
+}
+
+/// Read a bounded NIP-11 body, then map status without echoing that body
+/// on non-success. Oversize is rejected by
+/// [`read_bounded_public_metadata_body`] before this mapping.
+async fn handle_bounded_public_metadata(
+    resp: reqwest::Response,
+    limit: usize,
+) -> Result<String, CliError> {
+    let status = resp.status();
+    let body = read_bounded_public_metadata_body(resp, limit).await?;
+    if status.is_success() {
+        Ok(body)
+    } else {
+        Err(bounded_public_metadata_status_error(status))
+    }
+}
+
+async fn read_bounded_keyed_response_body(
+    mut resp: reqwest::Response,
+    limit: usize,
+) -> Result<String, CliError> {
+    if declared_keyed_response_too_large(resp.content_length(), limit) {
+        return Err(keyed_response_oversize(limit));
+    }
+
+    let mut collected = Vec::new();
+    if let Some(declared) = resp.content_length() {
+        collected.reserve((declared as usize).min(limit));
+    }
+
+    while let Some(chunk) = resp.chunk().await? {
+        if keyed_response_chunk_exceeds_limit(collected.len(), chunk.len(), limit) {
+            return Err(keyed_response_oversize(limit));
+        }
+        collected.extend_from_slice(&chunk);
+    }
+
+    Ok(String::from_utf8_lossy(&collected).into_owned())
+}
+
+/// Shared status/body mapper for unbounded `handle_response` and bounded keyed
+/// POST /events responses.
+///
+/// Success returns the body. Non-success extracts JSON `error`/`message` when
+/// present, maps 409 to [`CliError::Conflict`], annotates 403 when
+/// `BUZZ_AUTH_TAG` is set, and otherwise returns [`CliError::Relay`].
+fn map_response_status_and_body(
+    status: reqwest::StatusCode,
+    body: String,
+) -> Result<String, CliError> {
+    if !status.is_success() {
+        let status = status.as_u16();
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .or_else(|| v.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or(body);
+        if status == 409 {
+            return Err(CliError::Conflict(message));
+        }
+        if status == 403 && std::env::var("BUZZ_AUTH_TAG").is_ok() {
+            let message = format!(
+                "{message} (BUZZ_AUTH_TAG is set — it may be stale or revoked; try unsetting it)"
+            );
+            return Err(CliError::Relay {
+                status,
+                body: message,
+            });
+        }
+        return Err(CliError::Relay {
+            status,
+            body: message,
+        });
+    }
+    Ok(body)
+}
+
+/// Capture status before consuming a keyed POST /events body, enforce
+/// [`KEYED_RESPONSE_MAX_BYTES`], then map through `map_response_status_and_body`.
+///
+/// Oversize is always [`CliError::KeyedResponseTooLarge`]. On non-success,
+/// non-oversize body-read failures keep the empty-body fallback. On success,
+/// body-read failures remain [`CliError::Network`].
+async fn handle_keyed_response(resp: reqwest::Response) -> Result<String, CliError> {
+    let status = resp.status();
+    let body = match read_bounded_keyed_response_body(resp, KEYED_RESPONSE_MAX_BYTES).await {
+        Ok(body) => body,
+        Err(CliError::KeyedResponseTooLarge { limit }) => {
+            return Err(CliError::KeyedResponseTooLarge { limit });
+        }
+        Err(e) if status.is_success() => return Err(e),
+        Err(_) => String::new(),
+    };
+    map_response_status_and_body(status, body)
+}
+
 pub struct BuzzClient {
     http: reqwest::Client,
+    /// Never follows redirects. The only client used for keyed stored-event POSTs,
+    /// so a 307/308 cannot receive the signed body or `Idempotency-Key`.
+    http_keyed: reqwest::Client,
     relay_url: String, // base URL, no trailing slash, e.g. "https://relay.buzz.place"
     keys: Keys,
     /// Optional NIP-OA auth tag injected into every signed event.
@@ -544,13 +990,22 @@ impl BuzzClient {
         auth_tag: Option<Tag>,
         auth_tag_json: Option<String>,
     ) -> Result<Self, CliError> {
+        let timeout = env_duration_secs("BUZZ_TIMEOUT_SECS", 30);
+        let connect_timeout = env_duration_secs("BUZZ_CONNECT_TIMEOUT_SECS", 15);
         let http = reqwest::Client::builder()
-            .timeout(env_duration_secs("BUZZ_TIMEOUT_SECS", 30))
-            .connect_timeout(env_duration_secs("BUZZ_CONNECT_TIMEOUT_SECS", 15))
+            .timeout(timeout)
+            .connect_timeout(connect_timeout)
+            .build()
+            .map_err(|e| CliError::Other(e.to_string()))?;
+        let http_keyed = reqwest::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| CliError::Other(e.to_string()))?;
         Ok(Self {
             http,
+            http_keyed,
             relay_url,
             keys,
             auth_tag,
@@ -620,6 +1075,25 @@ impl BuzzClient {
         }
     }
 
+    /// Keyed stored-event POST. Always uses [`Self::http_keyed`] so the signed
+    /// body and `Idempotency-Key` cannot be forwarded through a redirect.
+    fn keyed_stored_event_post(
+        &self,
+        url: &str,
+        body: bytes::Bytes,
+        key_hex: &str,
+        auth: String,
+    ) -> reqwest::RequestBuilder {
+        self.with_auth_tag(
+            self.http_keyed
+                .post(url)
+                .header("Authorization", auth)
+                .header("Content-Type", "application/json")
+                .header(buzz_core::idempotency::HEADER_NAME, key_hex)
+                .body(body),
+        )
+    }
+
     /// Execute `op` up to `RETRY_MAX_ATTEMPTS` times, including body-transfer failures
     /// and transient relay error statuses.
     ///
@@ -629,13 +1103,37 @@ impl BuzzClient {
     /// - `Err(CliError::Network(e))` where `e.is_connect() || e.is_timeout() ||
     ///   e.is_request() || e.is_body() || e.is_decode()` — covers both connection
     ///   failures and mid-body TCP drops.
-    /// - `Err(CliError::Relay { status: 429 | 502 | 503 | 504, .. })` — transient relay
-    ///   or proxy errors. For 429 the `retry in Ns` hint from the body is used as the
-    ///   delay (capped at `RETRY_IN_MAX_SECS`); all others use exponential jitter.
+    /// - `Err(CliError::Relay { status: 429 | 502 | 503 | 504, .. })` — transient
+    ///   relay or proxy errors on read-semantic operations. For 429 the `retry in Ns`
+    ///   hint from the body is used as the delay (capped at `RETRY_IN_MAX_SECS`);
+    ///   502, 503, and 504 use exponential jitter. Unkeyed stored-event writes use
+    ///   [`Self::with_retry_unkeyed_write`] and do not retry HTTP 503.
     ///
     /// Use this variant for all operations (reads, writes, uploads); the retry boundary
     /// covers the entire operation including response body transfer.
     async fn with_retry_body<'a, T, F, Fut>(&'a self, op: F) -> Result<T, CliError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, CliError>> + 'a,
+        T: 'a,
+    {
+        self.with_retry_classified(true, op).await
+    }
+
+    async fn with_retry_unkeyed_write<'a, T, F, Fut>(&'a self, op: F) -> Result<T, CliError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, CliError>> + 'a,
+        T: 'a,
+    {
+        self.with_retry_classified(false, op).await
+    }
+
+    async fn with_retry_classified<'a, T, F, Fut>(
+        &'a self,
+        retry_503: bool,
+        op: F,
+    ) -> Result<T, CliError>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T, CliError>> + 'a,
@@ -664,8 +1162,11 @@ impl BuzzClient {
                                 Some(d)
                             }
                             CliError::Relay {
-                                status: 502..=504, ..
+                                status: 502 | 504, ..
                             } => Some(jitter_delay(attempt)),
+                            CliError::Relay { status: 503, .. } if retry_503 => {
+                                Some(jitter_delay(attempt))
+                            }
                             _ => None,
                         };
                         if let Some(d) = delay {
@@ -773,13 +1274,36 @@ impl BuzzClient {
     /// membership-scoped resource.
     pub async fn get_public(&self, path: &str) -> Result<String, CliError> {
         let url = format!("{}{path}", self.relay_url);
-        let resp = self
-            .http
+        let http = public_no_redirect_client()?;
+        let resp = http
             .get(&url)
             .header("Accept", "application/nostr+json")
             .send()
             .await?;
         self.handle_response(resp).await
+    }
+
+    /// GET public relay metadata (NIP-11) with a fixed body ceiling.
+    ///
+    /// Used only for the keyed kind-9 send preflight. Does not follow
+    /// redirects. A declared `Content-Length` above
+    /// [`NIP11_PUBLIC_METADATA_MAX_BYTES`] is rejected before reading body
+    /// bytes. Missing, dishonest, or chunked lengths are consumed
+    /// incrementally and stop at the first over-limit chunk. Oversize
+    /// success and error responses map to
+    /// [`CliError::PublicMetadataTooLarge`] and never echo the body.
+    /// In-bound non-success responses keep their HTTP status and typed
+    /// error family (`Conflict` for 409, otherwise `Relay`) but replace
+    /// any relay-controlled body with a fixed client message.
+    pub async fn get_public_metadata(&self, path: &str) -> Result<String, CliError> {
+        let url = format!("{}{path}", self.relay_url);
+        let http = public_no_redirect_client()?;
+        let resp = http
+            .get(&url)
+            .header("Accept", "application/nostr+json")
+            .send()
+            .await?;
+        handle_bounded_public_metadata(resp, NIP11_PUBLIC_METADATA_MAX_BYTES).await
     }
 
     /// Execute a one-shot query via the HTTP bridge.
@@ -923,8 +1447,30 @@ impl BuzzClient {
     ///
     /// All other event kinds retain the standard retry policy.
     pub async fn submit_event(&self, event: nostr::Event) -> Result<String, CliError> {
+        self.submit_event_with_idempotency_key(event, None).await
+    }
+
+    /// Submit a stored event, optionally with a request-scoped idempotency key.
+    ///
+    /// When `key` is `Some`, the same serialized body and `Idempotency-Key`
+    /// header are reused on 503/network retries; NIP-98 is re-signed each
+    /// attempt. Unkeyed submits never retry HTTP 503 as if they were keyed.
+    pub async fn submit_event_with_idempotency_key(
+        &self,
+        event: nostr::Event,
+        key: Option<[u8; 32]>,
+    ) -> Result<String, CliError> {
         let kind = event.kind.as_u16();
-        if is_moderation_kind(kind) {
+        if let Some(key) = key {
+            if is_moderation_kind(kind)
+                || !buzz_core::idempotency::supports_keyed_kind(u32::from(kind))
+            {
+                return Err(CliError::Usage(
+                    "--idempotency-key is only supported for kind 9".into(),
+                ));
+            }
+            self.submit_keyed_stored_event(event, key).await
+        } else if is_moderation_kind(kind) {
             self.submit_moderation_event(event).await
         } else {
             self.submit_stored_event(event).await
@@ -1090,7 +1636,7 @@ impl BuzzClient {
                 .map_err(|e| CliError::Other(format!("event serialization failed: {e}")))?,
         );
         let result = self
-            .with_retry_body(|| {
+            .with_retry_unkeyed_write(|| {
                 let body = body.clone();
                 let url = url.clone();
                 async move {
@@ -1125,6 +1671,146 @@ impl BuzzClient {
             }
         }
         result
+    }
+
+    /// Keyed stored-event POST. Retries only HTTP 503 and transport-uncertain
+    /// network failures, up to [`KEYED_RETRY_MAX_ATTEMPTS`] (initial plus three
+    /// retries). Each retry reuses the same signed event, serialized body, and
+    /// `Idempotency-Key`, and generates a fresh NIP-98 Authorization. Extra
+    /// keyed retries reuse the last generic jitter ceiling.
+    ///
+    /// One Tokio-clock deadline covers send, response-body read, and retry
+    /// sleeps for the whole operation. A valid positive Retry-After that does
+    /// not fit the remaining bound, or a final-attempt positive representable
+    /// Retry-After (delay-seconds or HTTP-date floor), returns
+    /// [`CliError::RelayDeferred`] without another request. `Retry-After: 0`
+    /// and missing/malformed Retry-After return the original 503. Numeric
+    /// overflow returns [`CliError::RelayRetryAfterOverflow`] without another
+    /// request and without inventing a finite wait.
+    ///
+    /// Deadline expiry while an HTTP request or response body is still in
+    /// flight is [`CliError::DeliveryUnknown`]. A scheduler overrun that
+    /// crosses the deadline during a retry sleep does not invent that
+    /// ambiguity: the already-known error is classified. Keyed 503 with a
+    /// positive representable Retry-After is [`CliError::RelayDeferred`] with
+    /// that exact floor; keyed 503 with a zero or missing/malformed hint
+    /// stays [`CliError::Relay`]; overflow is
+    /// [`CliError::RelayRetryAfterOverflow`]; a definitive connect failure
+    /// stays the network error; a transport-uncertain timeout, request, body,
+    /// or decode outcome is [`CliError::DeliveryUnknown`].
+    async fn submit_keyed_stored_event(
+        &self,
+        event: nostr::Event,
+        key: [u8; 32],
+    ) -> Result<String, CliError> {
+        let url = format!("{}/events", self.relay_url);
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&event)
+                .map_err(|e| CliError::Other(format!("event serialization failed: {e}")))?,
+        );
+        let key_hex = hex::encode(key);
+        let kind_u16 = event.kind.as_u16();
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(KEYED_OPERATION_DEADLINE_SECS);
+        self.submit_keyed_within_deadline(url, body, key_hex, kind_u16, deadline)
+            .await
+    }
+
+    async fn submit_keyed_within_deadline(
+        &self,
+        url: String,
+        body: bytes::Bytes,
+        key_hex: String,
+        kind_u16: u16,
+        deadline: tokio::time::Instant,
+    ) -> Result<String, CliError> {
+        for attempt in 0..KEYED_RETRY_MAX_ATTEMPTS {
+            let is_last = attempt == KEYED_RETRY_MAX_ATTEMPTS - 1;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(keyed_deadline_unknown(kind_u16));
+            }
+            let body = body.clone();
+            let url = url.clone();
+            let key_hex = key_hex.clone();
+            let attempt_fut = async {
+                let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+                let send_result = self
+                    .keyed_stored_event_post(&url, body, &key_hex, auth)
+                    .send()
+                    .await;
+                match send_result {
+                    Err(e) => Ok::<_, CliError>((
+                        Err(CliError::from(e)),
+                        RetryAfterHint::MissingOrMalformed,
+                    )),
+                    Ok(resp) => {
+                        if let Some(err) = keyed_redirect_refused(resp.status()) {
+                            Ok((Err(err), RetryAfterHint::MissingOrMalformed))
+                        } else {
+                            let retry_after =
+                                if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                                    parse_retry_after_hint(resp.headers())
+                                } else {
+                                    RetryAfterHint::MissingOrMalformed
+                                };
+                            Ok((handle_keyed_response(resp).await, retry_after))
+                        }
+                    }
+                }
+            };
+            let (result, retry_after) = match tokio::time::timeout_at(deadline, attempt_fut).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => return Err(e),
+                Err(_elapsed) => return Err(keyed_deadline_unknown(kind_u16)),
+            };
+            match result {
+                Ok(value) => return Ok(value),
+                Err(e) => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(keyed_deadline_after_known_error(e, retry_after, kind_u16));
+                    }
+                    // Last attempt must not compute retry-only delay state.
+                    // Extra keyed retries reuse the last RETRY_BASE_SECS
+                    // ceiling via keyed_jitter_delay rather than indexing past
+                    // the generic table.
+                    if is_last {
+                        return Err(keyed_exhausted_error(e, retry_after));
+                    }
+                    let delay = match &e {
+                        CliError::Network(net_err)
+                            if net_err.is_connect()
+                                || net_err.is_timeout()
+                                || net_err.is_request()
+                                || net_err.is_body()
+                                || net_err.is_decode() =>
+                        {
+                            let delay = keyed_jitter_delay(attempt);
+                            delay_strictly_fits(delay, remaining).then_some(delay)
+                        }
+                        CliError::Relay { status: 503, .. } => keyed_503_retry_delay(
+                            retry_after,
+                            keyed_jitter_delay(attempt),
+                            remaining,
+                        ),
+                        _ => None,
+                    };
+                    if let Some(d) = delay {
+                        tokio::time::sleep(d).await;
+                        if deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .is_zero()
+                        {
+                            return Err(keyed_deadline_after_known_error(e, retry_after, kind_u16));
+                        }
+                        continue;
+                    }
+                    return Err(keyed_exhausted_error(e, retry_after));
+                }
+            }
+        }
+        Err(CliError::Other("keyed submit exhausted retries".into()))
     }
 
     /// Publish an ephemeral event via WebSocket with NIP-42 authentication.
@@ -1318,33 +2004,14 @@ impl BuzzClient {
     }
 
     async fn handle_response(&self, resp: reqwest::Response) -> Result<String, CliError> {
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
+        let status = resp.status();
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            let message = serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| {
-                    v.get("error")
-                        .or_else(|| v.get("message"))
-                        .and_then(|m| m.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or(body);
-            if status == 403 && std::env::var("BUZZ_AUTH_TAG").is_ok() {
-                let message = format!(
-                    "{message} (BUZZ_AUTH_TAG is set — it may be stale or revoked; try unsetting it)"
-                );
-                return Err(CliError::Relay {
-                    status,
-                    body: message,
-                });
-            }
-            return Err(CliError::Relay {
-                status,
-                body: message,
-            });
+            map_response_status_and_body(status, body)
+        } else {
+            let body = resp.text().await?;
+            map_response_status_and_body(status, body)
         }
-        Ok(resp.text().await?)
     }
 }
 
@@ -1507,10 +2174,48 @@ pub fn normalize_write_response(raw: &str) -> String {
 mod retry_tests {
     use std::time::Duration;
 
+    use crate::error::CliError;
+
+    use chrono::{DateTime, NaiveDate, Utc};
+
     use super::{
-        env_duration_secs, is_moderation_kind, jitter_delay, parse_retry_hint_text,
-        parse_retry_in_secs, RETRY_BASE_SECS, RETRY_IN_MAX_SECS, RETRY_MAX_ATTEMPTS,
+        delay_from_retry_after_and_jitter, env_duration_secs, http_date_to_retry_after_hint,
+        is_moderation_kind, jitter_delay, keyed_503_retry_delay, keyed_exhausted_error,
+        keyed_jitter_delay, parse_retry_after_delta_seconds, parse_retry_after_hint,
+        parse_retry_after_hint_at, parse_retry_after_value, parse_retry_hint_text,
+        parse_retry_in_secs, RetryAfterHint, KEYED_OPERATION_DEADLINE_SECS,
+        KEYED_RETRY_MAX_ATTEMPTS, RETRY_BASE_SECS, RETRY_IN_MAX_SECS, RETRY_MAX_ATTEMPTS,
     };
+
+    fn utc_hms(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> DateTime<Utc> {
+        NaiveDate::from_ymd_opt(year, month, day)
+            .unwrap()
+            .and_hms_opt(hour, min, sec)
+            .unwrap()
+            .and_utc()
+    }
+
+    fn utc_hms_nano(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        min: u32,
+        sec: u32,
+        nano: u32,
+    ) -> DateTime<Utc> {
+        NaiveDate::from_ymd_opt(year, month, day)
+            .unwrap()
+            .and_hms_nano_opt(hour, min, sec, nano)
+            .unwrap()
+            .and_utc()
+    }
+
+    fn retry_after_headers(value: &str) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+        headers
+    }
 
     // ---- parse_retry_in_secs ----
 
@@ -1597,6 +2302,427 @@ mod retry_tests {
         }
     }
 
+    // ---- Retry-After floor + jitter (keyed 503) ----
+
+    #[test]
+    fn keyed_retry_after_sixty_is_a_floor_plus_bounded_jitter() {
+        let hint_secs = 60u64;
+        let jitter = Duration::from_millis(250);
+        let delay = delay_from_retry_after_and_jitter(Some(hint_secs), jitter)
+            .expect("60s Retry-After must be representable");
+        let hint = Duration::from_secs(hint_secs);
+        assert!(
+            delay >= hint,
+            "valid Retry-After must never be undercut; got {delay:?} < {hint:?}"
+        );
+        assert_eq!(delay, hint + jitter);
+        let no_jitter = delay_from_retry_after_and_jitter(Some(hint_secs), Duration::ZERO)
+            .expect("60s Retry-After must be representable");
+        assert_eq!(no_jitter, hint);
+        assert!(delay >= no_jitter);
+    }
+
+    #[test]
+    fn keyed_retry_after_missing_or_malformed_uses_jitter_fallback() {
+        let jitter = Duration::from_millis(400);
+        assert_eq!(
+            delay_from_retry_after_and_jitter(None, jitter),
+            Some(jitter)
+        );
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after_delta_seconds(&headers), None);
+        headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
+        assert_eq!(parse_retry_after_delta_seconds(&headers), Some(5));
+        headers.insert(reqwest::header::RETRY_AFTER, "5s".parse().unwrap());
+        assert_eq!(parse_retry_after_delta_seconds(&headers), None);
+        headers.insert(reqwest::header::RETRY_AFTER, "not-a-date".parse().unwrap());
+        assert_eq!(parse_retry_after_delta_seconds(&headers), None);
+    }
+
+    #[test]
+    fn http_date_retry_after_future_exact_now_and_past() {
+        let now = utc_hms(1994, 11, 6, 8, 49, 37);
+        let future = retry_after_headers("Sun, 06 Nov 1994 08:50:37 GMT");
+        assert_eq!(
+            parse_retry_after_hint_at(&future, now),
+            RetryAfterHint::Representable(60)
+        );
+        let exact = retry_after_headers("Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(
+            parse_retry_after_hint_at(&exact, now),
+            RetryAfterHint::Representable(0)
+        );
+        let past = retry_after_headers("Sun, 06 Nov 1994 08:48:37 GMT");
+        assert_eq!(
+            parse_retry_after_hint_at(&past, now),
+            RetryAfterHint::Representable(0)
+        );
+    }
+
+    #[test]
+    fn http_date_retry_after_ceils_positive_fractional_remainder() {
+        let now = utc_hms_nano(1994, 11, 6, 8, 49, 37, 500_000_000);
+        let when = utc_hms(1994, 11, 6, 8, 49, 38);
+        assert_eq!(
+            http_date_to_retry_after_hint(when, now),
+            RetryAfterHint::Representable(1),
+            "0.5s remaining must ceil so the retry cannot start before the absolute time"
+        );
+        let headers = retry_after_headers("Sun, 06 Nov 1994 08:49:38 GMT");
+        assert_eq!(
+            parse_retry_after_hint_at(&headers, now),
+            RetryAfterHint::Representable(1)
+        );
+        let exact_second = utc_hms(1994, 11, 6, 8, 49, 37);
+        assert_eq!(
+            parse_retry_after_hint_at(&headers, exact_second),
+            RetryAfterHint::Representable(1)
+        );
+    }
+
+    #[test]
+    fn http_date_retry_after_accepts_imf_rfc850_and_asctime() {
+        let now = utc_hms(1994, 11, 6, 7, 49, 37);
+        for value in [
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",
+        ] {
+            assert_eq!(
+                parse_retry_after_hint_at(&retry_after_headers(value), now),
+                RetryAfterHint::Representable(3600),
+                "accepted HTTP-date form must parse with GMT semantics: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_date_retry_after_malformed_keeps_jitter_fallback() {
+        let now = utc_hms(1994, 11, 6, 8, 49, 37);
+        for value in [
+            "5s",
+            "not-a-date",
+            "Wed, 21 Oct 2015 07:28:00 UTC",
+            "Sun, 06 Nov 1994 08:49:37 GMT trailing",
+        ] {
+            let hint = parse_retry_after_hint_at(&retry_after_headers(value), now);
+            assert_eq!(
+                hint,
+                RetryAfterHint::MissingOrMalformed,
+                "malformed Retry-After must keep the jitter fallback, got {hint:?} for {value:?}"
+            );
+        }
+        assert_eq!(
+            parse_retry_after_hint(&reqwest::header::HeaderMap::new()),
+            RetryAfterHint::MissingOrMalformed
+        );
+        assert_eq!(
+            parse_retry_after_value("", now),
+            RetryAfterHint::MissingOrMalformed
+        );
+    }
+
+    #[test]
+    fn date_derived_retry_after_floor_is_not_undercut() {
+        let now = utc_hms(2026, 9, 2, 12, 0, 0);
+        let headers = retry_after_headers("Wed, 02 Sep 2026 12:01:00 GMT");
+        let hint = parse_retry_after_hint_at(&headers, now);
+        assert_eq!(hint, RetryAfterHint::Representable(60));
+        let RetryAfterHint::Representable(secs) = hint else {
+            panic!("date-derived hint must be representable seconds");
+        };
+        let jitter = Duration::from_millis(250);
+        let delay = delay_from_retry_after_and_jitter(Some(secs), jitter)
+            .expect("date-derived 60s floor must be representable");
+        assert!(
+            delay >= Duration::from_secs(60),
+            "date-derived Retry-After must never be undercut; got {delay:?}"
+        );
+        let remaining = Duration::from_secs(KEYED_OPERATION_DEADLINE_SECS);
+        let retry = keyed_503_retry_delay(hint, jitter, remaining)
+            .expect("in-bound date-derived floor must retry");
+        assert!(retry >= Duration::from_secs(60));
+        let deferred = keyed_exhausted_error(
+            CliError::Relay {
+                status: 503,
+                body: "idempotency unavailable".into(),
+            },
+            hint,
+        );
+        assert!(
+            matches!(
+                deferred,
+                CliError::RelayDeferred {
+                    status: 503,
+                    retry_after_seconds: 60,
+                    ..
+                }
+            ),
+            "positive date-derived floor must be RelayDeferred, got {deferred:?}"
+        );
+        let digits = retry_after_headers("60");
+        assert_eq!(
+            parse_retry_after_hint(&digits),
+            RetryAfterHint::Representable(60),
+            "production wrapper must still honour delay-seconds"
+        );
+    }
+
+    #[test]
+    fn keyed_retry_after_pathological_does_not_retry_early() {
+        let jitter = Duration::from_millis(500);
+        match delay_from_retry_after_and_jitter(Some(u64::MAX), jitter) {
+            None => {}
+            Some(delay) => {
+                assert!(
+                    delay >= Duration::from_secs(u64::MAX),
+                    "pathological Retry-After must not collapse to an early retry; got {delay:?}"
+                );
+            }
+        }
+        let remaining = Duration::from_secs(KEYED_OPERATION_DEADLINE_SECS);
+        assert_eq!(
+            keyed_503_retry_delay(RetryAfterHint::Overflow, jitter, remaining),
+            None,
+            "numeric-overflow Retry-After must not fall back to jitter"
+        );
+        assert_eq!(
+            keyed_503_retry_delay(RetryAfterHint::Representable(3_600), jitter, remaining),
+            None,
+            "representable over-bound Retry-After must not retry inside the operation deadline"
+        );
+        let in_bound =
+            keyed_503_retry_delay(RetryAfterHint::Representable(60), Duration::ZERO, remaining)
+                .expect("in-bound 60s hint must retry");
+        assert_eq!(in_bound, Duration::from_secs(60));
+        assert_eq!(
+            keyed_503_retry_delay(
+                RetryAfterHint::Representable(KEYED_OPERATION_DEADLINE_SECS),
+                Duration::ZERO,
+                remaining,
+            ),
+            None,
+            "a hint that consumes the entire remaining bound must not start another request"
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "9".repeat(40).parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after_hint(&headers), RetryAfterHint::Overflow);
+        headers.insert(reqwest::header::RETRY_AFTER, "3600".parse().unwrap());
+        assert_eq!(
+            parse_retry_after_hint(&headers),
+            RetryAfterHint::Representable(3600)
+        );
+    }
+
+    #[test]
+    fn keyed_exhausted_preserves_in_bound_representable_retry_after() {
+        let err = CliError::Relay {
+            status: 503,
+            body: "idempotency unavailable".into(),
+        };
+        let out = keyed_exhausted_error(err, RetryAfterHint::Representable(1));
+        assert!(
+            matches!(
+                out,
+                CliError::RelayDeferred {
+                    status: 503,
+                    retry_after_seconds: 1,
+                    ..
+                }
+            ),
+            "final-attempt in-bound Retry-After must stay a deferred floor, got {out:?}"
+        );
+        let missing = keyed_exhausted_error(
+            CliError::Relay {
+                status: 503,
+                body: "idempotency unavailable".into(),
+            },
+            RetryAfterHint::MissingOrMalformed,
+        );
+        assert!(
+            matches!(missing, CliError::Relay { status: 503, .. }),
+            "missing Retry-After must remain Relay(503), got {missing:?}"
+        );
+        let overflow = keyed_exhausted_error(
+            CliError::Relay {
+                status: 503,
+                body: "idempotency unavailable".into(),
+            },
+            RetryAfterHint::Overflow,
+        );
+        assert!(
+            matches!(
+                overflow,
+                CliError::RelayRetryAfterOverflow { status: 503, .. }
+            ),
+            "overflow Retry-After must be RelayRetryAfterOverflow, got {overflow:?}"
+        );
+        assert!(
+            !matches!(overflow, CliError::Relay { .. }),
+            "overflow must not stay ordinary retryable Relay(503), got {overflow:?}"
+        );
+    }
+
+    #[test]
+    fn keyed_exhausted_retry_after_zero_stays_ordinary_relay_503() {
+        let zero = keyed_exhausted_error(
+            CliError::Relay {
+                status: 503,
+                body: "idempotency unavailable".into(),
+            },
+            RetryAfterHint::Representable(0),
+        );
+        assert!(
+            matches!(zero, CliError::Relay { status: 503, .. }),
+            "Retry-After 0 has no wait floor and must stay Relay(503), got {zero:?}"
+        );
+        assert!(
+            !matches!(zero, CliError::RelayDeferred { .. }),
+            "Retry-After 0 must not become permanently nonretryable deferred output, got {zero:?}"
+        );
+        assert!(
+            crate::error::is_retryable_error(&zero),
+            "Retry-After 0 must remain ordinary retryable Relay(503), got {zero:?}"
+        );
+    }
+
+    #[test]
+    fn keyed_retry_after_overflow_parser_to_exhausted_public_json() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "9".repeat(40).parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after_hint(&headers), RetryAfterHint::Overflow);
+
+        let overflow = keyed_exhausted_error(
+            CliError::Relay {
+                status: 503,
+                body: "idempotency unavailable".into(),
+            },
+            RetryAfterHint::Overflow,
+        );
+        assert!(
+            matches!(
+                overflow,
+                CliError::RelayRetryAfterOverflow { status: 503, .. }
+            ),
+            "overflow must not stay ordinary Relay(503), got {overflow:?}"
+        );
+        assert!(!matches!(overflow, CliError::Relay { .. }));
+        assert!(!matches!(overflow, CliError::RelayDeferred { .. }));
+        assert!(!matches!(overflow, CliError::DeliveryUnknown(_)));
+        assert_eq!(
+            overflow.to_string(),
+            "relay error 503: idempotency unavailable"
+        );
+        assert!(!crate::error::is_retryable_error(&overflow));
+        assert_eq!(crate::error::exit_code(&overflow), 2);
+        let overflow_json = crate::error::error_json(&overflow);
+        assert_eq!(overflow_json["error"].as_str(), Some("relay_error"));
+        assert_eq!(
+            overflow_json["message"].as_str(),
+            Some("relay error 503: idempotency unavailable")
+        );
+        assert_eq!(overflow_json["retryable"].as_bool(), Some(false));
+        assert!(
+            overflow_json.get("retry_after_seconds").is_none(),
+            "overflow must not invent a finite retry_after_seconds, got {overflow_json}"
+        );
+
+        headers.insert(reqwest::header::RETRY_AFTER, "3600".parse().unwrap());
+        let floor_hint = parse_retry_after_hint(&headers);
+        assert_eq!(floor_hint, RetryAfterHint::Representable(3600));
+        let deferred = keyed_exhausted_error(
+            CliError::Relay {
+                status: 503,
+                body: "idempotency unavailable".into(),
+            },
+            floor_hint,
+        );
+        assert!(
+            matches!(
+                deferred,
+                CliError::RelayDeferred {
+                    status: 503,
+                    retry_after_seconds: 3600,
+                    ..
+                }
+            ),
+            "positive representable floor must stay RelayDeferred, got {deferred:?}"
+        );
+        let deferred_json = crate::error::error_json(&deferred);
+        assert_eq!(deferred_json["error"].as_str(), Some("relay_error"));
+        assert_eq!(deferred_json["retryable"].as_bool(), Some(false));
+        assert_eq!(deferred_json["retry_after_seconds"].as_u64(), Some(3600));
+
+        headers.insert(reqwest::header::RETRY_AFTER, "0".parse().unwrap());
+        let zero_hint = parse_retry_after_hint(&headers);
+        assert_eq!(zero_hint, RetryAfterHint::Representable(0));
+        let zero = keyed_exhausted_error(
+            CliError::Relay {
+                status: 503,
+                body: "idempotency unavailable".into(),
+            },
+            zero_hint,
+        );
+        assert!(
+            matches!(zero, CliError::Relay { status: 503, .. }),
+            "Retry-After 0 must stay ordinary Relay(503), got {zero:?}"
+        );
+        assert!(crate::error::is_retryable_error(&zero));
+        let zero_json = crate::error::error_json(&zero);
+        assert_eq!(zero_json["error"].as_str(), Some("relay_error"));
+        assert_eq!(zero_json["retryable"].as_bool(), Some(true));
+        assert!(zero_json.get("retry_after_seconds").is_none());
+
+        headers.insert(reqwest::header::RETRY_AFTER, "5s".parse().unwrap());
+        assert_eq!(
+            parse_retry_after_hint(&headers),
+            RetryAfterHint::MissingOrMalformed
+        );
+        let malformed = keyed_exhausted_error(
+            CliError::Relay {
+                status: 503,
+                body: "idempotency unavailable".into(),
+            },
+            parse_retry_after_hint(&headers),
+        );
+        assert!(
+            matches!(malformed, CliError::Relay { status: 503, .. }),
+            "malformed Retry-After must stay ordinary Relay(503), got {malformed:?}"
+        );
+        assert!(crate::error::is_retryable_error(&malformed));
+        let malformed_json = crate::error::error_json(&malformed);
+        assert_eq!(malformed_json["retryable"].as_bool(), Some(true));
+        assert!(malformed_json.get("retry_after_seconds").is_none());
+
+        let empty = reqwest::header::HeaderMap::new();
+        assert_eq!(
+            parse_retry_after_hint(&empty),
+            RetryAfterHint::MissingOrMalformed
+        );
+        let missing = keyed_exhausted_error(
+            CliError::Relay {
+                status: 503,
+                body: "idempotency unavailable".into(),
+            },
+            parse_retry_after_hint(&empty),
+        );
+        assert!(
+            matches!(missing, CliError::Relay { status: 503, .. }),
+            "missing Retry-After must stay ordinary Relay(503), got {missing:?}"
+        );
+        assert!(crate::error::is_retryable_error(&missing));
+        let missing_json = crate::error::error_json(&missing);
+        assert_eq!(missing_json["retryable"].as_bool(), Some(true));
+        assert!(missing_json.get("retry_after_seconds").is_none());
+    }
+
     // ---- jitter bounds ----
 
     #[test]
@@ -1613,12 +2739,31 @@ mod retry_tests {
         }
     }
 
+    #[test]
+    fn keyed_jitter_reuses_last_ceiling_past_generic_table() {
+        let last_base = *RETRY_BASE_SECS
+            .last()
+            .expect("RETRY_BASE_SECS is non-empty");
+        for attempt in 0..KEYED_RETRY_MAX_ATTEMPTS {
+            let base = RETRY_BASE_SECS[(attempt as usize).min(RETRY_BASE_SECS.len() - 1)];
+            for _ in 0..50 {
+                let delay = keyed_jitter_delay(attempt).as_secs_f64();
+                assert!(
+                    (0.0..=base).contains(&delay),
+                    "keyed jitter {delay} out of [0, {base}] on attempt {attempt}"
+                );
+            }
+        }
+        assert_eq!(last_base, 1.5);
+    }
+
     // ---- constant sanity ----
 
     #[test]
     fn retry_constants_are_sensible() {
         assert_eq!(RETRY_MAX_ATTEMPTS, 3);
         assert_eq!(RETRY_BASE_SECS.len(), (RETRY_MAX_ATTEMPTS - 1) as usize);
+        assert_eq!(KEYED_RETRY_MAX_ATTEMPTS, 4);
         const { assert!(RETRY_IN_MAX_SECS > 0) };
     }
 
@@ -1944,6 +3089,151 @@ mod retry_policy_tests {
         let addr: SocketAddr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), counter)
+    }
+
+    /// Safe-read 503 is retried by `with_retry_body` (channels list / messages get /
+    /// POST query-count) and succeeds on the next attempt.
+    #[tokio::test]
+    async fn query_503_is_retried_then_succeeds() {
+        let (url, attempts) = get_server(|n| {
+            if n == 1 {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "transient unavailable".to_string(),
+                )
+            } else {
+                (StatusCode::OK, r#"{"ok":true}"#.to_string())
+            }
+        })
+        .await;
+        let client = test_client(&url);
+        let result = client.get_authed("/info").await;
+        assert!(
+            result.is_ok(),
+            "expected Ok after 503 retry, got {result:?}"
+        );
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "must have retried at least once"
+        );
+    }
+
+    /// POST /query is a read-only body and must retry HTTP 503 then succeed.
+    #[tokio::test]
+    async fn query_post_503_is_retried_then_succeeds() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let handler_ctr = counter.clone();
+        let app = Router::new().route(
+            "/query",
+            post(move || {
+                let handler_ctr = handler_ctr.clone();
+                async move {
+                    let n = handler_ctr.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == 1 {
+                        Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .body(Body::from("unavailable"))
+                            .unwrap()
+                    } else {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Body::from("[]"))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = test_client(&format!("http://{addr}"));
+        let result = client.query(&serde_json::json!({"limit": 1})).await;
+        assert!(
+            result.is_ok(),
+            "expected Ok after POST /query 503 retry, got {result:?}"
+        );
+        assert!(
+            counter.load(Ordering::SeqCst) >= 2,
+            "POST /query must retry HTTP 503"
+        );
+    }
+
+    /// Unkeyed stored-event writes must not retry ambiguous HTTP 503.
+    #[tokio::test]
+    async fn stored_event_503_is_not_retried() {
+        let (url, attempts) = test_server(|_n| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"unavailable"}"#.to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_stored_event(client.keys());
+        let err = client.submit_event(event).await.unwrap_err();
+        assert!(
+            matches!(err, CliError::DeliveryUnknown(_)),
+            "unkeyed 503 must stay ambiguous, got {err:?}"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "unkeyed event writes must not retry HTTP 503"
+        );
+    }
+
+    /// NIP-11 preflight must not follow a redirect to loopback or a private
+    /// target, and must not forward authentication material.
+    #[tokio::test]
+    async fn nip11_preflight_does_not_follow_redirect_to_loopback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let victim_hits = Arc::new(AtomicU32::new(0));
+        let victim_hits2 = victim_hits.clone();
+        let victim = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let victim_addr = victim.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = victim.accept().await else {
+                    break;
+                };
+                victim_hits2.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+                    .await;
+            }
+        });
+
+        let redirector = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirector_addr = redirector.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = redirector.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let location = format!("http://{victim_addr}/secret");
+                let body = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\n\r\n"
+                );
+                let _ = stream.write_all(body.as_bytes()).await;
+            }
+        });
+
+        let client = test_client(&format!("http://{redirector_addr}"));
+        let result = client.get_public("/").await;
+        assert!(
+            matches!(result, Err(CliError::Relay { status: 302, .. })),
+            "NIP-11 preflight must not follow the redirect, got {result:?}"
+        );
+        assert_eq!(
+            victim_hits.load(Ordering::SeqCst),
+            0,
+            "loopback redirect target must never be contacted"
+        );
     }
 
     /// `with_retry_body` retries transient HTTP 502 on a read path (`get_authed`)
@@ -2592,6 +3882,1469 @@ mod tests {
         assert!(
             built.headers().get("x-auth-tag").is_none(),
             "x-auth-tag header must not be present when no auth tag is configured"
+        );
+    }
+}
+
+#[cfg(test)]
+mod keyed_submit_tests {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use axum::extract::State;
+    use axum::http::{HeaderMap, Response, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+    use nostr::{EventBuilder, JsonUtil, Keys, Kind};
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::super::error::{error_json, is_retryable_error, CliError};
+    use super::{
+        BuzzClient, KEYED_OPERATION_DEADLINE_SECS, KEYED_RESPONSE_MAX_BYTES,
+        KEYED_RETRY_MAX_ATTEMPTS,
+    };
+
+    struct KeyedCapture {
+        attempts: AtomicU32,
+        bodies: Mutex<Vec<Vec<u8>>>,
+        keys: Mutex<Vec<String>>,
+        auths: Mutex<Vec<String>>,
+    }
+
+    type KeyedHandlerResponse = (StatusCode, Vec<(&'static str, &'static str)>, String);
+    type KeyedHandler = dyn Fn(u32) -> KeyedHandlerResponse + Send + Sync;
+
+    async fn keyed_events_server<F>(f: F) -> (String, Arc<KeyedCapture>)
+    where
+        F: Fn(u32) -> KeyedHandlerResponse + Send + Sync + 'static,
+    {
+        let capture = Arc::new(KeyedCapture {
+            attempts: AtomicU32::new(0),
+            bodies: Mutex::new(Vec::new()),
+            keys: Mutex::new(Vec::new()),
+            auths: Mutex::new(Vec::new()),
+        });
+        let handler: Arc<KeyedHandler> = Arc::new(f);
+        let state = (handler, capture.clone());
+
+        type S = (Arc<KeyedHandler>, Arc<KeyedCapture>);
+        let app = Router::new()
+            .route(
+                "/events",
+                post(
+                    |State((handler, cap)): State<S>,
+                     headers: HeaderMap,
+                     body: axum::body::Bytes| async move {
+                        let n = cap.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                        cap.bodies.lock().unwrap().push(body.to_vec());
+                        let key = headers
+                            .get("idempotency-key")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        cap.keys.lock().unwrap().push(key);
+                        let auth = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        cap.auths.lock().unwrap().push(auth);
+                        let (status, extra_headers, body) = handler(n);
+                        let mut builder = Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json");
+                        for (name, value) in extra_headers {
+                            builder = builder.header(name, value);
+                        }
+                        builder.body(axum::body::Body::from(body)).unwrap()
+                    },
+                ),
+            )
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), capture)
+    }
+
+    fn test_client(base_url: &str) -> BuzzClient {
+        let keys = Keys::generate();
+        BuzzClient::new(base_url.to_string(), keys, None, None).unwrap()
+    }
+
+    fn make_kind9_event(keys: &Keys) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(9), "hi")
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    fn nip98_event_from_authorization(value: &str) -> nostr::Event {
+        let encoded = value.strip_prefix("Nostr ").expect("Nostr prefix");
+        let json = B64.decode(encoded).expect("nip98 base64");
+        nostr::Event::from_json(std::str::from_utf8(&json).unwrap()).unwrap()
+    }
+
+    fn payload_tag(event: &nostr::Event) -> String {
+        event
+            .tags
+            .iter()
+            .find_map(|tag| {
+                let slice = tag.as_slice();
+                (slice.first().map(String::as_str) == Some("payload"))
+                    .then(|| slice.get(1).cloned())
+                    .flatten()
+            })
+            .expect("payload tag")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keyed_503_honors_retry_after_then_succeeds_with_same_body() {
+        let (url, capture) = keyed_events_server(|n| {
+            if n == 1 {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    vec![("retry-after", "60")],
+                    r#"{"error":"idempotency unavailable"}"#.to_string(),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    Vec::new(),
+                    r#"{"event_id":"abc","accepted":true,"message":""}"#.to_string(),
+                )
+            }
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let key = [0xab; 32];
+        let submit = tokio::spawn(async move {
+            client
+                .submit_event_with_idempotency_key(event, Some(key))
+                .await
+        });
+
+        let mut first_attempt_yields = 0u32;
+        while capture.attempts.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+            first_attempt_yields += 1;
+            assert!(
+                first_attempt_yields < 10_000,
+                "first keyed 503 never arrived"
+            );
+        }
+        assert_eq!(capture.attempts.load(Ordering::SeqCst), 1);
+
+        // The server increments `attempts` before returning the 503. Yield
+        // until the client has consumed it and parked on Retry-After.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        let retry_after_started = tokio::time::Instant::now();
+
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            1,
+            "must not retry inside the advertised Retry-After window"
+        );
+        assert!(
+            retry_after_started.elapsed() < Duration::from_secs(60),
+            "must not retry before sixty seconds"
+        );
+
+        // Floor is 60s; attempt-0 full jitter is in [0, 0.5). Advance past the
+        // combined ceiling so the second attempt is not timing-flaky.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut second_attempt_yields = 0u32;
+        while capture.attempts.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+            second_attempt_yields += 1;
+            assert!(
+                second_attempt_yields < 10_000,
+                "second keyed attempt did not run after Retry-After"
+            );
+        }
+        assert!(
+            retry_after_started.elapsed() >= Duration::from_secs(60),
+            "attempt two must occur at or after sixty seconds"
+        );
+        let result = submit.await.expect("join keyed submit");
+        assert!(
+            result.is_ok(),
+            "expected Ok after honoured Retry-After, got {result:?}"
+        );
+        assert_eq!(capture.attempts.load(Ordering::SeqCst), 2);
+
+        let bodies = capture.bodies.lock().unwrap().clone();
+        let keys = capture.keys.lock().unwrap().clone();
+        let auths = capture.auths.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(
+            bodies[0], bodies[1],
+            "retries must reuse the same event bytes"
+        );
+        let expected_key = hex::encode(key);
+        assert_eq!(keys, vec![expected_key.clone(), expected_key]);
+
+        let first_auth = nip98_event_from_authorization(&auths[0]);
+        let second_auth = nip98_event_from_authorization(&auths[1]);
+        first_auth.verify().unwrap();
+        second_auth.verify().unwrap();
+        assert_ne!(
+            first_auth.id, second_auth.id,
+            "each attempt must carry a freshly signed NIP-98 event"
+        );
+        let expected_payload = hex::encode(Sha256::digest(&bodies[0]));
+        assert_eq!(payload_tag(&first_auth), expected_payload);
+        assert_eq!(payload_tag(&second_auth), expected_payload);
+    }
+
+    #[tokio::test]
+    async fn keyed_409_is_not_retried_and_returns_conflict() {
+        let (url, capture) = keyed_events_server(|_n| {
+            (
+                StatusCode::CONFLICT,
+                Vec::new(),
+                r#"{"error":"idempotency-key conflict"}"#.to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let err = client
+            .submit_event_with_idempotency_key(event, Some([0xcd; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CliError::Conflict(_)),
+            "keyed 409 must surface Conflict, got {err:?}"
+        );
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            1,
+            "keyed 409 must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_unsupported_kind_is_local_usage_without_network() {
+        let (url, capture) = keyed_events_server(|_n| {
+            panic!("unsupported keyed kind must not send a network request")
+        })
+        .await;
+        let client = test_client(&url);
+        let event = EventBuilder::new(Kind::TextNote, "hi")
+            .sign_with_keys(client.keys())
+            .unwrap();
+        let err = client
+            .submit_event_with_idempotency_key(event, Some([0x11; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CliError::Usage(_)),
+            "unsupported keyed kind must be local Usage, got {err:?}"
+        );
+        assert_eq!(capture.attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keyed_over_bound_retry_after_returns_503_without_a_second_request() {
+        let (url, capture) = keyed_events_server(|_n| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                vec![("retry-after", "3600")],
+                r#"{"error":"idempotency unavailable"}"#.to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let submit = tokio::spawn(async move {
+            client
+                .submit_event_with_idempotency_key(event, Some([0x22; 32]))
+                .await
+        });
+        let mut yields = 0u32;
+        while capture.attempts.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+            yields += 1;
+            assert!(yields < 10_000, "keyed over-bound 503 never arrived");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            1,
+            "over-bound Retry-After must not issue another request"
+        );
+        let err = submit.await.expect("join").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CliError::RelayDeferred {
+                    status: 503,
+                    retry_after_seconds: 3_600,
+                    ..
+                }
+            ),
+            "over-bound hint must return deferred 503, got {err:?}"
+        );
+        assert!(!matches!(err, CliError::DeliveryUnknown(_)));
+        assert!(!crate::error::is_retryable_error(&err));
+        assert_eq!(capture.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keyed_deadline_bound_retry_after_is_deferred_without_a_second_request() {
+        let (url, capture) = keyed_events_server(|_n| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                vec![("retry-after", "90")],
+                r#"{"error":"idempotency unavailable"}"#.to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let submit = tokio::spawn(async move {
+            client
+                .submit_event_with_idempotency_key(event, Some([0x55; 32]))
+                .await
+        });
+        let mut yields = 0u32;
+        while capture.attempts.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+            yields += 1;
+            assert!(yields < 10_000, "keyed bound 503 never arrived");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            1,
+            "a hint equal to the remaining bound must not issue another request"
+        );
+        let err = submit.await.expect("join").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CliError::RelayDeferred {
+                    status: 503,
+                    retry_after_seconds: 90,
+                    ..
+                }
+            ),
+            "deadline-bound hint must return deferred 503, got {err:?}"
+        );
+        assert!(!matches!(err, CliError::DeliveryUnknown(_)));
+        assert_eq!(capture.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn keyed_overflow_retry_after_returns_503_without_early_retry() {
+        let overflow: &'static str = "9999999999999999999999999999999999999999";
+        let (url, capture) = keyed_events_server(move |_n| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                vec![("retry-after", overflow)],
+                r#"{"error":"idempotency unavailable"}"#.to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let t0 = std::time::Instant::now();
+        let err = client
+            .submit_event_with_idempotency_key(event, Some([0x33; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "overflow Retry-After must not fall back to a jitter sleep"
+        );
+        assert!(
+            matches!(err, CliError::RelayRetryAfterOverflow { status: 503, .. }),
+            "overflow hint must return nonretryable overflow 503, got {err:?}"
+        );
+        assert!(!matches!(err, CliError::Relay { .. }));
+        assert!(!matches!(err, CliError::RelayDeferred { .. }));
+        assert!(!matches!(err, CliError::DeliveryUnknown(_)));
+        assert!(!crate::error::is_retryable_error(&err));
+        let json = error_json(&err);
+        assert_eq!(json["error"].as_str(), Some("relay_error"));
+        assert_eq!(json["retryable"].as_bool(), Some(false));
+        assert!(json.get("retry_after_seconds").is_none());
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            1,
+            "overflow Retry-After must not issue another request"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keyed_deadline_cancels_a_stalled_request_without_real_time_wait() {
+        let accepted = Arc::new(AtomicU32::new(0));
+        let accepted2 = accepted.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                accepted2.fetch_add(1, Ordering::SeqCst);
+                let _held = stream;
+                std::future::pending::<()>().await;
+            }
+        });
+        let client = test_client(&format!("http://{addr}"));
+        let event = make_kind9_event(client.keys());
+        let started = tokio::time::Instant::now();
+        let submit = tokio::spawn(async move {
+            client
+                .submit_event_with_idempotency_key(event, Some([0x44; 32]))
+                .await
+        });
+        let mut yields = 0u32;
+        while accepted.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+            yields += 1;
+            assert!(yields < 10_000, "stalled keyed request never connected");
+        }
+        tokio::time::advance(Duration::from_secs(KEYED_OPERATION_DEADLINE_SECS)).await;
+        let err = tokio::time::timeout(Duration::from_secs(1), submit)
+            .await
+            .expect("outer keyed deadline must fire on paused Tokio time")
+            .expect("join")
+            .unwrap_err();
+        assert!(
+            matches!(err, CliError::DeliveryUnknown(_)),
+            "in-flight deadline expiry must be ambiguous, got {err:?}"
+        );
+        assert!(
+            started.elapsed()
+                <= Duration::from_secs(KEYED_OPERATION_DEADLINE_SECS) + Duration::from_secs(1),
+            "stalled keyed submit must not outlive the outer Tokio deadline"
+        );
+    }
+
+    /// A keyed 503 with a valid positive Retry-After is definitive. Parking in
+    /// the retry sleep and jumping the whole remaining deadline must classify
+    /// that known 503 as [`CliError::RelayDeferred`], never
+    /// [`CliError::DeliveryUnknown`], and must not start another request.
+    #[tokio::test(start_paused = true)]
+    async fn keyed_retry_sleep_deadline_crossing_returns_deferred_floor() {
+        let (url, capture) = keyed_events_server(|_n| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                vec![("retry-after", "60")],
+                r#"{"error":"idempotency unavailable"}"#.to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let submit = tokio::spawn(async move {
+            client
+                .submit_event_with_idempotency_key(event, Some([0x66; 32]))
+                .await
+        });
+
+        let mut first_attempt_yields = 0u32;
+        while capture.attempts.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+            first_attempt_yields += 1;
+            assert!(
+                first_attempt_yields < 10_000,
+                "first keyed 503 never arrived"
+            );
+        }
+        assert_eq!(capture.attempts.load(Ordering::SeqCst), 1);
+
+        // The server increments `attempts` before returning the 503. Yield
+        // until the client has consumed it and parked on Retry-After.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(Duration::from_secs(KEYED_OPERATION_DEADLINE_SECS)).await;
+        let err = tokio::time::timeout(Duration::from_secs(1), submit)
+            .await
+            .expect("retry-sleep deadline crossing must resolve on paused Tokio time")
+            .expect("join")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CliError::RelayDeferred {
+                    status: 503,
+                    retry_after_seconds: 60,
+                    ..
+                }
+            ),
+            "retry-sleep deadline crossing must preserve the Retry-After floor, got {err:?}"
+        );
+        assert!(
+            !matches!(err, CliError::DeliveryUnknown(_)),
+            "retry-sleep deadline crossing must not invent DeliveryUnknown, got {err:?}"
+        );
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            1,
+            "must not start another request after the deadline"
+        );
+    }
+
+    async fn drive_keyed_attempts_on_paused_time(capture: &Arc<KeyedCapture>, expected: u32) {
+        let mut yields = 0u32;
+        while capture.attempts.load(Ordering::SeqCst) < expected {
+            tokio::task::yield_now().await;
+            yields += 1;
+            if yields.is_multiple_of(16) {
+                tokio::time::advance(Duration::from_secs(2)).await;
+            }
+            assert!(
+                yields < 10_000,
+                "keyed attempt {expected} never arrived (have {})",
+                capture.attempts.load(Ordering::SeqCst)
+            );
+        }
+    }
+
+    async fn wait_for_keyed_attempt(capture: &Arc<KeyedCapture>, expected: u32) {
+        let mut yields = 0u32;
+        while capture.attempts.load(Ordering::SeqCst) < expected {
+            tokio::task::yield_now().await;
+            yields += 1;
+            assert!(
+                yields < 10_000,
+                "keyed attempt {expected} did not run after Retry-After"
+            );
+        }
+    }
+
+    /// Four consecutive keyed HTTP 503s must exhaust the keyed attempt budget
+    /// and return the original 503 without panicking on extra-attempt jitter.
+    #[tokio::test(start_paused = true)]
+    async fn keyed_three_503s_return_relay_error_without_panic() {
+        let (url, capture) = keyed_events_server(|_n| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Vec::new(),
+                r#"{"error":"idempotency unavailable"}"#.to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let submit = tokio::spawn(async move {
+            client
+                .submit_event_with_idempotency_key(event, Some([0x50; 32]))
+                .await
+        });
+        drive_keyed_attempts_on_paused_time(&capture, KEYED_RETRY_MAX_ATTEMPTS).await;
+        let err = submit.await.expect("join").unwrap_err();
+        assert!(
+            matches!(err, CliError::Relay { status: 503, .. }),
+            "exhausted keyed 503 must surface Relay(503), got {err:?}"
+        );
+        assert!(
+            crate::error::is_retryable_error(&err),
+            "exhausted keyed 503 must remain retryable, got {err:?}"
+        );
+        assert!(!matches!(err, CliError::DeliveryUnknown(_)));
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            KEYED_RETRY_MAX_ATTEMPTS,
+            "all four keyed attempts must fire"
+        );
+        let bodies = capture.bodies.lock().unwrap().clone();
+        let keys = capture.keys.lock().unwrap().clone();
+        let auths = capture.auths.lock().unwrap().clone();
+        assert_eq!(bodies.len(), KEYED_RETRY_MAX_ATTEMPTS as usize);
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(bodies[1], bodies[2]);
+        assert_eq!(bodies[2], bodies[3]);
+        assert_eq!(keys[0], keys[1]);
+        assert_eq!(keys[1], keys[2]);
+        assert_eq!(keys[2], keys[3]);
+        let first_auth = nip98_event_from_authorization(&auths[0]);
+        let last_auth = nip98_event_from_authorization(&auths[3]);
+        assert_ne!(first_auth.id, last_auth.id);
+    }
+
+    /// Four consecutive keyed HTTP 503s whose final response carries an
+    /// in-bound representable Retry-After must exhaust attempts without panic
+    /// and preserve that wait floor as structured deferred output.
+    #[tokio::test(start_paused = true)]
+    async fn keyed_three_503s_preserve_final_in_bound_retry_after_floor() {
+        let (url, capture) = keyed_events_server(|n| {
+            let headers = if n == KEYED_RETRY_MAX_ATTEMPTS {
+                vec![("retry-after", "1")]
+            } else {
+                Vec::new()
+            };
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                headers,
+                r#"{"error":"idempotency unavailable"}"#.to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let submit = tokio::spawn(async move {
+            client
+                .submit_event_with_idempotency_key(event, Some([0x52; 32]))
+                .await
+        });
+        drive_keyed_attempts_on_paused_time(&capture, KEYED_RETRY_MAX_ATTEMPTS).await;
+        let err = submit.await.expect("join").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CliError::RelayDeferred {
+                    status: 503,
+                    retry_after_seconds: 1,
+                    ..
+                }
+            ),
+            "final in-bound Retry-After must surface RelayDeferred, got {err:?}"
+        );
+        assert!(
+            !crate::error::is_retryable_error(&err),
+            "deferred floor must not invite an immediate outer retry, got {err:?}"
+        );
+        assert!(!matches!(err, CliError::DeliveryUnknown(_)));
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            KEYED_RETRY_MAX_ATTEMPTS,
+            "all four keyed attempts must fire"
+        );
+        let bodies = capture.bodies.lock().unwrap().clone();
+        let keys = capture.keys.lock().unwrap().clone();
+        let auths = capture.auths.lock().unwrap().clone();
+        assert_eq!(bodies.len(), KEYED_RETRY_MAX_ATTEMPTS as usize);
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(bodies[1], bodies[2]);
+        assert_eq!(bodies[2], bodies[3]);
+        assert_eq!(keys[0], keys[1]);
+        assert_eq!(keys[1], keys[2]);
+        assert_eq!(keys[2], keys[3]);
+        let first_auth = nip98_event_from_authorization(&auths[0]);
+        let last_auth = nip98_event_from_authorization(&auths[3]);
+        assert_ne!(first_auth.id, last_auth.id);
+    }
+
+    /// Three consecutive keyed 503s with `Retry-After: 5` must not start a
+    /// fourth request before 15 seconds. The fourth attempt may then succeed
+    /// with the same body/key and a fresh NIP-98 Authorization.
+    #[tokio::test(start_paused = true)]
+    async fn keyed_three_retry_after_5_succeeds_on_fourth_attempt_after_15s() {
+        let (url, capture) = keyed_events_server(|n| {
+            if n < KEYED_RETRY_MAX_ATTEMPTS {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    vec![("retry-after", "5")],
+                    r#"{"error":"idempotency unavailable"}"#.to_string(),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    Vec::new(),
+                    r#"{"event_id":"abc","accepted":true,"message":""}"#.to_string(),
+                )
+            }
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let key = [0x15; 32];
+        let submit = tokio::spawn(async move {
+            client
+                .submit_event_with_idempotency_key(event, Some(key))
+                .await
+        });
+
+        let mut first_attempt_yields = 0u32;
+        while capture.attempts.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+            first_attempt_yields += 1;
+            assert!(
+                first_attempt_yields < 10_000,
+                "first keyed 503 never arrived"
+            );
+        }
+        assert_eq!(capture.attempts.load(Ordering::SeqCst), 1);
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        let retry_after_started = tokio::time::Instant::now();
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            1,
+            "must not retry inside the first Retry-After: 5 window"
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        wait_for_keyed_attempt(&capture, 2).await;
+        assert!(retry_after_started.elapsed() >= Duration::from_secs(5));
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            2,
+            "must not start the third request inside the second Retry-After: 5 window"
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        wait_for_keyed_attempt(&capture, 3).await;
+        assert!(retry_after_started.elapsed() >= Duration::from_secs(10));
+
+        let elapsed = retry_after_started.elapsed();
+        if elapsed < Duration::from_secs(14) {
+            tokio::time::sleep(Duration::from_secs(14) - elapsed).await;
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            3,
+            "must not start a fourth request before 15 seconds"
+        );
+        assert!(
+            retry_after_started.elapsed() < Duration::from_secs(15),
+            "pre-15s probe must remain before the legal capacity-release floor"
+        );
+
+        // Floor is 5s; extra keyed jitter is in [0, 1.5). Advance past the
+        // combined ceiling so the fourth attempt is not timing-flaky.
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        wait_for_keyed_attempt(&capture, KEYED_RETRY_MAX_ATTEMPTS).await;
+        assert!(
+            retry_after_started.elapsed() >= Duration::from_secs(15),
+            "fourth attempt must start no earlier than 15 seconds"
+        );
+
+        let result = submit.await.expect("join keyed submit");
+        assert!(
+            result.is_ok(),
+            "expected Ok on the fourth keyed attempt, got {result:?}"
+        );
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            KEYED_RETRY_MAX_ATTEMPTS
+        );
+
+        let bodies = capture.bodies.lock().unwrap().clone();
+        let keys = capture.keys.lock().unwrap().clone();
+        let auths = capture.auths.lock().unwrap().clone();
+        assert_eq!(bodies.len(), KEYED_RETRY_MAX_ATTEMPTS as usize);
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(bodies[1], bodies[2]);
+        assert_eq!(bodies[2], bodies[3]);
+        let expected_key = hex::encode(key);
+        assert_eq!(
+            keys,
+            vec![
+                expected_key.clone(),
+                expected_key.clone(),
+                expected_key.clone(),
+                expected_key
+            ]
+        );
+        let mut auth_ids = Vec::new();
+        let expected_payload = hex::encode(Sha256::digest(&bodies[0]));
+        for auth in &auths {
+            let event = nip98_event_from_authorization(auth);
+            event.verify().unwrap();
+            assert_eq!(payload_tag(&event), expected_payload);
+            auth_ids.push(event.id);
+        }
+        assert_eq!(auth_ids.len(), 4);
+        for i in 1..auth_ids.len() {
+            assert_ne!(
+                auth_ids[i - 1],
+                auth_ids[i],
+                "each attempt must carry a freshly signed NIP-98 event"
+            );
+        }
+    }
+
+    /// Keyed connect-failure exhaustion must return the network error, never
+    /// panic on last-attempt jitter indexing.
+    #[tokio::test(start_paused = true)]
+    async fn keyed_three_connect_failures_return_network_error_without_panic() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = test_client(&format!("http://{addr}"));
+        let event = make_kind9_event(client.keys());
+        let submit = tokio::spawn(async move {
+            client
+                .submit_event_with_idempotency_key(event, Some([0x51; 32]))
+                .await
+        });
+        let mut steps = 0u32;
+        while !submit.is_finished() {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(2)).await;
+            steps += 1;
+            assert!(
+                steps < 10_000,
+                "keyed connect exhaustion never finished on paused time"
+            );
+        }
+        let err = submit.await.expect("join").unwrap_err();
+        assert!(
+            matches!(err, CliError::Network(_)),
+            "exhausted keyed connect failures must surface Network, got {err:?}"
+        );
+        assert!(
+            crate::error::is_retryable_error(&err),
+            "keyed connect exhaustion must remain retryable, got {err:?}"
+        );
+        assert!(!matches!(err, CliError::DeliveryUnknown(_)));
+        let description = format!("{err:?}");
+        assert!(
+            !description.contains("outcome unknown"),
+            "keyed connect failure must not be labeled DeliveryUnknown; got: {description}"
+        );
+    }
+
+    struct RedirectVictim {
+        hits: AtomicU32,
+        bodies: Mutex<Vec<Vec<u8>>>,
+        keys: Mutex<Vec<Option<String>>>,
+    }
+
+    /// 307/308 must stop at the original `/events` POST. The redirect target
+    /// must not receive the signed body or `Idempotency-Key`, and the client
+    /// must not treat the 3xx as a 503/network retry.
+    async fn keyed_redirect_does_not_forward(status: StatusCode) {
+        const BODY_SENTINEL: &str = "keyed-redirect-body-must-not-surface";
+        let expected_status = status.as_u16();
+
+        let victim = Arc::new(RedirectVictim {
+            hits: AtomicU32::new(0),
+            bodies: Mutex::new(Vec::new()),
+            keys: Mutex::new(Vec::new()),
+        });
+        let victim_state = victim.clone();
+        let victim_app =
+            Router::new().fallback(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let victim_state = victim_state.clone();
+                async move {
+                    victim_state.hits.fetch_add(1, Ordering::SeqCst);
+                    victim_state.bodies.lock().unwrap().push(body.to_vec());
+                    let key = headers
+                        .get("idempotency-key")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    victim_state.keys.lock().unwrap().push(key);
+                    StatusCode::OK
+                }
+            });
+        let victim_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let victim_addr: SocketAddr = victim_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(victim_listener, victim_app).await.unwrap() });
+
+        let origin_hits = Arc::new(AtomicU32::new(0));
+        let origin_hits2 = origin_hits.clone();
+        let location = format!("http://{victim_addr}/sink");
+        let origin_app = Router::new().route(
+            "/events",
+            post(move || {
+                let origin_hits2 = origin_hits2.clone();
+                let location = location.clone();
+                async move {
+                    origin_hits2.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .status(status)
+                        .header("location", location)
+                        .header("content-type", "text/plain")
+                        .body(axum::body::Body::from(BODY_SENTINEL))
+                        .unwrap()
+                }
+            }),
+        );
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr: SocketAddr = origin_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(origin_listener, origin_app).await.unwrap() });
+
+        let client = test_client(&format!("http://{origin_addr}"));
+        let event = make_kind9_event(client.keys());
+        let err = client
+            .submit_event_with_idempotency_key(event, Some([0x37; 32]))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                CliError::Relay { status: s, body } if *s == expected_status && !body.contains(BODY_SENTINEL)
+            ),
+            "keyed {expected_status} must be a bounded Relay error without the 3xx body, got {err:?}"
+        );
+        assert!(
+            !matches!(err, CliError::Network(_)),
+            "keyed {expected_status} must not be retried as a network error, got {err:?}"
+        );
+        assert!(
+            !matches!(err, CliError::DeliveryUnknown(_)),
+            "keyed {expected_status} must not be DeliveryUnknown, got {err:?}"
+        );
+        assert!(
+            !crate::error::is_retryable_error(&err),
+            "keyed {expected_status} must not enter 503/network retry, got {err:?}"
+        );
+        assert_eq!(
+            origin_hits.load(Ordering::SeqCst),
+            1,
+            "original keyed endpoint must be contacted only once"
+        );
+        assert_eq!(
+            victim.hits.load(Ordering::SeqCst),
+            0,
+            "redirect target must not be contacted"
+        );
+        let victim_bodies = victim.bodies.lock().unwrap().clone();
+        let victim_keys = victim.keys.lock().unwrap().clone();
+        assert!(
+            victim_bodies.iter().all(|b| b.is_empty()),
+            "redirect target must not receive the signed body, got {victim_bodies:?}"
+        );
+        assert!(
+            victim_keys.iter().all(|k| k.is_none()),
+            "redirect target must not receive Idempotency-Key, got {victim_keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_307_does_not_forward_body_or_idempotency_key() {
+        keyed_redirect_does_not_forward(StatusCode::TEMPORARY_REDIRECT).await;
+    }
+
+    #[tokio::test]
+    async fn keyed_308_does_not_forward_body_or_idempotency_key() {
+        keyed_redirect_does_not_forward(StatusCode::PERMANENT_REDIRECT).await;
+    }
+
+    fn assert_keyed_oversize(err: &CliError, hostile: &str) {
+        match err {
+            CliError::KeyedResponseTooLarge { limit } => {
+                assert_eq!(*limit, KEYED_RESPONSE_MAX_BYTES);
+            }
+            other => panic!("expected KeyedResponseTooLarge, got {other:?}"),
+        }
+        assert!(
+            !matches!(err, CliError::Network(_)),
+            "oversize must not surface as Network, got {err:?}"
+        );
+        assert!(
+            !matches!(err, CliError::Relay { .. }),
+            "oversize must not surface as Relay, got {err:?}"
+        );
+        assert!(
+            !matches!(err, CliError::DeliveryUnknown(_)),
+            "oversize must not surface as DeliveryUnknown, got {err:?}"
+        );
+        assert!(
+            !matches!(err, CliError::RelayDeferred { .. }),
+            "oversize must not surface as RelayDeferred, got {err:?}"
+        );
+        let display = err.to_string();
+        assert!(!display.contains(hostile));
+        assert!(!format!("{err:?}").contains(hostile));
+        assert!(!error_json(err).to_string().contains(hostile));
+        assert!(!is_retryable_error(err));
+    }
+
+    async fn spawn_keyed_http_then_hold(response: Vec<u8>) -> (String, Arc<AtomicU32>) {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts2 = attempts.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            attempts2.fetch_add(1, Ordering::SeqCst);
+            let mut buf = vec![0u8; 8192];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream.write_all(&response).await;
+            // Keep the connection open so a client that waits for the rest of
+            // the body cannot complete by seeing EOF.
+            let mut unused = [0u8; 1];
+            let _ = stream.read(&mut unused).await;
+        });
+        (format!("http://{addr}"), attempts)
+    }
+
+    async fn spawn_keyed_http_complete(response: Vec<u8>) -> (String, Arc<AtomicU32>) {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts2 = attempts.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            attempts2.fetch_add(1, Ordering::SeqCst);
+            let mut buf = vec![0u8; 8192];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream.write_all(&response).await;
+        });
+        (format!("http://{addr}"), attempts)
+    }
+
+    #[tokio::test]
+    async fn keyed_response_at_byte_ceiling_is_accepted() {
+        let limit = KEYED_RESPONSE_MAX_BYTES;
+        let body = "a".repeat(limit);
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {limit}\r\n\r\n"
+        )
+        .into_bytes();
+        response.extend_from_slice(body.as_bytes());
+        let (url, attempts) = spawn_keyed_http_complete(response).await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let got = client
+            .submit_event_with_idempotency_key(event, Some([0x60; 32]))
+            .await
+            .unwrap();
+        assert_eq!(got.len(), limit);
+        assert_eq!(got, body);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn keyed_declared_oversize_response_is_rejected_before_body_collection() {
+        const HOSTILE: &str = "hostile-keyed-response-body";
+        let limit = KEYED_RESPONSE_MAX_BYTES;
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            limit + 1
+        );
+        let (url, attempts) = spawn_keyed_http_then_hold(headers.into_bytes()).await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.submit_event_with_idempotency_key(event, Some([0x61; 32])),
+        )
+        .await
+        .expect("declared oversize must not wait for an omitted body")
+        .unwrap_err();
+        assert_keyed_oversize(&err, HOSTILE);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn keyed_chunked_oversize_stops_at_first_cumulative_over_limit_chunk() {
+        const HOSTILE: &str = "hostile-chunked-keyed-response";
+        let limit = KEYED_RESPONSE_MAX_BYTES;
+        let first = HOSTILE.len();
+        let second = limit + 1 - first;
+        assert_eq!(first + second, limit + 1);
+        assert_ne!(second, limit + 1);
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{first:x}\r\n")
+                .into_bytes();
+        response.extend_from_slice(HOSTILE.as_bytes());
+        response.extend_from_slice(format!("\r\n{second:x}\r\n").as_bytes());
+        response.extend(vec![b'x'; second]);
+        response.extend_from_slice(b"\r\n");
+        // No terminating 0-chunk. Waiting for the rest of the stream would hang.
+        let (url, attempts) = spawn_keyed_http_then_hold(response).await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.submit_event_with_idempotency_key(event, Some([0x62; 32])),
+        )
+        .await
+        .expect("chunked oversize must not wait for a terminating chunk")
+        .unwrap_err();
+        assert_keyed_oversize(&err, HOSTILE);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn keyed_missing_length_oversize_is_rejected() {
+        const HOSTILE: &str = "hostile-missing-length-keyed-response";
+        let limit = KEYED_RESPONSE_MAX_BYTES;
+        let mut body = HOSTILE.as_bytes().to_vec();
+        body.extend(vec![b'x'; limit + 1 - HOSTILE.len()]);
+        assert_eq!(body.len(), limit + 1);
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
+        response.extend_from_slice(&body);
+        let (url, attempts) = spawn_keyed_http_complete(response).await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let err = client
+            .submit_event_with_idempotency_key(event, Some([0x63; 32]))
+            .await
+            .unwrap_err();
+        assert_keyed_oversize(&err, HOSTILE);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn keyed_in_bound_json_400_maps_to_relay_with_extracted_message() {
+        let (url, capture) = keyed_events_server(|_n| {
+            (
+                StatusCode::BAD_REQUEST,
+                Vec::new(),
+                r#"{"error":"event schema rejected"}"#.to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let err = client
+            .submit_event_with_idempotency_key(event, Some([0x64; 32]))
+            .await
+            .unwrap_err();
+        match &err {
+            CliError::Relay { status: 400, body } => {
+                assert_eq!(body, "event schema rejected");
+            }
+            other => panic!(
+                "in-bound keyed 400 must map to Relay {{ status: 400 }} with extracted message, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            1,
+            "keyed 400 must not be retried"
+        );
+        assert!(!matches!(err, CliError::KeyedResponseTooLarge { .. }));
+        assert!(!matches!(err, CliError::Network(_)));
+        assert!(!matches!(err, CliError::DeliveryUnknown(_)));
+        assert!(!matches!(err, CliError::RelayDeferred { .. }));
+    }
+
+    #[tokio::test]
+    async fn keyed_503_retry_after_3600_is_deferred_after_one_attempt() {
+        let (url, capture) = keyed_events_server(|_n| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                vec![("retry-after", "3600")],
+                r#"{"error":"idempotency unavailable"}"#.to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_kind9_event(client.keys());
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.submit_event_with_idempotency_key(event, Some([0x65; 32])),
+        )
+        .await
+        .expect("Retry-After 3600 must not hang inside the keyed loop")
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CliError::RelayDeferred {
+                    status: 503,
+                    retry_after_seconds: 3600,
+                    ..
+                }
+            ),
+            "503 Retry-After 3600 must return RelayDeferred after one attempt, got {err:?}"
+        );
+        assert_eq!(
+            capture.attempts.load(Ordering::SeqCst),
+            1,
+            "Retry-After 3600 must not issue another request"
+        );
+        assert!(!is_retryable_error(&err));
+        assert!(!matches!(err, CliError::KeyedResponseTooLarge { .. }));
+        assert!(!matches!(err, CliError::Network(_)));
+        assert!(!matches!(err, CliError::DeliveryUnknown(_)));
+        assert!(!matches!(err, CliError::Relay { .. }));
+    }
+}
+
+#[cfg(test)]
+mod public_metadata_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    use nostr::Keys;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::{
+        declared_public_metadata_too_large, public_metadata_chunk_exceeds_limit, BuzzClient,
+        BOUNDED_PUBLIC_METADATA_ERROR, NIP11_PUBLIC_METADATA_MAX_BYTES,
+    };
+    use crate::error::{error_json, is_retryable_error, CliError};
+
+    fn test_client(base_url: &str) -> BuzzClient {
+        BuzzClient::new(base_url.to_string(), Keys::generate(), None, None).unwrap()
+    }
+
+    fn assert_oversize(err: &CliError, hostile: &str) {
+        match err {
+            CliError::PublicMetadataTooLarge { limit } => {
+                assert_eq!(*limit, NIP11_PUBLIC_METADATA_MAX_BYTES);
+            }
+            other => panic!("expected PublicMetadataTooLarge, got {other:?}"),
+        }
+        let display = err.to_string();
+        assert_eq!(
+            display,
+            format!("public metadata exceeds {NIP11_PUBLIC_METADATA_MAX_BYTES} bytes")
+        );
+        assert!(!display.contains(hostile));
+        assert!(!format!("{err:?}").contains(hostile));
+        assert!(!error_json(err).to_string().contains(hostile));
+        assert!(!is_retryable_error(err));
+    }
+
+    async fn spawn_http_then_hold(response: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream.write_all(&response).await;
+            // Keep the connection open so a client that waits for the rest of
+            // the body cannot complete by seeing EOF.
+            let mut unused = [0u8; 1];
+            let _ = stream.read(&mut unused).await;
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_http_complete(response: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream.write_all(&response).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn json_of_size(size: usize) -> String {
+        let mut doc = serde_json::json!({
+            "supported_extensions": ["buzz-idempotency"],
+            "idempotency": buzz_core::idempotency::canonical_nip11_descriptor(),
+            "pad": ""
+        });
+        let base_len = serde_json::to_string(&doc).unwrap().len();
+        assert!(size >= base_len);
+        doc["pad"] = serde_json::json!("a".repeat(size - base_len));
+        let body = serde_json::to_string(&doc).unwrap();
+        assert_eq!(body.len(), size);
+        body
+    }
+
+    #[test]
+    fn declared_length_at_ceiling_is_accepted_by_the_predicate() {
+        let limit = NIP11_PUBLIC_METADATA_MAX_BYTES;
+        assert!(!declared_public_metadata_too_large(
+            Some(limit as u64),
+            limit
+        ));
+        assert!(declared_public_metadata_too_large(
+            Some(limit as u64 + 1),
+            limit
+        ));
+        assert!(!declared_public_metadata_too_large(None, limit));
+    }
+
+    #[test]
+    fn incremental_chunk_predicate_trips_on_first_over_limit_chunk() {
+        let limit = NIP11_PUBLIC_METADATA_MAX_BYTES;
+        assert!(!public_metadata_chunk_exceeds_limit(0, limit, limit));
+        assert!(public_metadata_chunk_exceeds_limit(0, limit + 1, limit));
+        assert!(public_metadata_chunk_exceeds_limit(limit, 1, limit));
+        assert!(!public_metadata_chunk_exceeds_limit(limit - 1, 1, limit));
+    }
+
+    #[tokio::test]
+    async fn oversized_declared_length_is_rejected_before_body_collection() {
+        const HOSTILE: &str = "hostile-nip11-body";
+        let limit = NIP11_PUBLIC_METADATA_MAX_BYTES;
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            limit + 1
+        );
+        // Intentionally omit the body. Collecting by Content-Length would wait
+        // for limit+1 bytes that never arrive.
+        let url = spawn_http_then_hold(headers.into_bytes()).await;
+        let err = test_client(&url)
+            .get_public_metadata("/")
+            .await
+            .unwrap_err();
+        assert_oversize(&err, HOSTILE);
+    }
+
+    #[tokio::test]
+    async fn chunked_missing_length_overflow_stops_at_first_over_limit_chunk() {
+        const HOSTILE: &str = "hostile-chunked-nip11";
+        let limit = NIP11_PUBLIC_METADATA_MAX_BYTES;
+        let over = limit + 1;
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nxxxxxxxx\r\n{over:x}\r\n"
+        )
+        .into_bytes();
+        response.extend(vec![b'x'; over]);
+        response.extend_from_slice(b"\r\n");
+        // No terminating 0-chunk. Waiting for the rest of the stream would hang.
+        let url = spawn_http_then_hold(response).await;
+        let err = test_client(&url)
+            .get_public_metadata("/")
+            .await
+            .unwrap_err();
+        assert_oversize(&err, HOSTILE);
+    }
+
+    #[tokio::test]
+    async fn valid_document_at_accepted_byte_boundary_is_returned() {
+        let limit = NIP11_PUBLIC_METADATA_MAX_BYTES;
+        let body = json_of_size(limit);
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {limit}\r\n\r\n"
+        )
+        .into_bytes();
+        response.extend_from_slice(body.as_bytes());
+        let url = spawn_http_complete(response).await;
+        let got = test_client(&url).get_public_metadata("/").await.unwrap();
+        assert_eq!(got.len(), limit);
+        assert_eq!(got, body);
+        let parsed: serde_json::Value = serde_json::from_str(&got).unwrap();
+        assert!(buzz_core::idempotency::nip11_keyed_client_accepts(&parsed));
+    }
+
+    #[tokio::test]
+    async fn oversized_error_response_is_not_echoed() {
+        const HOSTILE: &str = "hostile-error-body";
+        let limit = NIP11_PUBLIC_METADATA_MAX_BYTES;
+        let headers = format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{HOSTILE}",
+            limit + 1
+        );
+        let url = spawn_http_then_hold(headers.into_bytes()).await;
+        let err = test_client(&url)
+            .get_public_metadata("/")
+            .await
+            .unwrap_err();
+        assert_oversize(&err, HOSTILE);
+        assert!(!matches!(err, CliError::Relay { status: 500, .. }));
+        assert!(!matches!(err, CliError::Network(_)));
+    }
+
+    #[tokio::test]
+    async fn in_bound_error_response_is_not_echoed() {
+        const HOSTILE: &str = "hostile-in-bound-nip11-error";
+        let body = format!(r#"{{"error":"{HOSTILE}","message":"{HOSTILE}"}}"#);
+        let len = body.len();
+        assert!(len <= NIP11_PUBLIC_METADATA_MAX_BYTES);
+        let response = format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {len}\r\n\r\n{body}"
+        );
+        let url = spawn_http_complete(response.into_bytes()).await;
+        let err = test_client(&url)
+            .get_public_metadata("/")
+            .await
+            .unwrap_err();
+        match &err {
+            CliError::Relay { status: 500, body } => {
+                assert_eq!(body, BOUNDED_PUBLIC_METADATA_ERROR);
+            }
+            other => panic!(
+                "in-bound NIP-11 error must keep HTTP status and Relay family, got {other:?}"
+            ),
+        }
+        assert!(!matches!(err, CliError::PublicMetadataTooLarge { .. }));
+        assert!(!matches!(err, CliError::Conflict(_)));
+        let display = err.to_string();
+        assert_eq!(
+            display,
+            format!("relay error 500: {BOUNDED_PUBLIC_METADATA_ERROR}")
+        );
+        assert!(!display.contains(HOSTILE));
+        assert!(!format!("{err:?}").contains(HOSTILE));
+        let json = error_json(&err);
+        assert!(!json.to_string().contains(HOSTILE));
+        assert_eq!(
+            json.get("message").and_then(|m| m.as_str()),
+            Some(display.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_preflight_does_not_follow_redirect_to_loopback() {
+        let victim_hits = Arc::new(AtomicU32::new(0));
+        let victim_hits2 = victim_hits.clone();
+        let victim = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let victim_addr = victim.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = victim.accept().await else {
+                    break;
+                };
+                victim_hits2.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+                    .await;
+            }
+        });
+
+        let redirector = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirector_addr = redirector.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = redirector.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let location = format!("http://{victim_addr}/secret");
+                let body = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\n\r\n"
+                );
+                let _ = stream.write_all(body.as_bytes()).await;
+            }
+        });
+
+        let result = test_client(&format!("http://{redirector_addr}"))
+            .get_public_metadata("/")
+            .await;
+        assert!(
+            matches!(result, Err(CliError::Relay { status: 302, .. })),
+            "bounded NIP-11 preflight must not follow the redirect, got {result:?}"
+        );
+        assert_eq!(
+            victim_hits.load(Ordering::SeqCst),
+            0,
+            "loopback redirect target must never be contacted"
         );
     }
 }

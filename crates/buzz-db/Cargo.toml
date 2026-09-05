@@ -27,3 +27,4 @@ metrics     = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 metrics-util = { workspace = true }
+buzz-core = { workspace = true, features = ["test-utils"] }

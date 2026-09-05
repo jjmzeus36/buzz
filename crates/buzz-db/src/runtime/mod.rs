@@ -12,49 +12,126 @@ use uuid::Uuid;
 
 use buzz_core::{CommunityId, StoredEvent};
 
+/// Maximum rows bound into one `event_mentions` INSERT. Six parameters per
+/// row stay under PostgreSQL's 65,535 bind-parameter cap.
+pub(crate) const MENTION_INSERT_CHUNK_ROWS: usize = 5_000;
+
+/// Valid normalized p-tag pubkeys plus the count of malformed actual `p` tags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExtractedMentionPTags {
+    pub valid_pubkeys: Vec<String>,
+    pub malformed_p_tags: usize,
+}
+
+/// Extract p-tag mentions: exact lowercase `"p"`, 64-byte ASCII hex values
+/// normalized to lowercase. Trailing tag fields are allowed. Non-`p` tags are
+/// ignored and not counted. Every valid occurrence is preserved in order.
+pub(crate) fn extract_mention_p_tags(event: &nostr::Event) -> ExtractedMentionPTags {
+    let mut valid_pubkeys = Vec::new();
+    let mut malformed_p_tags = 0usize;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        match parts {
+            [kind, value, ..] if kind == "p" => {
+                let value = value.as_str();
+                if value.len() == 64 && value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+                    valid_pubkeys.push(value.to_ascii_lowercase());
+                } else {
+                    malformed_p_tags = malformed_p_tags.saturating_add(1);
+                }
+            }
+            [kind, ..] if kind == "p" => {
+                malformed_p_tags = malformed_p_tags.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    ExtractedMentionPTags {
+        valid_pubkeys,
+        malformed_p_tags,
+    }
+}
+
+fn emit_malformed_p_tag_debug(event: &nostr::Event, malformed_p_tags: usize) {
+    if malformed_p_tags == 0 {
+        return;
+    }
+    tracing::debug!(
+        malformed_p_tags,
+        event_id = %event.id,
+        "skipped malformed p-tags during mention insert"
+    );
+}
+
+/// Proof that [`enforce_kind9_p_tag_limit`] already ran for this write.
+///
+/// The field is private so another module cannot mint the token and skip the
+/// kind-9 cap. Already-validated writers require this value.
+#[derive(Debug)]
+pub(crate) struct Kind9PTagLimitEnforced(());
+
+/// Reject kind-9 writes that exceed the actual lowercase `"p"` tag cap.
+///
+/// Count-only: no mention-row allocation. Unrelated event kinds are unchanged.
+pub(crate) fn enforce_kind9_p_tag_limit(event: &nostr::Event) -> Result<Kind9PTagLimitEnforced> {
+    if u32::from(event.kind.as_u16()) != buzz_core::kind::KIND_STREAM_MESSAGE {
+        return Ok(Kind9PTagLimitEnforced(()));
+    }
+    if buzz_core::idempotency::keyed_p_tag_count(event) > buzz_core::idempotency::KEYED_MAX_P_TAGS {
+        return Err(DbError::InvalidData(
+            "too many p tags for keyed ingest".to_string(),
+        ));
+    }
+    Ok(Kind9PTagLimitEnforced(()))
+}
+
 /// Extract p-tag mentions from an event and insert into the `event_mentions` table.
 ///
-/// This pool-owning wrapper propagates failures to its caller. Replacement writes
-/// use the transaction-bound helper below so event storage and mention indexing
-/// commit or roll back together. Duplicate inserts are silently skipped with
-/// `INSERT ... ON CONFLICT DO NOTHING`.
+/// This pool-owning wrapper inserts mention rows in one transaction and
+/// propagates failures. Duplicate inserts are skipped with
+/// `INSERT ... ON CONFLICT DO NOTHING`. Events with no indexed `p` tags do
+/// not open a transaction.
 pub async fn insert_mentions(
     pool: &PgPool,
     community_id: CommunityId,
     event: &nostr::Event,
     channel_id: Option<Uuid>,
 ) -> Result<()> {
+    let extracted = extract_mention_p_tags(event);
+    if extracted.valid_pubkeys.is_empty() {
+        emit_malformed_p_tag_debug(event, extracted.malformed_p_tags);
+        return Ok(());
+    }
     let connection =
         observability::acquire_writer(pool, observability::WriterOperation::EventWrite).await?;
     let mut tx = sqlx::Transaction::begin(connection, None).await?;
-    insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
+    insert_extracted_mentions_in_transaction(&mut tx, community_id, event, channel_id, &extracted)
+        .await?;
     tx.commit().await?;
     Ok(())
 }
 
-/// Insert mention rows on the caller's transaction. Replacement writes use
-/// this so the authoritative event and its discovery index commit or roll back
-/// as one unit.
+/// Insert mention rows on the caller's transaction so event storage and
+/// mention indexing commit or roll back together.
 pub(crate) async fn insert_mentions_in_transaction(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     community_id: CommunityId,
     event: &nostr::Event,
     channel_id: Option<Uuid>,
 ) -> Result<()> {
-    let p_tags: Vec<&str> = event
-        .tags
-        .iter()
-        .filter_map(|tag| {
-            let tag_vec = tag.as_slice();
-            if tag_vec.len() >= 2 && tag_vec[0] == "p" {
-                Some(tag_vec[1].as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let extracted = extract_mention_p_tags(event);
+    insert_extracted_mentions_in_transaction(tx, community_id, event, channel_id, &extracted).await
+}
 
-    if p_tags.is_empty() {
+async fn insert_extracted_mentions_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    community_id: CommunityId,
+    event: &nostr::Event,
+    channel_id: Option<Uuid>,
+    extracted: &ExtractedMentionPTags,
+) -> Result<()> {
+    emit_malformed_p_tag_debug(event, extracted.malformed_p_tags);
+    if extracted.valid_pubkeys.is_empty() {
         return Ok(());
     }
 
@@ -64,35 +141,11 @@ pub(crate) async fn insert_mentions_in_transaction(
         .ok_or(crate::error::DbError::InvalidTimestamp(created_at_secs))?;
     let kind = event.kind.as_u16() as u32;
 
-    // Validate and normalize pubkeys, logging any malformed ones.
-    let valid_pubkeys: Vec<String> = p_tags
-        .into_iter()
-        .filter(|pk| {
-            if pk.len() != 64 || !pk.chars().all(|c| c.is_ascii_hexdigit()) {
-                tracing::debug!(
-                    event_id = %event.id,
-                    invalid_ptag = pk,
-                    "skipping malformed p-tag in insert_mentions"
-                );
-                false
-            } else {
-                true
-            }
-        })
-        .map(|pk| pk.to_ascii_lowercase())
-        .collect();
-
-    if valid_pubkeys.is_empty() {
-        return Ok(());
-    }
-
     // Multi-row INSERT ... ON CONFLICT DO NOTHING, chunked to stay under
-    // Postgres's 65,535 bind-parameter statement cap (6 binds per row caps a
-    // single statement at ~10.9k rows). Relay-signed kind 39002 rosters carry
-    // one p-tag per channel member and can exceed that. The caller owns the
-    // transaction so all chunks share its commit boundary.
-    const MENTION_INSERT_CHUNK_ROWS: usize = 5_000;
-    for chunk in valid_pubkeys.chunks(MENTION_INSERT_CHUNK_ROWS) {
+    // Postgres's 65,535 bind-parameter statement cap (6 binds per row).
+    // Every valid occurrence is sent; uniqueness is resolved by PostgreSQL.
+    // The caller owns the transaction so all chunks share its commit boundary.
+    for chunk in extracted.valid_pubkeys.chunks(MENTION_INSERT_CHUNK_ROWS) {
         let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
             "INSERT INTO event_mentions \
              (community_id, pubkey_hex, event_id, event_created_at, channel_id, event_kind) ",
@@ -1129,6 +1182,7 @@ impl Db {
             return Err(DbError::EphemeralEventRejected(kind_u16));
         }
 
+        let enforced = enforce_kind9_p_tag_limit(event)?;
         let connection =
             observability::acquire_writer(&self.pool, observability::WriterOperation::EventWrite)
                 .await?;
@@ -1136,20 +1190,19 @@ impl Db {
         self.deletion_store()
             .guard_transaction_with_serving_lease(&mut tx, lease)
             .await?;
-        let result = event::insert_event_with_thread_metadata_tx(
+        let result = event::insert_event_with_thread_metadata_already_validated(
             &mut tx,
             community_id,
             event,
             channel_id,
             None,
+            enforced,
         )
         .await?;
-        tx.commit().await?;
         if result.1 {
-            if let Err(e) = insert_mentions(&self.pool, community_id, event, channel_id).await {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-            }
+            insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
         }
+        tx.commit().await?;
         Ok(result)
     }
 

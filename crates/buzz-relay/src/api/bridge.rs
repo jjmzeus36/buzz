@@ -3,20 +3,31 @@
 //! These endpoints provide HTTP access to the relay's Nostr protocol,
 //! authenticated via NIP-98 signed events.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
+use std::thread::{self, Thread};
+use std::time::Duration;
 
 use axum::{
     extract::{Path, Query, RawQuery, State},
-    http::{HeaderMap, StatusCode},
-    response::Json,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Json, Response},
 };
 use base64::Engine;
+use dashmap::{DashMap, Entry as DashMapEntry};
 use serde_json::Value;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
+use uuid::Uuid;
 
-use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
+use buzz_auth::{LimitType, Nip98ReplayGuard, RateLimiter, DEFAULT_REPLAY_TTL_SECS};
 use buzz_core::TenantContext;
 
-use crate::handlers::ingest::{IngestAuth, IngestError};
+use crate::handlers::ingest::{
+    ingest_keyed_http_event, try_acquire_keyed_ingress, IngestAuth, IngestError,
+    KeyedEarlyDeadline, KeyedHttpEarlyContext, KeyedHttpError, KeyedHttpValidatedEvent,
+    KeyedIngressGuard, KEYED_BUSY_RETRY_AFTER_SECS,
+};
 use crate::state::AppState;
 
 use super::{api_error, internal_error, not_found};
@@ -38,19 +49,27 @@ pub(crate) async fn enforce_http_admission(
     .await
     {
         Ok(()) => Ok(()),
-        Err(crate::admission::AdmissionError::Exceeded { reset_in_secs }) => {
+        Err(error) => Err(http_admission_error_response(error)),
+    }
+}
+
+fn http_admission_error_response(
+    error: crate::admission::AdmissionError,
+) -> (StatusCode, Json<Value>) {
+    match error {
+        crate::admission::AdmissionError::Exceeded { reset_in_secs } => {
             metrics::counter!("buzz_admission_rejections_total", "transport" => "http", "reason" => "quota").increment(1);
-            Err(api_error(
+            api_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 &format!("rate-limited: quota exceeded; retry in {reset_in_secs}s"),
-            ))
+            )
         }
-        Err(crate::admission::AdmissionError::Unavailable) => {
+        crate::admission::AdmissionError::Unavailable => {
             metrics::counter!("buzz_admission_rejections_total", "transport" => "http", "reason" => "unavailable").increment(1);
-            Err(api_error(
+            api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "rate-limited: shared admission unavailable",
-            ))
+            )
         }
     }
 }
@@ -718,16 +737,621 @@ fn truncate_reason(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+#[derive(Debug)]
+enum KeyedHandlerError {
+    InvalidHeader((StatusCode, Json<Value>)),
+}
+
+fn keyed_handler_error_response(error: KeyedHandlerError) -> Response {
+    match error {
+        KeyedHandlerError::InvalidHeader(response) => response.into_response(),
+    }
+}
+
+#[derive(Debug)]
+enum KeyedPreIngestError {
+    Attempt(crate::admission::AdmissionError),
+    Replay((StatusCode, Json<Value>)),
+}
+
+/// Process-global fail-fast cap on concurrent keyed POST /events after NIP-98
+/// and before Redis attempt admission. Distinct from keyed ingress. Never queues.
+const KEYED_PRE_ATTEMPT_GLOBAL_MAX: usize = 32;
+/// Per-bound-community share of pre-attempt capacity. Strictly below global and
+/// at most half of global so one community cannot occupy every slot.
+const KEYED_PRE_ATTEMPT_COMMUNITY_MAX: usize = 16;
+/// Physical bound on registry entries, including dead `Weak` generations
+/// waiting for the cleanup thread. Vacant inserts fail closed at this cap.
+const KEYED_PRE_ATTEMPT_REGISTRY_MAX: usize = 64;
+/// Cleanup-thread `park_timeout` fallback so dead weaks are still reaped if a
+/// Drop `unpark` is lost. Not used on Tokio request workers.
+const KEYED_PRE_ATTEMPT_REAPER_PARK_TIMEOUT: Duration = Duration::from_secs(1);
+
+const _: () = {
+    assert!(KEYED_PRE_ATTEMPT_COMMUNITY_MAX > 0);
+    assert!(KEYED_PRE_ATTEMPT_COMMUNITY_MAX < KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+    assert!(KEYED_PRE_ATTEMPT_COMMUNITY_MAX * 2 <= KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+    assert!(KEYED_PRE_ATTEMPT_GLOBAL_MAX == 32);
+    assert!(KEYED_PRE_ATTEMPT_COMMUNITY_MAX == 16);
+    assert!(KEYED_PRE_ATTEMPT_REGISTRY_MAX >= KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+    assert!(KEYED_PRE_ATTEMPT_REGISTRY_MAX == 64);
+};
+
+/// One registry generation. The weak keeps the map entry after the last permit
+/// drops; `generation` identifies the slot so stale reclaim cannot remove a
+/// replacement for the same UUID.
+struct KeyedPreAttemptEntry {
+    semaphore: Weak<Semaphore>,
+    generation: u64,
+}
+
+/// Injectable process-global semaphore plus per-community weak slots.
+/// Production uses the static pool; tests pass a local instance.
+struct KeyedPreAttemptCapacity {
+    global: Semaphore,
+    registry: DashMap<Uuid, KeyedPreAttemptEntry>,
+    live_entries: AtomicUsize,
+    reaper: OnceLock<Thread>,
+}
+
+impl KeyedPreAttemptCapacity {
+    fn new() -> Self {
+        Self {
+            global: Semaphore::new(KEYED_PRE_ATTEMPT_GLOBAL_MAX),
+            registry: DashMap::new(),
+            live_entries: AtomicUsize::new(0),
+            reaper: OnceLock::new(),
+        }
+    }
+
+    fn unpark_reaper(&self) {
+        if let Some(thread) = self.reaper.get() {
+            thread.unpark();
+        }
+    }
+
+    /// Fail-fast community semaphore checkout. Shard contention, a full
+    /// registry bound, and a closed semaphore return `Err` without touching
+    /// global capacity. Occupied dead weaks are replaced in place with a new
+    /// generation; the bound counter is unchanged for that replacement.
+    fn try_checkout_community_semaphore(
+        &self,
+        community: Uuid,
+    ) -> Result<(Arc<Semaphore>, u64), ()> {
+        let Some(entry) = self.registry.try_entry(community) else {
+            return Err(());
+        };
+        match entry {
+            DashMapEntry::Occupied(mut occupied) => {
+                if let Some(sem) = occupied.get().semaphore.upgrade() {
+                    Ok((sem, occupied.get().generation))
+                } else {
+                    let generation = occupied.get().generation.wrapping_add(1);
+                    let sem = Arc::new(Semaphore::new(KEYED_PRE_ATTEMPT_COMMUNITY_MAX));
+                    occupied.insert(KeyedPreAttemptEntry {
+                        semaphore: Arc::downgrade(&sem),
+                        generation,
+                    });
+                    Ok((sem, generation))
+                }
+            }
+            DashMapEntry::Vacant(vacant) => {
+                if !reserve_keyed_pre_attempt_registry_slot(self) {
+                    return Err(());
+                }
+                let sem = Arc::new(Semaphore::new(KEYED_PRE_ATTEMPT_COMMUNITY_MAX));
+                vacant.insert(KeyedPreAttemptEntry {
+                    semaphore: Arc::downgrade(&sem),
+                    generation: 1,
+                });
+                Ok((sem, 1))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn global_available(&self) -> usize {
+        self.global.available_permits()
+    }
+
+    #[cfg(test)]
+    fn community_count(&self, community: Uuid) -> Option<usize> {
+        self.registry.get(&community).and_then(|entry| {
+            entry
+                .semaphore
+                .upgrade()
+                .map(|sem| KEYED_PRE_ATTEMPT_COMMUNITY_MAX - sem.available_permits())
+        })
+    }
+
+    #[cfg(test)]
+    fn community_live_handles(&self, community: Uuid) -> Option<usize> {
+        self.community_count(community)
+    }
+
+    #[cfg(test)]
+    fn registry_len(&self) -> usize {
+        self.registry.len()
+    }
+
+    #[cfg(test)]
+    fn registry_bound(&self) -> usize {
+        self.live_entries.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn registry_contains(&self, community: Uuid) -> bool {
+        self.registry.contains_key(&community)
+    }
+
+    #[cfg(test)]
+    fn community_generation(&self, community: Uuid) -> Option<u64> {
+        self.registry.get(&community).map(|entry| entry.generation)
+    }
+
+    #[cfg(test)]
+    fn community_live_generation(&self, community: Uuid) -> Option<u64> {
+        self.registry
+            .get(&community)
+            .and_then(|entry| entry.semaphore.upgrade().map(|_| entry.generation))
+    }
+
+    /// Hold this community's registry shard with the same `try_entry` production
+    /// acquire uses. Vacant holds do not insert. Same-thread nested `try_entry`
+    /// on this shard returns `None`.
+    #[cfg(test)]
+    fn try_hold_registry(&self, community: Uuid) -> Option<KeyedPreAttemptRegistryHold<'_>> {
+        self.registry
+            .try_entry(community)
+            .map(|entry| KeyedPreAttemptRegistryHold { _entry: entry })
+    }
+}
+
+impl Drop for KeyedPreAttemptCapacity {
+    fn drop(&mut self) {
+        self.unpark_reaper();
+    }
+}
+
+/// Test-only occupancy of one DashMap shard write lock.
+#[cfg(test)]
+struct KeyedPreAttemptRegistryHold<'a> {
+    _entry: DashMapEntry<'a, Uuid, KeyedPreAttemptEntry>,
+}
+
+/// Fail-fast RAII process-global 32 + per-bound-community 16 pre-attempt
+/// capacity. Distinct from [`KeyedIngressGuard`]. Drop releases the community
+/// permit, then the global permit, then unparks the cleanup thread. Drop does
+/// not park, spawn, or take a registry lock.
+struct KeyedPreAttemptGuard<'a> {
+    community_permit: Option<OwnedSemaphorePermit>,
+    global: Option<SemaphorePermit<'a>>,
+    capacity: &'a KeyedPreAttemptCapacity,
+}
+
+impl Drop for KeyedPreAttemptGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.community_permit.take());
+        drop(self.global.take());
+        self.capacity.unpark_reaper();
+    }
+}
+
+fn reserve_keyed_pre_attempt_registry_slot(capacity: &KeyedPreAttemptCapacity) -> bool {
+    let prev = capacity.live_entries.fetch_add(1, Ordering::AcqRel);
+    if prev >= KEYED_PRE_ATTEMPT_REGISTRY_MAX {
+        capacity.live_entries.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+fn release_keyed_pre_attempt_registry_slots(capacity: &KeyedPreAttemptCapacity, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let mut current = capacity.live_entries.load(Ordering::Acquire);
+    loop {
+        let next = current.saturating_sub(n);
+        match capacity.live_entries.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Remove `community` only when it still stores `expected` and that generation
+/// is dead. A newer generation for the same UUID is left untouched.
+fn reclaim_dead_keyed_pre_attempt_generation(
+    capacity: &KeyedPreAttemptCapacity,
+    community: Uuid,
+    expected: u64,
+) {
+    let Some(entry) = capacity.registry.try_entry(community) else {
+        return;
+    };
+    let DashMapEntry::Occupied(occupied) = entry else {
+        return;
+    };
+    if occupied.get().generation != expected {
+        return;
+    }
+    if occupied.get().semaphore.upgrade().is_some() {
+        return;
+    }
+    occupied.remove();
+    release_keyed_pre_attempt_registry_slots(capacity, 1);
+}
+
+/// Blocking retention of dead weak entries. Runs on the dedicated cleanup
+/// thread, and from tests that observe reaper completion. Never called from
+/// Drop or from a request-worker acquire path.
+fn reap_dead_keyed_pre_attempt_entries(capacity: &KeyedPreAttemptCapacity) {
+    let removed = AtomicUsize::new(0);
+    capacity.registry.retain(|_, entry| {
+        if entry.semaphore.upgrade().is_some() {
+            true
+        } else {
+            removed.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    });
+    release_keyed_pre_attempt_registry_slots(capacity, removed.load(Ordering::Relaxed));
+}
+
+fn keyed_pre_attempt_reaper_loop(capacity: Weak<KeyedPreAttemptCapacity>) {
+    loop {
+        thread::park_timeout(KEYED_PRE_ATTEMPT_REAPER_PARK_TIMEOUT);
+        let Some(capacity) = capacity.upgrade() else {
+            return;
+        };
+        reap_dead_keyed_pre_attempt_entries(&capacity);
+    }
+}
+
+fn try_init_keyed_pre_attempt_capacity() -> Result<Arc<KeyedPreAttemptCapacity>, ()> {
+    let capacity = Arc::new(KeyedPreAttemptCapacity::new());
+    let worker = Arc::downgrade(&capacity);
+    let join = thread::Builder::new()
+        .name("buzz-keyed-pre-attempt-reaper".into())
+        .spawn(move || keyed_pre_attempt_reaper_loop(worker))
+        .map_err(|_| ())?;
+    if capacity.reaper.set(join.thread().clone()).is_err() {
+        join.thread().unpark();
+        return Err(());
+    }
+    Ok(capacity)
+}
+
+fn keyed_pre_attempt_capacity() -> Result<&'static KeyedPreAttemptCapacity, ()> {
+    static CAP: OnceLock<Result<Arc<KeyedPreAttemptCapacity>, ()>> = OnceLock::new();
+    match CAP.get_or_init(try_init_keyed_pre_attempt_capacity) {
+        Ok(capacity) => Ok(capacity.as_ref()),
+        Err(()) => Err(()),
+    }
+}
+
+/// Reserve per-community eligibility before consuming global capacity.
+/// Over-cap community contenders, registry-shard contention, and a full
+/// registry bound fail closed without queueing, parking, or taking a global
+/// slot. Global exhaustion rolls back the community reservation exactly once.
+fn try_acquire_keyed_pre_attempt_from<'a>(
+    capacity: &'a KeyedPreAttemptCapacity,
+    community: Uuid,
+) -> Result<KeyedPreAttemptGuard<'a>, ()> {
+    let (sem, generation) = capacity.try_checkout_community_semaphore(community)?;
+    let community_permit = match sem.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            reclaim_dead_keyed_pre_attempt_generation(capacity, community, generation);
+            capacity.unpark_reaper();
+            return Err(());
+        }
+    };
+    match capacity.global.try_acquire() {
+        Ok(global) => Ok(KeyedPreAttemptGuard {
+            community_permit: Some(community_permit),
+            global: Some(global),
+            capacity,
+        }),
+        Err(_) => {
+            drop(community_permit);
+            reclaim_dead_keyed_pre_attempt_generation(capacity, community, generation);
+            capacity.unpark_reaper();
+            Err(())
+        }
+    }
+}
+
+fn try_acquire_keyed_pre_attempt(community: Uuid) -> Result<KeyedPreAttemptGuard<'static>, ()> {
+    try_acquire_keyed_pre_attempt_from(keyed_pre_attempt_capacity()?, community)
+}
+
+/// Ingress is already held. Drop the pre-attempt guard only after that acquire
+/// so there is no uncovered phase between the two.
+fn handoff_keyed_pre_attempt_to_ingress(
+    ingress: KeyedIngressGuard,
+    pre_attempt: KeyedPreAttemptGuard<'_>,
+) -> KeyedIngressGuard {
+    drop(pre_attempt);
+    ingress
+}
+
+/// Authenticated keyed attempt charge. Invoke exactly once after NIP-98
+/// authentication and pre-attempt capacity, before local ingress or replay.
+async fn admit_keyed_http_attempt<L: RateLimiter>(
+    limiter: &L,
+    tenant: &TenantContext,
+    pubkey: &nostr::PublicKey,
+) -> Result<(), KeyedPreIngestError> {
+    crate::admission::check_keyed_http_attempt_admission(limiter, tenant, pubkey)
+        .await
+        .map_err(KeyedPreIngestError::Attempt)
+}
+
+/// Production keyed POST /events post-auth errors through body validation.
+/// Fresh and persist admission run later, after committed classification.
+#[derive(Debug)]
+enum KeyedHttpAdmitError {
+    PreIngest(KeyedPreIngestError),
+    Parse(serde_json::Error),
+    Membership((StatusCode, Json<Value>)),
+    Body { kind: u32, error: IngestError },
+}
+
+/// Verified owner carried as metadata through classification. Identity
+/// admission uses the authenticated signer, not this owner.
+///
+/// Closed-relay membership already returns a cryptographically verified owner
+/// (`ViaOwner`). Open relays supply [`super::relay_members::extract_nip_oa_owner`],
+/// which itself returns `None` for absent or invalid tags. An attacker-chosen
+/// owner string never enters this function unverified.
+fn keyed_http_verified_owner(
+    membership_owner: Option<nostr::PublicKey>,
+    open_relay_extracted_owner: Option<nostr::PublicKey>,
+) -> Option<nostr::PublicKey> {
+    membership_owner.or(open_relay_extracted_owner)
+}
+
+fn keyed_http_nip98_auth(pubkey: nostr::PublicKey) -> IngestAuth {
+    IngestAuth::Http {
+        pubkey,
+        scopes: buzz_auth::Scope::all_known(),
+        auth_method: crate::handlers::ingest::HttpAuthMethod::Nip98,
+    }
+}
+
+/// Request-local tenant, pubkey, NIP-98 event id, and body.
+struct KeyedHttpAdmitRequest<'req> {
+    tenant: &'req TenantContext,
+    pubkey: nostr::PublicKey,
+    event_id_bytes: [u8; 32],
+    body: &'req [u8],
+    signed_created_at: Option<u64>,
+}
+
+async fn keyed_deadline_io<T, F>(
+    deadline: KeyedEarlyDeadline,
+    fut: F,
+) -> Result<T, KeyedPreIngestError>
+where
+    F: Future<Output = T>,
+{
+    let remaining = deadline.remaining();
+    if remaining.is_zero() {
+        return Err(KeyedPreIngestError::Attempt(
+            crate::admission::AdmissionError::Unavailable,
+        ));
+    }
+    match tokio::time::timeout(remaining, fut).await {
+        Ok(value) => Ok(value),
+        Err(_elapsed) => Err(KeyedPreIngestError::Attempt(
+            crate::admission::AdmissionError::Unavailable,
+        )),
+    }
+}
+
+/// Production keyed POST /events post-attempt orchestration.
+///
+/// Attempt admission and ingress acquisition happen before this helper.
+/// Order here: NIP-98 replay → JSON parse → event signature and
+/// authenticated-author binding → relay membership → cryptographically
+/// verified owner metadata → supported-kind/body/`p` cap. Replay and
+/// membership consume the remaining absolute early deadline. Signature
+/// verification runs in `spawn_blocking` that owns this request's
+/// [`KeyedHttpEarlyContext`], so a timeout cannot release ingress while CPU
+/// work continues. Fresh and persist admission stay with keyed ingest after
+/// committed classification. The returned [`KeyedHttpValidatedEvent`] is the
+/// only input the keyed ingest seam accepts. The same early context is
+/// returned for ingest; it is not reconstructed.
+///
+/// `open_relay_auth_tag` may return a request-local raw NIP-OA auth tag only
+/// when open-relay extraction is applicable. A closed-relay caller must
+/// return `None` so this seam cannot acquire an owner from the header. The
+/// tag is verified here with [`super::relay_members::extract_nip_oa_owner`]
+/// against the authenticated agent; a pre-extracted owner cannot be injected.
+async fn admit_keyed_http_after_attempt<'req, 'tag, Mem, MemFut, Tag>(
+    replay_guard: &dyn Nip98ReplayGuard,
+    request: KeyedHttpAdmitRequest<'req>,
+    membership: Mem,
+    open_relay_auth_tag: Tag,
+    early: KeyedHttpEarlyContext,
+) -> Result<(KeyedHttpValidatedEvent, KeyedHttpEarlyContext), KeyedHttpAdmitError>
+where
+    Mem: FnOnce() -> MemFut + 'req,
+    MemFut:
+        Future<Output = Result<Option<nostr::PublicKey>, (StatusCode, Json<Value>)>> + Send + 'req,
+    Tag: FnOnce() -> Option<&'tag str> + 'req,
+{
+    let KeyedHttpAdmitRequest {
+        tenant,
+        pubkey,
+        event_id_bytes,
+        body,
+        signed_created_at,
+    } = request;
+    let deadline = early.deadline;
+    match keyed_deadline_io(
+        deadline,
+        check_nip98_replay_with_guard(replay_guard, tenant, event_id_bytes),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(response)) => {
+            return Err(KeyedHttpAdmitError::PreIngest(KeyedPreIngestError::Replay(
+                response,
+            )));
+        }
+        Err(error) => return Err(KeyedHttpAdmitError::PreIngest(error)),
+    }
+    let event: nostr::Event = serde_json::from_slice(body).map_err(KeyedHttpAdmitError::Parse)?;
+    let auth = keyed_http_nip98_auth(pubkey);
+    let kind = buzz_core::kind::event_kind_u32(&event);
+    // Blocking verification owns `early` (ingress included). Do not wrap this
+    // join in `timeout`/`select!` — dropping that JoinHandle while the request
+    // still owned the guard would release permits during CPU work. An
+    // already-expired deadline fails closed before verification starts.
+    if early.deadline.expired() {
+        return Err(KeyedHttpAdmitError::PreIngest(
+            KeyedPreIngestError::Attempt(crate::admission::AdmissionError::Unavailable),
+        ));
+    }
+    let (signed, mut early) =
+        KeyedHttpValidatedEvent::verify_signature_and_author_with_early(event, auth, early)
+            .await
+            .map_err(|error| KeyedHttpAdmitError::Body { kind, error })?;
+    let membership_owner = match keyed_deadline_io(deadline, membership()).await {
+        Ok(Ok(owner)) => owner,
+        Ok(Err(response)) => return Err(KeyedHttpAdmitError::Membership(response)),
+        Err(error) => return Err(KeyedHttpAdmitError::PreIngest(error)),
+    };
+    let agent_bytes = pubkey.to_bytes();
+    early.verified_owner = keyed_http_verified_owner(
+        membership_owner,
+        super::relay_members::extract_nip_oa_owner(
+            &agent_bytes,
+            open_relay_auth_tag(),
+            signed_created_at,
+        ),
+    );
+    let validated = KeyedHttpValidatedEvent::finish_after_owner(signed)
+        .map_err(|error| KeyedHttpAdmitError::Body { kind, error })?;
+    Ok((validated, early))
+}
+
+fn json_parse_submit_outcome(e: serde_json::Error) -> SubmitOutcome {
+    // Never log `e`'s Display string: serde_json embeds the offending
+    // input verbatim in its error message, so a malformed field of
+    // arbitrary size (the router allows 1 MiB bodies) would otherwise
+    // reflect attacker-controlled text into a log line at full size.
+    // `category`/`line`/`column` are bounded, structured, and still
+    // enough to tell "which parse failure" apart at a glance.
+    crate::handlers::ingest::reject_with_transport("http", "invalid");
+    SubmitOutcome::ParseFail {
+        category: match e.classify() {
+            serde_json::error::Category::Io => "io",
+            serde_json::error::Category::Syntax => "syntax",
+            serde_json::error::Category::Data => "data",
+            serde_json::error::Category::Eof => "eof",
+        },
+        line: e.line(),
+        column: e.column(),
+        response: api_error(StatusCode::BAD_REQUEST, &format!("invalid event JSON: {e}")),
+    }
+}
+
+fn ingest_error_to_submit_outcome(kind_u32: u32, error: IngestError) -> SubmitOutcome {
+    match error {
+        IngestError::Rejected(msg) => {
+            // `msg` can embed event-controlled content (e.g. a channel
+            // create's raw `visibility`/`channel_type` tag values, or a raw
+            // tag pubkey) — truncate before logging, but return the full msg
+            // in the HTTP response body (unchanged from prior behaviour).
+            let reason = truncate_reason(&msg, REJECT_REASON_MAX_BYTES).to_owned();
+            crate::handlers::ingest::reject_with_transport("http", "invalid");
+            SubmitOutcome::Rejected {
+                kind: kind_u32,
+                reason,
+                response: api_error(StatusCode::BAD_REQUEST, &msg),
+            }
+        }
+        IngestError::AuthFailed(msg) => {
+            crate::handlers::ingest::reject_with_transport("http", "auth");
+            let e = api_error(StatusCode::FORBIDDEN, &msg);
+            SubmitOutcome::Err {
+                status: e.0,
+                response: e,
+            }
+        }
+        IngestError::Internal(msg) => {
+            crate::handlers::ingest::reject_with_transport("http", "error");
+            let e = internal_error(&msg);
+            SubmitOutcome::Err {
+                status: e.0,
+                response: e,
+            }
+        }
+    }
+}
+
+fn keyed_admit_outcome(error: KeyedHttpAdmitError) -> SubmitOutcome {
+    match error {
+        KeyedHttpAdmitError::PreIngest(error) => keyed_pre_ingest_outcome(error),
+        KeyedHttpAdmitError::Parse(error) => json_parse_submit_outcome(error),
+        KeyedHttpAdmitError::Membership(e) => SubmitOutcome::Err {
+            status: e.0,
+            response: e,
+        },
+        KeyedHttpAdmitError::Body { kind, error } => ingest_error_to_submit_outcome(kind, error),
+    }
+}
+
+fn keyed_pre_ingest_outcome(error: KeyedPreIngestError) -> SubmitOutcome {
+    match error {
+        KeyedPreIngestError::Attempt(error) => {
+            let retry_after_secs = match error {
+                crate::admission::AdmissionError::Exceeded { reset_in_secs } => reset_in_secs,
+                crate::admission::AdmissionError::Unavailable => KEYED_BUSY_RETRY_AFTER_SECS,
+            };
+            let (status, retry_after, body) = keyed_busy_http_parts(retry_after_secs);
+            SubmitOutcome::Busy {
+                status,
+                response: (status, retry_after, body).into_response(),
+            }
+        }
+        KeyedPreIngestError::Replay(response) => SubmitOutcome::Err {
+            status: response.0,
+            response,
+        },
+    }
+}
+
 /// Submit a signed Nostr event via HTTP bridge (NIP-98 auth).
 pub async fn submit_event(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, Response> {
+    let idempotency_key = match parse_idempotency_key_header(&headers) {
+        Ok(key) => key,
+        Err(error) => {
+            return Err(keyed_handler_error_response(
+                KeyedHandlerError::InvalidHeader(error),
+            ));
+        }
+    };
     // Row zero: bind this HTTP request to its community from the request host
     // before any tenant-scoped write, identical to the WS door in `router.rs`.
     // Unmapped host or lookup failure fails closed with a generic 404 — never a
-    // default tenant, never echoing the host.
+    // default tenant, never echoing the host. Keyed pre-attempt capacity is not
+    // acquired until this bind and NIP-98 verification both succeed, and only
+    // for a present Idempotency-Key.
     let raw_host = headers
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -739,6 +1363,7 @@ pub async fn submit_event(
                 StatusCode::NOT_FOUND,
                 "relay: no community is configured for this host",
             )
+            .into_response()
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
@@ -751,9 +1376,66 @@ pub async fn submit_event(
         "POST",
         &url,
         Some(&body),
-        state.config.require_auth_token,
-    )?;
+        state.config.require_auth_token || idempotency_key.is_some(),
+    )
+    .map_err(IntoResponse::into_response)?;
     let pubkey_hex = pubkey.to_hex();
+
+    let mut early = None;
+    if idempotency_key.is_some() {
+        // After NIP-98, before KeyedEarlyDeadline and Redis attempt admission.
+        // Fail-fast process-global 32 and per-bound-community 16; never queues.
+        let pre_attempt = match try_acquire_keyed_pre_attempt(*tenant.community().as_uuid()) {
+            Ok(permit) => permit,
+            Err(()) => {
+                let (status, retry_after, body) =
+                    keyed_busy_http_parts(KEYED_BUSY_RETRY_AFTER_SECS);
+                return Err((status, retry_after, body).into_response());
+            }
+        };
+        let deadline = KeyedEarlyDeadline::start();
+        if deadline.expired() {
+            let (status, retry_after, body) = keyed_busy_http_parts(KEYED_BUSY_RETRY_AFTER_SECS);
+            return Err((status, retry_after, body).into_response());
+        }
+        match tokio::time::timeout(
+            deadline.remaining(),
+            admit_keyed_http_attempt(state.admission_rate_limiter.as_ref(), &tenant, &pubkey),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(match keyed_pre_ingest_outcome(error).into_response() {
+                    Ok(json) => json.into_response(),
+                    Err(response) => *response,
+                });
+            }
+            Err(_elapsed) => {
+                let (status, retry_after, body) =
+                    keyed_busy_http_parts(KEYED_BUSY_RETRY_AFTER_SECS);
+                return Err((status, retry_after, body).into_response());
+            }
+        }
+        let ingress = match try_acquire_keyed_ingress(*tenant.community().as_uuid()) {
+            Ok(guard) => guard,
+            Err(KeyedHttpError::Busy { retry_after_secs }) => {
+                let (status, retry_after, body) = keyed_busy_http_parts(retry_after_secs);
+                return Err((status, retry_after, body).into_response());
+            }
+            Err(_) => {
+                let (status, retry_after, body) =
+                    keyed_busy_http_parts(KEYED_BUSY_RETRY_AFTER_SECS);
+                return Err((status, retry_after, body).into_response());
+            }
+        };
+        let ingress = handoff_keyed_pre_attempt_to_ingress(ingress, pre_attempt);
+        early = Some(KeyedHttpEarlyContext {
+            ingress: Some(ingress),
+            deadline,
+            verified_owner: None,
+        });
+    }
 
     // Everything after auth — admission, replay, membership, parse, ingest —
     // runs inside the helper.  The thin wrapper here owns the single terminal
@@ -767,6 +1449,10 @@ pub async fn submit_event(
         pubkey,
         event_id_bytes,
         signed_created_at,
+        SubmitEventKeyedContext {
+            idempotency_key,
+            early,
+        },
     )
     .await;
 
@@ -818,15 +1504,74 @@ pub async fn submit_event(
                 "HTTP bridge request"
             );
         }
+        SubmitOutcome::Busy { status, .. } => {
+            tracing::warn!(
+                pubkey = %pubkey_hex,
+                route = "/events",
+                status = status.as_u16(),
+                accepted = false,
+                "HTTP bridge request"
+            );
+        }
     }
 
-    outcome.into_response()
+    outcome.into_response().map_err(|response| *response)
+}
+
+fn parse_idempotency_key_header(
+    headers: &HeaderMap,
+) -> Result<Option<[u8; 32]>, (StatusCode, Json<Value>)> {
+    let values: Vec<_> = headers
+        .get_all(buzz_core::idempotency::HEADER_NAME)
+        .iter()
+        .collect();
+    if values.is_empty() {
+        return Ok(None);
+    }
+    if values.len() != 1 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid: Idempotency-Key",
+        ));
+    }
+    let Ok(raw) = values[0].to_str() else {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid: Idempotency-Key",
+        ));
+    };
+    if raw.contains(',') {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid: Idempotency-Key",
+        ));
+    }
+    buzz_core::idempotency::parse_idempotency_key(raw)
+        .map(Some)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid: Idempotency-Key"))
+}
+
+/// Keyed HTTP 503 for writer busy, reservation-capacity exhaustion, and
+/// open-reservation admission/persist timeout. `Retry-After` stays bounded.
+fn keyed_busy_http_parts(
+    retry_after_secs: u64,
+) -> (StatusCode, [(header::HeaderName, String); 1], Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, retry_after_secs.to_string())],
+        Json(serde_json::json!({"error": "idempotency unavailable"})),
+    )
+}
+
+fn keyed_conflict_http_parts() -> (StatusCode, Json<Value>) {
+    api_error(StatusCode::CONFLICT, "idempotency-key conflict")
 }
 
 /// Log-context outcome for a single [`submit_event`] call.
 ///
 /// Carries enough structured data for the terminal attribution log while also
 /// holding the HTTP response so the thin wrapper can return it unchanged.
+#[derive(Debug)]
 enum SubmitOutcome {
     /// Ingest pipeline ran and returned a result (accepted or not).
     Ok {
@@ -853,23 +1598,38 @@ enum SubmitOutcome {
         status: StatusCode,
         response: (StatusCode, Json<Value>),
     },
+    /// Keyed writer busy — HTTP 503 with Retry-After.
+    Busy {
+        status: StatusCode,
+        response: Response,
+    },
 }
 
 impl SubmitOutcome {
-    fn into_response(self) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    fn into_response(self) -> Result<Json<Value>, Box<Response>> {
         match self {
             SubmitOutcome::Ok { response, .. } => Ok(response),
-            SubmitOutcome::ParseFail { response, .. } => Err(response),
-            SubmitOutcome::Rejected { response, .. } => Err(response),
-            SubmitOutcome::Err { response, .. } => Err(response),
+            SubmitOutcome::ParseFail { response, .. } => Err(Box::new(response.into_response())),
+            SubmitOutcome::Rejected { response, .. } => Err(Box::new(response.into_response())),
+            SubmitOutcome::Err { response, .. } => Err(Box::new(response.into_response())),
+            SubmitOutcome::Busy { response, .. } => Err(Box::new(response)),
         }
     }
+}
+
+struct SubmitEventKeyedContext {
+    idempotency_key: Option<[u8; 32]>,
+    early: Option<KeyedHttpEarlyContext>,
 }
 
 /// Post-auth execution for [`submit_event`]: admission, replay, membership,
 /// parse, and ingest.  Returns a [`SubmitOutcome`] that carries both the log
 /// fields and the HTTP response so the thin wrapper can emit exactly one
 /// terminal attribution line covering every outcome.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "combines upstream signed_created_at auth metadata with Goal1 keyed context"
+)]
 async fn submit_event_authed(
     state: &Arc<AppState>,
     tenant: &TenantContext,
@@ -878,9 +1638,111 @@ async fn submit_event_authed(
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
     signed_auth_created_at: Option<u64>,
+    keyed: SubmitEventKeyedContext,
 ) -> SubmitOutcome {
-    // Admission and replay checks fire before body parse — a 429 or replay
-    // reject on a malformed body must still be attributed.
+    let SubmitEventKeyedContext {
+        idempotency_key,
+        early,
+    } = keyed;
+    // Per-principal admission and NIP-98 replay fire before body parse for
+    // unkeyed requests — a 429 or replay reject on a malformed body must still
+    // be attributed. Keyed requests already charged attempt and hold ingress.
+    // Replay, parse, membership, and body validation run here. Fresh and
+    // persist admission run inside ingest only after committed classification.
+    // Owner materialization waits for an accepted terminal result after early
+    // permits are released.
+    if let Some(key) = idempotency_key {
+        let Some(early) = early else {
+            return SubmitOutcome::Busy {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                response: {
+                    let (status, retry_after, body) =
+                        keyed_busy_http_parts(KEYED_BUSY_RETRY_AFTER_SECS);
+                    (status, retry_after, body).into_response()
+                },
+            };
+        };
+        let deadline = early.deadline;
+        if deadline.expired() {
+            return keyed_pre_ingest_outcome(KeyedPreIngestError::Attempt(
+                crate::admission::AdmissionError::Unavailable,
+            ));
+        }
+        let pubkey_bytes = pubkey.to_bytes();
+        let auth_tag = super::relay_members::extract_auth_tag_header(headers);
+        let (validated, early) = match admit_keyed_http_after_attempt(
+            state.nip98_replay.as_ref(),
+            KeyedHttpAdmitRequest {
+                tenant,
+                pubkey,
+                event_id_bytes,
+                body,
+                signed_created_at: signed_auth_created_at,
+            },
+            || {
+                super::relay_members::enforce_relay_membership(
+                    state,
+                    tenant.community(),
+                    &pubkey_bytes,
+                    auth_tag,
+                    signed_auth_created_at,
+                )
+            },
+            || {
+                if !state.config.require_relay_membership {
+                    auth_tag
+                } else {
+                    None
+                }
+            },
+            early,
+        )
+        .await
+        {
+            Ok(admitted) => admitted,
+            Err(error) => return keyed_admit_outcome(error),
+        };
+        let kind_u32 = buzz_core::kind::event_kind_u32(validated.event());
+        let ingest_result =
+            match ingest_keyed_http_event(state, tenant, validated, key, early).await {
+                Ok(result) => Ok(result),
+                Err(KeyedHttpError::Ingest(error)) => Err(error),
+                Err(KeyedHttpError::Conflict) => {
+                    let response = keyed_conflict_http_parts();
+                    return SubmitOutcome::Err {
+                        status: response.0,
+                        response,
+                    };
+                }
+                Err(KeyedHttpError::Busy { retry_after_secs }) => {
+                    let (status, retry_after, body) = keyed_busy_http_parts(retry_after_secs);
+                    return SubmitOutcome::Busy {
+                        status,
+                        response: (status, retry_after, body).into_response(),
+                    };
+                }
+                Err(KeyedHttpError::Principal(error)) => {
+                    let response = http_admission_error_response(error);
+                    return SubmitOutcome::Err {
+                        status: response.0,
+                        response,
+                    };
+                }
+            };
+        return match ingest_result {
+            Ok(result) => SubmitOutcome::Ok {
+                accepted: result.accepted,
+                kind: kind_u32,
+                response: Json(serde_json::json!({
+                    "event_id": result.event_id,
+                    "accepted": result.accepted,
+                    "message": result.message,
+                })),
+            },
+            Err(error) => ingest_error_to_submit_outcome(kind_u32, error),
+        };
+    }
+
     if let Err(e) = enforce_http_admission(state, tenant, &pubkey).await {
         return SubmitOutcome::Err {
             status: e.0,
@@ -898,39 +1760,23 @@ async fn submit_event_authed(
     let event: nostr::Event = match serde_json::from_slice(body) {
         Ok(ev) => ev,
         Err(e) => {
-            // Never log `e`'s Display string: serde_json embeds the offending
-            // input verbatim in its error message, so a malformed field of
-            // arbitrary size (the router allows 1 MiB bodies) would otherwise
-            // reflect attacker-controlled text into a log line at full size.
-            // `category`/`line`/`column` are bounded, structured, and still
-            // enough to tell "which parse failure" apart at a glance.
-            crate::handlers::ingest::reject_with_transport("http", "invalid");
-            return SubmitOutcome::ParseFail {
-                category: match e.classify() {
-                    serde_json::error::Category::Io => "io",
-                    serde_json::error::Category::Syntax => "syntax",
-                    serde_json::error::Category::Data => "data",
-                    serde_json::error::Category::Eof => "eof",
-                },
-                line: e.line(),
-                column: e.column(),
-                response: api_error(StatusCode::BAD_REQUEST, &format!("invalid event JSON: {e}")),
-            };
+            return json_parse_submit_outcome(e);
         }
     };
 
     // Enforce relay membership (with NIP-OA fallback via x-auth-tag header).
     let auth_tag = super::relay_members::extract_auth_tag_header(headers);
-    let nip_oa_owner = match super::relay_members::enforce_relay_membership(
+    let membership = super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
         signed_auth_created_at,
     )
-    .await
-    {
-        Ok(owner) => owner.or_else(|| {
+    .await;
+    let nip_oa_owner = match membership {
+        Ok(owner) => keyed_http_verified_owner(
+            owner,
             if !state.config.require_relay_membership {
                 super::relay_members::extract_nip_oa_owner(
                     &pubkey_bytes,
@@ -939,8 +1785,8 @@ async fn submit_event_authed(
                 )
             } else {
                 None
-            }
-        }),
+            },
+        ),
         Err(e) => {
             return SubmitOutcome::Err {
                 status: e.0,
@@ -953,54 +1799,19 @@ async fn submit_event_authed(
     }
 
     let kind_u32 = buzz_core::kind::event_kind_u32(&event);
-    let auth = IngestAuth::Http {
-        pubkey,
-        scopes: buzz_auth::Scope::all_known(), // Pure Nostr: full scopes, channel access via membership
-        auth_method: crate::handlers::ingest::HttpAuthMethod::Nip98,
-    };
+    let auth = keyed_http_nip98_auth(pubkey);
 
     match crate::handlers::ingest::ingest_event(state, tenant, event, auth).await {
-        Ok(result) => {
-            let response = Json(serde_json::json!({
+        Ok(result) => SubmitOutcome::Ok {
+            accepted: result.accepted,
+            kind: kind_u32,
+            response: Json(serde_json::json!({
                 "event_id": result.event_id,
                 "accepted": result.accepted,
                 "message": result.message,
-            }));
-            SubmitOutcome::Ok {
-                accepted: result.accepted,
-                kind: kind_u32,
-                response,
-            }
-        }
-        Err(IngestError::Rejected(msg)) => {
-            // `msg` can embed event-controlled content (e.g. a channel
-            // create's raw `visibility`/`channel_type` tag values, or a raw
-            // tag pubkey) — truncate before logging, but return the full msg
-            // in the HTTP response body (unchanged from prior behaviour).
-            let reason = truncate_reason(&msg, REJECT_REASON_MAX_BYTES).to_owned();
-            crate::handlers::ingest::reject_with_transport("http", "invalid");
-            SubmitOutcome::Rejected {
-                kind: kind_u32,
-                reason,
-                response: api_error(StatusCode::BAD_REQUEST, &msg),
-            }
-        }
-        Err(IngestError::AuthFailed(msg)) => {
-            crate::handlers::ingest::reject_with_transport("http", "auth");
-            let e = api_error(StatusCode::FORBIDDEN, &msg);
-            SubmitOutcome::Err {
-                status: e.0,
-                response: e,
-            }
-        }
-        Err(IngestError::Internal(msg)) => {
-            crate::handlers::ingest::reject_with_transport("http", "error");
-            let e = internal_error(&msg);
-            SubmitOutcome::Err {
-                status: e.0,
-                response: e,
-            }
-        }
+            })),
+        },
+        Err(error) => ingest_error_to_submit_outcome(kind_u32, error),
     }
 }
 
@@ -2532,8 +3343,43 @@ fn ban_json(b: &buzz_db::moderation::BanRecord) -> Value {
 #[cfg(test)]
 mod postgres_tests {
     use super::*;
-    use nostr::{Alphabet, EventBuilder, Keys, Kind, SingleLetterTag, Tag};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use buzz_auth::rate_limit::{
+        HierarchicalAdmissionOutcome, HierarchicalAdmissionRequest,
+        HierarchicalIdentityDenialPeekOutcome, HierarchicalIdentityDenialPeekRequest,
+        PairedAdmissionOutcome, PairedAdmissionRequest,
+    };
+    use buzz_auth::RateLimiter;
+    use buzz_db::idempotency::KeyedCommittedOutcome;
+    use buzz_sdk::nip_oa::compute_auth_tag;
+    use nostr::{Alphabet, EventBuilder, Keys, Kind, SingleLetterTag, Tag, Timestamp};
+
+    use crate::admission::{
+        keyed_http_attempt_admission_principal, keyed_http_fresh_admission_principal,
+        KEYED_HTTP_ATTEMPT_FLEET_SENTINEL, KEYED_HTTP_ATTEMPT_LIMIT_TYPE,
+        KEYED_HTTP_ATTEMPT_WINDOW_SECS, KEYED_HTTP_FAIR_SHARE_PER_MIN,
+        KEYED_HTTP_FRESH_FLEET_SENTINEL, KEYED_HTTP_FRESH_LIMIT_TYPE,
+        KEYED_HTTP_PREAUTH_IDENTITY_CARDINALITY_BOUND,
+    };
+    use crate::handlers::ingest::{
+        enforce_keyed_events_fleet_admission, install_keyed_verify_watch,
+        keyed_community_admission_principal, keyed_http_error_from_fleet, lock_keyed_ingress_tests,
+        lock_keyed_ingress_tests_async, maybe_enforce_keyed_events_fleet_admission,
+        try_acquire_keyed_ingress, KeyedWriterCapacityGuard, KEYED_BUSY_RETRY_AFTER_SECS,
+        KEYED_COMMUNITY_ADMISSION_LIMIT_TYPE, KEYED_EVENTS_COMMUNITY_ADMISSION_PER_MIN,
+        KEYED_EVENTS_FLEET_ADMISSION_PER_MIN, KEYED_EVENTS_FLEET_ADMISSION_SENTINEL,
+        KEYED_EVENTS_FLEET_ADMISSION_WINDOW_SECS, KEYED_INGRESS_COMMUNITY_MAX,
+        KEYED_INGRESS_GLOBAL_MAX, KEYED_RESERVATION_ADMISSION_BUDGET,
+        KEYED_RESERVATION_ADMISSION_BUDGET_SECS, KEYED_RESERVATION_PERSIST_BUDGET_SECS,
+    };
+
+    // Serializes `router_*` tests that share production fleet sentinel keys.
+    static ROUTER_FLEET_SENTINEL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn redis_pool() -> deadpool_redis::Pool {
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
@@ -2809,6 +3655,8 @@ mod postgres_tests {
     }
 
     mod external_infra_redis_tests {
+        use super::*;
+
         #[tokio::test]
         #[ignore = "requires Redis"]
         async fn nip98_replay_guard_rejects_cross_pod_replay_on_bridge_path() {
@@ -2819,6 +3667,73 @@ mod postgres_tests {
         #[ignore = "requires Redis"]
         async fn nip98_replay_guard_rejects_same_pod_same_community_replay() {
             super::nip98_replay_guard_rejects_same_pod_same_community_replay().await;
+        }
+
+        /// Sub-floor TTL proof: production `RedisNip98ReplayGuard` must lift a
+        /// 30-second request to the default 120-second floor. Reads PTTL of the
+        /// canonical community-scoped key immediately after the first claim so
+        /// the proof does not sleep for 30 seconds or reimplement the clamp.
+        #[tokio::test]
+        #[ignore = "requires Redis"]
+        async fn nip98_replay_guard_sub_floor_ttl_is_lifted_to_default_floor() {
+            let pool = redis_pool();
+            let guard = buzz_pubsub::RedisNip98ReplayGuard::new(pool.clone());
+            let tenant = fresh_tenant("nip98-sub-floor.example");
+            let event_id = EventBuilder::new(Kind::HttpAuth, "")
+                .sign_with_keys(&Keys::generate())
+                .expect("sign auth event")
+                .id;
+            let key = buzz_auth::nip98_replay::nip98_replay_key_for_scope(
+                &tenant.community().to_string(),
+                &event_id,
+            );
+            const REQUESTED_TTL_SECS: u64 = 30;
+
+            assert!(
+                guard
+                    .try_mark(&tenant, &event_id, REQUESTED_TTL_SECS)
+                    .await
+                    .expect("first claim"),
+                "first claim of a unique NIP-98 event id must succeed"
+            );
+
+            let mut conn = pool.get().await.expect("redis conn");
+            let pttl_ms: i64 = redis::cmd("PTTL")
+                .arg(&key)
+                .query_async(&mut *conn)
+                .await
+                .expect("pttl");
+            let _: i64 = redis::cmd("DEL")
+                .arg(&key)
+                .query_async(&mut *conn)
+                .await
+                .expect("del unique nip98 key");
+
+            let requested_ms = i64::try_from(REQUESTED_TTL_SECS)
+                .expect("requested ttl fits pttl")
+                .saturating_mul(1000);
+            let floor_ms = i64::try_from(DEFAULT_REPLAY_TTL_SECS)
+                .expect("replay floor fits pttl")
+                .saturating_mul(1000);
+            // Local Redis SET EX is millisecond-close to the requested seconds.
+            // Keep slack far below 30s so a raw EX 30 cannot satisfy the floor.
+            const TOLERANCE_MS: i64 = 5_000;
+            assert!(
+                TOLERANCE_MS < requested_ms,
+                "timing tolerance must not make a raw {REQUESTED_TTL_SECS}s TTL pass"
+            );
+            assert!(
+                pttl_ms > requested_ms,
+                "sub-floor claim must not keep the requested {REQUESTED_TTL_SECS}s TTL, pttl_ms={pttl_ms}"
+            );
+            assert!(
+                pttl_ms <= floor_ms,
+                "marker TTL must not exceed the default floor, pttl_ms={pttl_ms} floor_ms={floor_ms}"
+            );
+            assert!(
+                pttl_ms >= floor_ms - TOLERANCE_MS,
+                "marker must receive the {DEFAULT_REPLAY_TTL_SECS}s default floor rather than raw {REQUESTED_TTL_SECS}s, pttl_ms={pttl_ms}"
+            );
         }
     }
 
@@ -2881,16 +3796,44 @@ mod postgres_tests {
     /// Build a signed NIP-98 event JSON string for `url` + `method`, mirroring
     /// `buzz_auth::nip98::tests::make_nip98_event` so the bridge tests don't
     /// reach into buzz-auth's test scope.
+    ///
+    /// A per-request test-only custom tag is included before signing so two
+    /// helper-issued tokens for the same key/url/method in the same second
+    /// still get distinct event IDs. Content stays empty; no payload tag.
     fn build_nip98_event_json(keys: &Keys, url: &str, method: &str) -> String {
+        let request_tag = uuid::Uuid::new_v4().to_string();
         let tags = vec![
             Tag::parse(["u", url]).expect("u tag"),
             Tag::parse(["method", method]).expect("method tag"),
+            Tag::parse(["bridge-test", &request_tag]).expect("per-request test tag"),
         ];
         let event = EventBuilder::new(Kind::HttpAuth, "")
             .tags(tags)
             .sign_with_keys(keys)
             .expect("sign NIP-98 event");
         serde_json::to_string(&event).expect("serialize")
+    }
+
+    #[test]
+    fn freshly_issued_nip98_request_tokens_have_distinct_ids() {
+        let keys = Keys::generate();
+        let url = "https://relay.example/events";
+        let first = build_nip98_event_json(&keys, url, "POST");
+        let second = build_nip98_event_json(&keys, url, "POST");
+        let first_id = serde_json::from_str::<nostr::Event>(&first)
+            .expect("first token")
+            .id
+            .to_bytes();
+        let second_id = serde_json::from_str::<nostr::Event>(&second)
+            .expect("second token")
+            .id
+            .to_bytes();
+        assert_ne!(
+            first_id, second_id,
+            "two freshly issued signed request tokens must not share an event ID"
+        );
+        assert!(!first.contains("payload"));
+        assert!(!second.contains("payload"));
     }
 
     /// Build a `HeaderMap` with the NIP-98 event base64-encoded in
@@ -3791,6 +4734,161 @@ mod postgres_tests {
         assert_eq!(result, s);
     }
 
+    fn idempotency_header_map(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append("idempotency-key", value.parse().expect("header value"));
+        }
+        headers
+    }
+
+    fn assert_invalid_idempotency_key(headers: HeaderMap) {
+        let (status, Json(body)) =
+            parse_idempotency_key_header(&headers).expect_err("must be HTTP 400");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            msg.contains("Idempotency-Key"),
+            "invalid header body must name Idempotency-Key; got {body:?}"
+        );
+    }
+
+    #[test]
+    fn parse_idempotency_key_absent_is_unkeyed() {
+        let headers = HeaderMap::new();
+        assert_eq!(parse_idempotency_key_header(&headers).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_idempotency_key_lowercase_64_hex() {
+        let hex = "ab".repeat(32);
+        let headers = idempotency_header_map(&[&hex]);
+        let key = parse_idempotency_key_header(&headers)
+            .unwrap()
+            .expect("decoded key");
+        assert_eq!(hex::encode(key), hex);
+    }
+
+    #[test]
+    fn parse_idempotency_key_duplicate_physical_headers_are_400() {
+        let hex = "ab".repeat(32);
+        assert_invalid_idempotency_key(idempotency_header_map(&[&hex, &hex]));
+    }
+
+    #[test]
+    fn parse_idempotency_key_comma_folded_is_400() {
+        let folded = format!("{},{}", "ab".repeat(32), "cd".repeat(32));
+        assert_invalid_idempotency_key(idempotency_header_map(&[&folded]));
+    }
+
+    #[test]
+    fn parse_idempotency_key_uppercase_is_400() {
+        assert_invalid_idempotency_key(idempotency_header_map(&[&"AB".repeat(32)]));
+    }
+
+    #[test]
+    fn parse_idempotency_key_non_hex_is_400() {
+        assert_invalid_idempotency_key(idempotency_header_map(&[&"g".repeat(64)]));
+    }
+
+    #[test]
+    fn parse_idempotency_key_wrong_length_is_400() {
+        assert_invalid_idempotency_key(idempotency_header_map(&[&"ab".repeat(31)]));
+    }
+
+    #[test]
+    fn parse_idempotency_key_whitespace_is_400() {
+        let hex = format!(" {} ", "ab".repeat(32));
+        assert_invalid_idempotency_key(idempotency_header_map(&[&hex]));
+    }
+
+    #[test]
+    fn parse_idempotency_key_non_utf8_is_400() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "idempotency-key",
+            axum::http::HeaderValue::from_bytes(&[0xff, 0xfe]).expect("opaque header bytes"),
+        );
+        assert_invalid_idempotency_key(headers);
+    }
+
+    #[test]
+    fn keyed_busy_response_is_generic_503_with_retry_after() {
+        let (status, retry_after, Json(body)) = keyed_busy_http_parts(KEYED_BUSY_RETRY_AFTER_SECS);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry_after[0].0, header::RETRY_AFTER);
+        assert_eq!(retry_after[0].1, "5");
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "idempotency unavailable"})
+        );
+        let dumped = body.to_string();
+        assert!(
+            !dumped.contains("event_id"),
+            "busy body must stay generic: {dumped}"
+        );
+    }
+
+    #[test]
+    fn reservation_timeout_and_capacity_exhaustion_use_keyed_busy_503() {
+        assert_eq!(
+            KEYED_RESERVATION_ADMISSION_BUDGET.as_secs(),
+            KEYED_BUSY_RETRY_AFTER_SECS
+        );
+        const {
+            assert!(
+                KEYED_RESERVATION_ADMISSION_BUDGET_SECS
+                    < buzz_db::idempotency::KEYED_RESERVATION_IDLE_TIMEOUT_SECS
+            );
+            assert!(
+                buzz_db::idempotency::KEYED_RESERVATION_IDLE_TIMEOUT_SECS
+                    <= KEYED_RESERVATION_PERSIST_BUDGET_SECS
+            );
+        }
+        let timeout_busy = KeyedHttpError::Busy {
+            retry_after_secs: KEYED_RESERVATION_ADMISSION_BUDGET.as_secs(),
+        };
+        let KeyedHttpError::Busy { retry_after_secs } = timeout_busy else {
+            panic!("timeout/capacity must stay on the keyed Busy path");
+        };
+        let (status, retry_after, Json(body)) = keyed_busy_http_parts(retry_after_secs);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry_after[0].0, header::RETRY_AFTER);
+        assert_eq!(retry_after[0].1, "5");
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "idempotency unavailable"})
+        );
+    }
+
+    #[test]
+    fn idle_in_transaction_sqlstate_uses_keyed_busy_503() {
+        // SQLSTATE 25P03 is classed as idempotency-unavailable in buzz-db;
+        // ingest maps that to KeyedHttpError::Busy with the default Retry-After.
+        let (status, retry_after, Json(body)) = keyed_busy_http_parts(KEYED_BUSY_RETRY_AFTER_SECS);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry_after[0].1, "5");
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "idempotency unavailable"})
+        );
+    }
+
+    #[test]
+    fn keyed_conflict_response_does_not_disclose_bound_event_id() {
+        let (status, Json(body)) = keyed_conflict_http_parts();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.get("error").and_then(|v| v.as_str()),
+            Some("idempotency-key conflict")
+        );
+        let dumped = body.to_string();
+        assert!(
+            !dumped.contains("event_id"),
+            "conflict body must not disclose the bound event id: {dumped}"
+        );
+    }
+
     // ──────────────────────────────────────────────────────────────────────────
     // Handler-level tests: submit_event HTTP-counter seam
     //
@@ -4237,5 +5335,4327 @@ mod postgres_tests {
             log.contains(&pubkey_hex[..16]),
             "attribution line must carry the pubkey;\nlog:\n{log}"
         );
+    }
+
+    #[derive(Clone, Copy)]
+    enum FleetLimiterOutcome {
+        Allow,
+        Deny,
+        Fail,
+    }
+
+    type KeyedPrincipalCall = (uuid::Uuid, [u8; 32], LimitType, u64, u64);
+
+    struct FleetLimiter {
+        community_outcome: FleetLimiterOutcome,
+        fleet_outcome: FleetLimiterOutcome,
+        ip_calls: Mutex<Vec<(IpAddr, u64, u64)>>,
+        principal_calls: Mutex<Vec<KeyedPrincipalCall>>,
+    }
+
+    impl RateLimiter for FleetLimiter {
+        async fn check_and_increment(
+            &self,
+            ctx: &TenantContext,
+            pubkey: &nostr::PublicKey,
+            limit_type: LimitType,
+            window_secs: u64,
+            limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            self.principal_calls.lock().unwrap().push((
+                *ctx.community().as_uuid(),
+                pubkey.to_bytes(),
+                limit_type,
+                window_secs,
+                limit,
+            ));
+            match self.community_outcome {
+                FleetLimiterOutcome::Allow => {
+                    Ok(buzz_auth::RateLimitResult::allowed(1, limit, window_secs))
+                }
+                FleetLimiterOutcome::Deny => {
+                    Ok(buzz_auth::RateLimitResult::denied(limit + 1, limit, 59))
+                }
+                FleetLimiterOutcome::Fail => Err(buzz_auth::AuthError::Internal(
+                    "shared admission unavailable".to_owned(),
+                )),
+            }
+        }
+
+        async fn check_ip_connection(
+            &self,
+            ip: &IpAddr,
+            window_secs: u64,
+            limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            self.ip_calls
+                .lock()
+                .unwrap()
+                .push((*ip, window_secs, limit));
+            match self.fleet_outcome {
+                FleetLimiterOutcome::Allow => {
+                    Ok(buzz_auth::RateLimitResult::allowed(1, limit, window_secs))
+                }
+                FleetLimiterOutcome::Deny => {
+                    Ok(buzz_auth::RateLimitResult::denied(limit + 1, limit, 59))
+                }
+                FleetLimiterOutcome::Fail => Err(buzz_auth::AuthError::Internal(
+                    "shared admission unavailable".to_owned(),
+                )),
+            }
+        }
+
+        async fn check_paired_admission(
+            &self,
+            request: PairedAdmissionRequest<'_>,
+        ) -> Result<PairedAdmissionOutcome, buzz_auth::AuthError> {
+            self.principal_calls.lock().unwrap().push((
+                *request.tenant.community().as_uuid(),
+                request.pubkey.to_bytes(),
+                request.limit_type.clone(),
+                request.window_secs(),
+                request.tenant_limit,
+            ));
+            match self.community_outcome {
+                FleetLimiterOutcome::Allow => {}
+                FleetLimiterOutcome::Deny => {
+                    return Ok(PairedAdmissionOutcome::TenantDenied(
+                        buzz_auth::RateLimitResult::denied(
+                            request.tenant_limit + 1,
+                            request.tenant_limit,
+                            59,
+                        ),
+                    ));
+                }
+                FleetLimiterOutcome::Fail => {
+                    return Err(buzz_auth::AuthError::Internal(
+                        "shared admission unavailable".to_owned(),
+                    ));
+                }
+            }
+            self.ip_calls.lock().unwrap().push((
+                *request.fleet_ip,
+                request.window_secs(),
+                request.fleet_limit,
+            ));
+            match self.fleet_outcome {
+                FleetLimiterOutcome::Allow => Ok(PairedAdmissionOutcome::Allowed {
+                    tenant: buzz_auth::RateLimitResult::allowed(
+                        1,
+                        request.tenant_limit,
+                        request.window_secs(),
+                    ),
+                    fleet: buzz_auth::RateLimitResult::allowed(
+                        1,
+                        request.fleet_limit,
+                        request.window_secs(),
+                    ),
+                }),
+                FleetLimiterOutcome::Deny => Ok(PairedAdmissionOutcome::FleetDenied(
+                    buzz_auth::RateLimitResult::denied(
+                        request.fleet_limit + 1,
+                        request.fleet_limit,
+                        59,
+                    ),
+                )),
+                FleetLimiterOutcome::Fail => Err(buzz_auth::AuthError::Internal(
+                    "shared admission unavailable".to_owned(),
+                )),
+            }
+        }
+
+        async fn check_hierarchical_admission(
+            &self,
+            request: HierarchicalAdmissionRequest<'_>,
+        ) -> Result<HierarchicalAdmissionOutcome, buzz_auth::AuthError> {
+            self.principal_calls.lock().unwrap().push((
+                *request.tenant.community().as_uuid(),
+                request.community.to_bytes(),
+                request.limit_type.clone(),
+                request.window_secs(),
+                request.limits.community,
+            ));
+            match self.community_outcome {
+                FleetLimiterOutcome::Allow => {}
+                FleetLimiterOutcome::Deny => {
+                    return Ok(HierarchicalAdmissionOutcome::CommunityDenied(
+                        buzz_auth::RateLimitResult::denied(
+                            request.limits.community + 1,
+                            request.limits.community,
+                            59,
+                        ),
+                    ));
+                }
+                FleetLimiterOutcome::Fail => {
+                    return Err(buzz_auth::AuthError::Internal(
+                        "shared admission unavailable".to_owned(),
+                    ));
+                }
+            }
+            self.ip_calls.lock().unwrap().push((
+                *request.fleet_ip,
+                request.window_secs(),
+                request.limits.fleet,
+            ));
+            match self.fleet_outcome {
+                FleetLimiterOutcome::Allow => Ok(HierarchicalAdmissionOutcome::Allowed {
+                    identity: buzz_auth::RateLimitResult::allowed(
+                        1,
+                        request.limits.identity,
+                        request.window_secs(),
+                    ),
+                    community: buzz_auth::RateLimitResult::allowed(
+                        1,
+                        request.limits.community,
+                        request.window_secs(),
+                    ),
+                    fleet: buzz_auth::RateLimitResult::allowed(
+                        1,
+                        request.limits.fleet,
+                        request.window_secs(),
+                    ),
+                }),
+                FleetLimiterOutcome::Deny => Ok(HierarchicalAdmissionOutcome::FleetDenied(
+                    buzz_auth::RateLimitResult::denied(
+                        request.limits.fleet + 1,
+                        request.limits.fleet,
+                        59,
+                    ),
+                )),
+                FleetLimiterOutcome::Fail => Err(buzz_auth::AuthError::Internal(
+                    "shared admission unavailable".to_owned(),
+                )),
+            }
+        }
+    }
+
+    fn fleet_limiter(outcome: FleetLimiterOutcome) -> FleetLimiter {
+        fleet_limiter_stages(outcome, outcome)
+    }
+
+    fn fleet_limiter_stages(
+        community_outcome: FleetLimiterOutcome,
+        fleet_outcome: FleetLimiterOutcome,
+    ) -> FleetLimiter {
+        FleetLimiter {
+            community_outcome,
+            fleet_outcome,
+            ip_calls: Mutex::new(Vec::new()),
+            principal_calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn keyed_tenant(community: uuid::Uuid) -> TenantContext {
+        TenantContext::resolved(
+            buzz_core::CommunityId::from_uuid(community),
+            "keyed-admission.test",
+        )
+    }
+
+    fn expected_community_call(community: uuid::Uuid) -> KeyedPrincipalCall {
+        (
+            community,
+            keyed_community_admission_principal().to_bytes(),
+            KEYED_COMMUNITY_ADMISSION_LIMIT_TYPE,
+            KEYED_EVENTS_FLEET_ADMISSION_WINDOW_SECS,
+            KEYED_EVENTS_COMMUNITY_ADMISSION_PER_MIN,
+        )
+    }
+
+    fn expected_fleet_call() -> (IpAddr, u64, u64) {
+        (
+            KEYED_EVENTS_FLEET_ADMISSION_SENTINEL,
+            KEYED_EVENTS_FLEET_ADMISSION_WINDOW_SECS,
+            KEYED_EVENTS_FLEET_ADMISSION_PER_MIN,
+        )
+    }
+
+    #[test]
+    fn keyed_events_fleet_ceiling_is_at_most_1200_per_minute() {
+        assert_eq!(KEYED_EVENTS_FLEET_ADMISSION_PER_MIN, 1_200);
+        const { assert!(KEYED_EVENTS_FLEET_ADMISSION_PER_MIN <= 1_200) };
+        assert_eq!(KEYED_EVENTS_FLEET_ADMISSION_WINDOW_SECS, 60);
+        const { assert!(KEYED_EVENTS_FLEET_ADMISSION_PER_MIN > 417) };
+    }
+
+    #[test]
+    fn keyed_events_fleet_sentinel_is_unreachable_broadcast() {
+        match KEYED_EVENTS_FLEET_ADMISSION_SENTINEL {
+            IpAddr::V4(addr) => assert!(addr.is_broadcast()),
+            IpAddr::V6(_) => panic!("fleet sentinel must not be a unicast IPv6 client identity"),
+        }
+        assert_eq!(
+            KEYED_EVENTS_FLEET_ADMISSION_SENTINEL,
+            IpAddr::V4(Ipv4Addr::BROADCAST)
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_events_admission_is_tenant_fair_then_fleet_aggregate() {
+        let limiter = fleet_limiter(FleetLimiterOutcome::Allow);
+        let community_a = uuid::Uuid::from_u128(1);
+        let community_b = uuid::Uuid::from_u128(2);
+        let tenant_a = keyed_tenant(community_a);
+        let tenant_b = keyed_tenant(community_b);
+        let persist_identity = Keys::generate().public_key();
+        enforce_keyed_events_fleet_admission(&limiter, &tenant_a, &persist_identity, 300)
+            .await
+            .expect("first tenant-shaped call");
+        enforce_keyed_events_fleet_admission(&limiter, &tenant_b, &persist_identity, 300)
+            .await
+            .expect("second tenant-shaped call");
+        let principal_calls = limiter.principal_calls.lock().unwrap().clone();
+        let ip_calls = limiter.ip_calls.lock().unwrap().clone();
+        assert_eq!(
+            principal_calls,
+            vec![
+                expected_community_call(community_a),
+                expected_community_call(community_b),
+            ]
+        );
+        assert_ne!(principal_calls[0].0, principal_calls[1].0);
+        assert_eq!(principal_calls[0].1, principal_calls[1].1);
+        assert_eq!(
+            principal_calls[0].1,
+            keyed_community_admission_principal().to_bytes()
+        );
+        assert_eq!(principal_calls[0].2, LimitType::ApiCalls);
+        assert_eq!(ip_calls, vec![expected_fleet_call(), expected_fleet_call()]);
+        assert_eq!(ip_calls[0], ip_calls[1]);
+        assert_eq!(ip_calls[0].0, KEYED_EVENTS_FLEET_ADMISSION_SENTINEL);
+    }
+
+    #[tokio::test]
+    async fn keyed_events_community_denial_preserves_reset_as_retry_after() {
+        let limiter = fleet_limiter(FleetLimiterOutcome::Deny);
+        let community = uuid::Uuid::from_u128(1);
+        let err = enforce_keyed_events_fleet_admission(
+            &limiter,
+            &keyed_tenant(community),
+            &Keys::generate().public_key(),
+            300,
+        )
+        .await
+        .expect_err("denied community admission");
+        let crate::admission::AdmissionError::Exceeded { reset_in_secs } = err else {
+            panic!("community quota denial must stay Exceeded, not Unavailable: {err:?}");
+        };
+        assert_eq!(reset_in_secs, 59);
+        assert_eq!(
+            limiter.principal_calls.lock().unwrap().clone(),
+            vec![expected_community_call(community)]
+        );
+        assert!(
+            limiter.ip_calls.lock().unwrap().is_empty(),
+            "a denied community must not charge the fleet sentinel"
+        );
+        match keyed_http_error_from_fleet(err) {
+            KeyedHttpError::Busy { retry_after_secs } => {
+                assert_eq!(retry_after_secs, 59);
+                let (status, retry_after, Json(body)) = keyed_busy_http_parts(retry_after_secs);
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(retry_after[0].0, header::RETRY_AFTER);
+                assert_eq!(retry_after[0].1, "59");
+                assert_ne!(retry_after[0].1, "5");
+                assert_eq!(
+                    body,
+                    serde_json::json!({"error": "idempotency unavailable"})
+                );
+            }
+            other => panic!("community Exceeded must map to Busy with reset, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_events_fleet_denial_preserves_reset_as_retry_after() {
+        let limiter = fleet_limiter_stages(FleetLimiterOutcome::Allow, FleetLimiterOutcome::Deny);
+        let community = uuid::Uuid::from_u128(1);
+        let err = enforce_keyed_events_fleet_admission(
+            &limiter,
+            &keyed_tenant(community),
+            &Keys::generate().public_key(),
+            300,
+        )
+        .await
+        .expect_err("denied fleet admission");
+        let crate::admission::AdmissionError::Exceeded { reset_in_secs } = err else {
+            panic!("fleet quota denial must stay Exceeded, not Unavailable: {err:?}");
+        };
+        assert_eq!(reset_in_secs, 59);
+        assert_eq!(
+            limiter.principal_calls.lock().unwrap().clone(),
+            vec![expected_community_call(community)]
+        );
+        assert_eq!(
+            limiter.ip_calls.lock().unwrap().clone(),
+            vec![expected_fleet_call()]
+        );
+        match keyed_http_error_from_fleet(err) {
+            KeyedHttpError::Busy { retry_after_secs } => {
+                assert_eq!(retry_after_secs, 59);
+                let (status, retry_after, Json(body)) = keyed_busy_http_parts(retry_after_secs);
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(retry_after[0].0, header::RETRY_AFTER);
+                assert_eq!(retry_after[0].1, "59");
+                assert_ne!(retry_after[0].1, "5");
+                assert_eq!(
+                    body,
+                    serde_json::json!({"error": "idempotency unavailable"})
+                );
+            }
+            other => panic!("fleet Exceeded must map to Busy with reset, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_events_community_unavailable_fails_closed_to_default_retry_after() {
+        let limiter = fleet_limiter(FleetLimiterOutcome::Fail);
+        let community = uuid::Uuid::from_u128(1);
+        let err = enforce_keyed_events_fleet_admission(
+            &limiter,
+            &keyed_tenant(community),
+            &Keys::generate().public_key(),
+            300,
+        )
+        .await
+        .expect_err("unavailable community admission must fail closed");
+        assert_eq!(err, crate::admission::AdmissionError::Unavailable);
+        assert_eq!(
+            limiter.principal_calls.lock().unwrap().clone(),
+            vec![expected_community_call(community)]
+        );
+        assert!(
+            limiter.ip_calls.lock().unwrap().is_empty(),
+            "community unavailability must not charge the fleet sentinel"
+        );
+        match keyed_http_error_from_fleet(err) {
+            KeyedHttpError::Busy { retry_after_secs } => {
+                assert_eq!(retry_after_secs, KEYED_BUSY_RETRY_AFTER_SECS);
+                let (status, retry_after, Json(body)) = keyed_busy_http_parts(retry_after_secs);
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(retry_after[0].1, "5");
+                assert_eq!(
+                    body.get("error").and_then(|v| v.as_str()),
+                    Some("idempotency unavailable")
+                );
+            }
+            other => panic!("community Unavailable must map to default Busy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_events_fleet_unavailable_fails_closed_to_default_retry_after() {
+        let limiter = fleet_limiter_stages(FleetLimiterOutcome::Allow, FleetLimiterOutcome::Fail);
+        let community = uuid::Uuid::from_u128(1);
+        let err = enforce_keyed_events_fleet_admission(
+            &limiter,
+            &keyed_tenant(community),
+            &Keys::generate().public_key(),
+            300,
+        )
+        .await
+        .expect_err("unavailable fleet admission must fail closed");
+        assert_eq!(err, crate::admission::AdmissionError::Unavailable);
+        assert_eq!(
+            limiter.principal_calls.lock().unwrap().clone(),
+            vec![expected_community_call(community)]
+        );
+        assert_eq!(
+            limiter.ip_calls.lock().unwrap().clone(),
+            vec![expected_fleet_call()]
+        );
+        match keyed_http_error_from_fleet(err) {
+            KeyedHttpError::Busy { retry_after_secs } => {
+                assert_eq!(retry_after_secs, KEYED_BUSY_RETRY_AFTER_SECS);
+                let (status, retry_after, Json(body)) = keyed_busy_http_parts(retry_after_secs);
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(retry_after[0].1, "5");
+                assert_eq!(
+                    body.get("error").and_then(|v| v.as_str()),
+                    Some("idempotency unavailable")
+                );
+            }
+            other => panic!("fleet Unavailable must map to default Busy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyed_busy_retry_after_fifty_nine_is_not_collapsed_to_five() {
+        let (status, retry_after, Json(body)) = keyed_busy_http_parts(59);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry_after[0].1, "59");
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "idempotency unavailable"})
+        );
+    }
+
+    #[tokio::test]
+    async fn one_keyed_admission_charges_community_then_fleet() {
+        let limiter = fleet_limiter(FleetLimiterOutcome::Allow);
+        let community = uuid::Uuid::from_u128(1);
+        enforce_keyed_events_fleet_admission(
+            &limiter,
+            &keyed_tenant(community),
+            &Keys::generate().public_key(),
+            300,
+        )
+        .await
+        .expect("valid keyed persist may charge the fleet bucket");
+        assert_eq!(
+            limiter.principal_calls.lock().unwrap().clone(),
+            vec![expected_community_call(community)]
+        );
+        assert_eq!(
+            limiter.ip_calls.lock().unwrap().clone(),
+            vec![expected_fleet_call()]
+        );
+    }
+
+    #[tokio::test]
+    async fn unkeyed_and_pre_ingest_paths_do_not_consume_keyed_fleet_bucket() {
+        let limiter = fleet_limiter(FleetLimiterOutcome::Deny);
+        let community = uuid::Uuid::from_u128(1);
+        let tenant = keyed_tenant(community);
+        let persist_identity = Keys::generate().public_key();
+        maybe_enforce_keyed_events_fleet_admission(
+            &limiter,
+            &tenant,
+            &persist_identity,
+            300,
+            false,
+        )
+        .await
+        .expect(
+            "malformed JSON, NIP-98 replay, nonmember, and unkeyed /events never set keyed=true",
+        );
+        assert!(limiter.principal_calls.lock().unwrap().is_empty());
+        assert!(
+            limiter.ip_calls.lock().unwrap().is_empty(),
+            "pre-ingest and unkeyed paths must not increment the keyed fleet aggregate"
+        );
+        maybe_enforce_keyed_events_fleet_admission(&limiter, &tenant, &persist_identity, 300, true)
+            .await
+            .expect_err("keyed persist path must consult the community bucket");
+        assert_eq!(
+            limiter.principal_calls.lock().unwrap().clone(),
+            vec![expected_community_call(community)]
+        );
+        assert!(
+            limiter.ip_calls.lock().unwrap().is_empty(),
+            "a denying community stage must not charge the fleet sentinel"
+        );
+    }
+
+    async fn redis_int(state: &crate::state::AppState, key: &str) -> i64 {
+        let mut conn = state.redis_pool.get().await.expect("redis conn");
+        let value: Option<i64> = redis::cmd("GET")
+            .arg(key)
+            .query_async(&mut *conn)
+            .await
+            .expect("GET");
+        value.unwrap_or(0)
+    }
+
+    async fn redis_pexpiretime_ms(state: &crate::state::AppState, key: &str) -> i64 {
+        let mut conn = state.redis_pool.get().await.expect("redis conn");
+        redis::cmd("PEXPIRETIME")
+            .arg(key)
+            .query_async(&mut *conn)
+            .await
+            .expect("PEXPIRETIME")
+    }
+
+    async fn redis_time_ms(state: &crate::state::AppState) -> i64 {
+        let mut conn = state.redis_pool.get().await.expect("redis conn");
+        let (secs, micros): (i64, i64) = redis::cmd("TIME")
+            .query_async(&mut *conn)
+            .await
+            .expect("TIME");
+        secs.saturating_mul(1000).saturating_add(micros / 1000)
+    }
+
+    async fn redis_set_int_pexpireat(
+        state: &crate::state::AppState,
+        key: &str,
+        value: i64,
+        expire_at_ms: i64,
+    ) {
+        let mut conn = state.redis_pool.get().await.expect("redis conn");
+        redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .query_async::<()>(&mut *conn)
+            .await
+            .expect("SET");
+        let _: i64 = redis::cmd("PEXPIREAT")
+            .arg(key)
+            .arg(expire_at_ms)
+            .query_async(&mut *conn)
+            .await
+            .expect("PEXPIREAT");
+    }
+
+    async fn redis_del(state: &crate::state::AppState, key: &str) {
+        let mut conn = state.redis_pool.get().await.expect("redis conn");
+        let _: i64 = redis::cmd("DEL")
+            .arg(key)
+            .query_async(&mut *conn)
+            .await
+            .expect("DEL");
+    }
+
+    async fn redis_restore_int(
+        state: &crate::state::AppState,
+        key: &str,
+        value: i64,
+        expire_at_ms: i64,
+    ) {
+        if expire_at_ms == -2 {
+            redis_del(state, key).await;
+            return;
+        }
+        let mut conn = state.redis_pool.get().await.expect("redis conn");
+        redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .query_async::<()>(&mut *conn)
+            .await
+            .expect("SET");
+        if expire_at_ms > 0 {
+            let _: i64 = redis::cmd("PEXPIREAT")
+                .arg(key)
+                .arg(expire_at_ms)
+                .query_async(&mut *conn)
+                .await
+                .expect("PEXPIREAT");
+        }
+    }
+
+    fn unique_idempotency_key_hex() -> String {
+        let uuid = uuid::Uuid::new_v4();
+        let mut bytes = [0u8; 32];
+        bytes[..16].copy_from_slice(uuid.as_bytes());
+        bytes[16..].copy_from_slice(uuid.as_bytes());
+        hex::encode(bytes)
+    }
+
+    fn parse_test_idempotency_key(hex_key: &str) -> [u8; 32] {
+        buzz_core::idempotency::parse_idempotency_key(hex_key).expect("test idempotency key")
+    }
+
+    async fn post_events_with_idempotency(
+        state: Arc<crate::state::AppState>,
+        host: &str,
+        keys: &Keys,
+        body: &[u8],
+        idempotency_key: Option<&str>,
+    ) -> axum::http::StatusCode {
+        post_events_with_idempotency_response(state, host, keys, body, idempotency_key)
+            .await
+            .status()
+    }
+
+    async fn post_events_with_idempotency_response(
+        state: Arc<crate::state::AppState>,
+        host: &str,
+        keys: &Keys,
+        body: &[u8],
+        idempotency_key: Option<&str>,
+    ) -> axum::http::Response<axum::body::Body> {
+        use axum::body::Body;
+        use axum::http::{header, Request};
+        use tower::ServiceExt;
+
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/events")
+            .header(header::HOST, host)
+            .header("content-type", "application/json");
+        if let Some(key) = idempotency_key {
+            builder = builder.header("Idempotency-Key", key);
+            let tenant = fresh_tenant(host);
+            let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
+            let event_json = build_nip98_event_json(keys, &url, "POST");
+            let headers = nip98_auth_headers(&event_json);
+            let authorization = headers
+                .get(header::AUTHORIZATION)
+                .expect("NIP-98 Authorization")
+                .clone();
+            builder = builder.header(header::AUTHORIZATION, authorization);
+        } else {
+            builder = builder.header("x-pubkey", keys.public_key().to_hex());
+        }
+        crate::router::build_router(state)
+            .oneshot(
+                builder
+                    .body(Body::from(body.to_vec()))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router oneshot")
+    }
+
+    /// POST /events with a valid Idempotency-Key and only the unsigned
+    /// development `X-Pubkey` identity — no NIP-98 Authorization.
+    async fn post_events_unsigned_x_pubkey_with_key(
+        state: Arc<crate::state::AppState>,
+        host: &str,
+        pubkey_hex: &str,
+        body: &[u8],
+        idempotency_key: &str,
+    ) -> axum::http::Response<axum::body::Body> {
+        use axum::body::Body;
+        use axum::http::{header, Request};
+        use tower::ServiceExt;
+
+        crate::router::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/events")
+                    .header(header::HOST, host)
+                    .header("content-type", "application/json")
+                    .header("x-pubkey", pubkey_hex)
+                    .header("Idempotency-Key", idempotency_key)
+                    .body(Body::from(body.to_vec()))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router oneshot")
+    }
+
+    fn kind9_event(keys: &Keys, channel: uuid::Uuid) -> (Vec<u8>, String) {
+        let event = EventBuilder::new(Kind::Custom(9), "keyed-router")
+            .tags([Tag::parse(["h", &channel.to_string()]).expect("h tag")])
+            .sign_with_keys(keys)
+            .expect("sign kind 9");
+        (
+            serde_json::to_vec(&event).expect("serialize"),
+            keys.public_key().to_hex(),
+        )
+    }
+
+    async fn insert_open_channel(
+        database_url: &str,
+        community: buzz_core::CommunityId,
+    ) -> uuid::Uuid {
+        let pool = sqlx::PgPool::connect(database_url)
+            .await
+            .expect("connect test db");
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO channels (id, community_id, name, created_by) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(*community.as_uuid())
+        .bind(format!("keyed-{}", id.simple()))
+        .bind(vec![7_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("insert channel");
+        id
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn router_keyed_admission_charges_only_fresh_hierarchy_after_validation() {
+        let _router_fleet_guard = ROUTER_FLEET_SENTINEL_LOCK.lock().await;
+        let state = bridge_handler_test_state()
+            .await
+            .expect("local Postgres/Redis not reachable");
+        let host = format!("keyed-router-{}.local", uuid::Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("community");
+        let channel = insert_open_channel(&state.config.database_url, community.id).await;
+        let tenant = crate::tenant::bind_community(&state.db, &host)
+            .await
+            .expect("bind");
+        let keys = Keys::generate();
+        let (body, _) = kind9_event(&keys, channel);
+        let event: nostr::Event = serde_json::from_slice(&body).expect("kind 9 event");
+        let historical_identity_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keys.public_key(),
+            &KEYED_HTTP_ATTEMPT_LIMIT_TYPE,
+        );
+        let historical_community_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keyed_http_attempt_admission_principal(),
+            &KEYED_HTTP_ATTEMPT_LIMIT_TYPE,
+        );
+        let historical_fleet_key =
+            buzz_auth::rate_limit::ip_rate_limit_key(&KEYED_HTTP_ATTEMPT_FLEET_SENTINEL);
+        let fresh_identity_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keys.public_key(),
+            &KEYED_HTTP_FRESH_LIMIT_TYPE,
+        );
+        let fresh_community_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keyed_http_fresh_admission_principal(),
+            &KEYED_HTTP_FRESH_LIMIT_TYPE,
+        );
+        let fresh_fleet_key =
+            buzz_auth::rate_limit::ip_rate_limit_key(&KEYED_HTTP_FRESH_FLEET_SENTINEL);
+        let persist_community_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keyed_community_admission_principal(),
+            &KEYED_COMMUNITY_ADMISSION_LIMIT_TYPE,
+        );
+        let persist_fleet_key =
+            buzz_auth::rate_limit::ip_rate_limit_key(&KEYED_EVENTS_FLEET_ADMISSION_SENTINEL);
+        let principal_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keys.public_key(),
+            &LimitType::ApiCalls,
+        );
+        let historical_i0 = redis_int(&state, &historical_identity_key).await;
+        let historical_c0 = redis_int(&state, &historical_community_key).await;
+        let historical_f0 = redis_int(&state, &historical_fleet_key).await;
+        let fresh_i0 = redis_int(&state, &fresh_identity_key).await;
+        let fresh_c0 = redis_int(&state, &fresh_community_key).await;
+        let fresh_f0 = redis_int(&state, &fresh_fleet_key).await;
+        let persist_c0 = redis_int(&state, &persist_community_key).await;
+        let persist_f0 = redis_int(&state, &persist_fleet_key).await;
+        let principal_0 = redis_int(&state, &principal_key).await;
+        let fresh_f_expire_at = redis_pexpiretime_ms(&state, &fresh_fleet_key).await;
+        let persist_f_expire_at = redis_pexpiretime_ms(&state, &persist_fleet_key).await;
+        let key = unique_idempotency_key_hex();
+        let key_bytes = parse_test_idempotency_key(&key);
+        let author = event.pubkey.to_bytes();
+        let status =
+            post_events_with_idempotency(Arc::clone(&state), &host, &keys, &body, Some(&key)).await;
+        let historical_i1 = redis_int(&state, &historical_identity_key).await;
+        let historical_c1 = redis_int(&state, &historical_community_key).await;
+        let historical_f1 = redis_int(&state, &historical_fleet_key).await;
+        let fresh_i1 = redis_int(&state, &fresh_identity_key).await;
+        let fresh_c1 = redis_int(&state, &fresh_community_key).await;
+        let fresh_f1 = redis_int(&state, &fresh_fleet_key).await;
+        let persist_c1 = redis_int(&state, &persist_community_key).await;
+        let persist_f1 = redis_int(&state, &persist_fleet_key).await;
+        let principal_1 = redis_int(&state, &principal_key).await;
+        let classified = state
+            .db
+            .classify_committed_keyed_stream(
+                tenant.community(),
+                author,
+                key_bytes,
+                &event,
+                Some(channel),
+                None,
+            )
+            .await
+            .expect("classify committed keyed stream");
+        let event_id = event.id.to_bytes();
+        let stored = state
+            .db
+            .get_events_by_ids_routed("bridge_query", tenant.community(), &[event_id.as_slice()])
+            .await
+            .expect("fetch persisted event");
+        let pool = sqlx::PgPool::connect(&state.config.database_url)
+            .await
+            .expect("connect test db");
+        let idempotency_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event_idempotency_keys WHERE community_id = $1 AND author_pubkey = $2 AND idempotency_key = $3",
+        )
+        .bind(*tenant.community().as_uuid())
+        .bind(author.as_slice())
+        .bind(key_bytes.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("count idempotency rows");
+        sqlx::query(
+            "DELETE FROM event_idempotency_keys WHERE community_id = $1 AND author_pubkey = $2 AND idempotency_key = $3",
+        )
+        .bind(*tenant.community().as_uuid())
+        .bind(author.as_slice())
+        .bind(key_bytes.as_slice())
+        .execute(&pool)
+        .await
+        .expect("cleanup idempotency row");
+        redis_del(&state, &fresh_identity_key).await;
+        redis_del(&state, &fresh_community_key).await;
+        redis_del(&state, &principal_key).await;
+        redis_del(&state, &persist_community_key).await;
+        redis_restore_int(&state, &fresh_fleet_key, fresh_f0, fresh_f_expire_at).await;
+        redis_restore_int(&state, &persist_fleet_key, persist_f0, persist_f_expire_at).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "valid keyed kind 9");
+        assert_eq!(historical_i1, historical_i0 + 1);
+        assert_eq!(historical_c1, historical_c0 + 1);
+        assert_eq!(historical_f1, historical_f0 + 1);
+        assert_eq!(fresh_i1, fresh_i0 + 1);
+        assert_eq!(fresh_c1, fresh_c0 + 1);
+        assert_eq!(fresh_f1, fresh_f0 + 1);
+        assert_eq!(persist_c1, persist_c0 + 1);
+        assert_eq!(persist_f1, persist_f0 + 1);
+        assert_eq!(principal_1, principal_0 + 1);
+        match classified {
+            Some(KeyedCommittedOutcome::Replay { original_event_id }) => {
+                assert_eq!(original_event_id, event_id);
+            }
+            other => panic!("successful keyed ingest must persist a keyed row, got {other:?}"),
+        }
+        assert_eq!(stored.len(), 1, "event row must be persisted");
+        assert_eq!(idempotency_rows, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn router_keyed_writer_capacity_exhaustion_is_busy_then_succeeds_after_release() {
+        let _router_fleet_guard = ROUTER_FLEET_SENTINEL_LOCK.lock().await;
+        let state = bridge_handler_test_state()
+            .await
+            .expect("local Postgres/Redis not reachable");
+        let host = format!("keyed-writer-cap-{}.local", uuid::Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("community");
+        let channel = insert_open_channel(&state.config.database_url, community.id).await;
+        let tenant = crate::tenant::bind_community(&state.db, &host)
+            .await
+            .expect("bind");
+        let keys = Keys::generate();
+        let (body, _) = kind9_event(&keys, channel);
+        let event: nostr::Event = serde_json::from_slice(&body).expect("kind 9 event");
+        let author = event.pubkey.to_bytes();
+        let event_id = event.id.to_bytes();
+        let key = unique_idempotency_key_hex();
+        let key_bytes = parse_test_idempotency_key(&key);
+        let pool = sqlx::PgPool::connect(&state.config.database_url)
+            .await
+            .expect("connect test db");
+
+        {
+            let _capacity = KeyedWriterCapacityGuard::hold_all();
+            let response = post_events_with_idempotency_response(
+                Arc::clone(&state),
+                &host,
+                &keys,
+                &body,
+                Some(&key),
+            )
+            .await;
+            let status = response.status();
+            let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
+            let body_bytes = axum::body::to_bytes(response.into_body(), 256)
+                .await
+                .expect("bounded keyed-busy body");
+            let classified = state
+                .db
+                .classify_committed_keyed_stream(
+                    tenant.community(),
+                    author,
+                    key_bytes,
+                    &event,
+                    Some(channel),
+                    None,
+                )
+                .await
+                .expect("classify committed keyed stream");
+            let stored = state
+                .db
+                .get_events_by_ids_routed(
+                    "bridge_query",
+                    tenant.community(),
+                    &[event_id.as_slice()],
+                )
+                .await
+                .expect("fetch event");
+            let idempotency_rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM event_idempotency_keys WHERE community_id = $1 AND author_pubkey = $2 AND idempotency_key = $3",
+            )
+            .bind(*tenant.community().as_uuid())
+            .bind(author.as_slice())
+            .bind(key_bytes.as_slice())
+            .fetch_one(&pool)
+            .await
+            .expect("count idempotency rows");
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                retry_after.as_ref().and_then(|value| value.to_str().ok()),
+                Some("5")
+            );
+            assert_eq!(KEYED_BUSY_RETRY_AFTER_SECS, 5);
+            let json: Value = serde_json::from_slice(&body_bytes).expect("keyed-busy JSON");
+            assert_eq!(
+                json,
+                serde_json::json!({"error": "idempotency unavailable"})
+            );
+            assert!(
+                classified.is_none(),
+                "writer-capacity Busy must not leave a committed keyed row"
+            );
+            assert!(
+                stored.is_empty(),
+                "writer-capacity Busy must not persist the event"
+            );
+            assert_eq!(
+                idempotency_rows, 0,
+                "writer-capacity Busy must abort the reservation"
+            );
+        }
+
+        let success =
+            post_events_with_idempotency(Arc::clone(&state), &host, &keys, &body, Some(&key)).await;
+        let classified = state
+            .db
+            .classify_committed_keyed_stream(
+                tenant.community(),
+                author,
+                key_bytes,
+                &event,
+                Some(channel),
+                None,
+            )
+            .await
+            .expect("classify committed keyed stream");
+        let stored = state
+            .db
+            .get_events_by_ids_routed("bridge_query", tenant.community(), &[event_id.as_slice()])
+            .await
+            .expect("fetch persisted event");
+        let idempotency_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event_idempotency_keys WHERE community_id = $1 AND author_pubkey = $2 AND idempotency_key = $3",
+        )
+        .bind(*tenant.community().as_uuid())
+        .bind(author.as_slice())
+        .bind(key_bytes.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("count idempotency rows");
+        sqlx::query(
+            "DELETE FROM event_idempotency_keys WHERE community_id = $1 AND author_pubkey = $2 AND idempotency_key = $3",
+        )
+        .bind(*tenant.community().as_uuid())
+        .bind(author.as_slice())
+        .bind(key_bytes.as_slice())
+        .execute(&pool)
+        .await
+        .expect("cleanup idempotency row");
+        assert_eq!(
+            success,
+            axum::http::StatusCode::OK,
+            "same keyed request must succeed after capacity is released"
+        );
+        match classified {
+            Some(KeyedCommittedOutcome::Replay { original_event_id }) => {
+                assert_eq!(original_event_id, event_id);
+            }
+            other => panic!("retry after capacity release must persist a keyed row, got {other:?}"),
+        }
+        assert_eq!(stored.len(), 1, "event row must be persisted on retry");
+        assert_eq!(idempotency_rows, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn router_keyed_saturated_attempt_identity_is_rejected_without_side_effects() {
+        let _router_fleet_guard = ROUTER_FLEET_SENTINEL_LOCK.lock().await;
+        let state = bridge_handler_test_state()
+            .await
+            .expect("local Postgres/Redis not reachable");
+        let host = format!("keyed-fresh-deny-{}.local", uuid::Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("community");
+        let channel = insert_open_channel(&state.config.database_url, community.id).await;
+        let tenant = crate::tenant::bind_community(&state.db, &host)
+            .await
+            .expect("bind");
+        let keys = Keys::generate();
+        let (body, _) = kind9_event(&keys, channel);
+        let event: nostr::Event = serde_json::from_slice(&body).expect("kind 9 event");
+        let historical_identity_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keys.public_key(),
+            &KEYED_HTTP_ATTEMPT_LIMIT_TYPE,
+        );
+        let historical_community_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keyed_http_attempt_admission_principal(),
+            &KEYED_HTTP_ATTEMPT_LIMIT_TYPE,
+        );
+        let historical_fleet_key =
+            buzz_auth::rate_limit::ip_rate_limit_key(&KEYED_HTTP_ATTEMPT_FLEET_SENTINEL);
+        let fresh_identity_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keys.public_key(),
+            &KEYED_HTTP_FRESH_LIMIT_TYPE,
+        );
+        let fresh_community_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keyed_http_fresh_admission_principal(),
+            &KEYED_HTTP_FRESH_LIMIT_TYPE,
+        );
+        let fresh_fleet_key =
+            buzz_auth::rate_limit::ip_rate_limit_key(&KEYED_HTTP_FRESH_FLEET_SENTINEL);
+        let persist_community_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keyed_community_admission_principal(),
+            &KEYED_COMMUNITY_ADMISSION_LIMIT_TYPE,
+        );
+        let persist_fleet_key =
+            buzz_auth::rate_limit::ip_rate_limit_key(&KEYED_EVENTS_FLEET_ADMISSION_SENTINEL);
+        let principal_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keys.public_key(),
+            &LimitType::ApiCalls,
+        );
+        let historical_i0 = redis_int(&state, &historical_identity_key).await;
+        let historical_c0 = redis_int(&state, &historical_community_key).await;
+        let historical_f0 = redis_int(&state, &historical_fleet_key).await;
+        let persist_c0 = redis_int(&state, &persist_community_key).await;
+        let persist_f0 = redis_int(&state, &persist_fleet_key).await;
+        let principal_0 = redis_int(&state, &principal_key).await;
+        let fresh_fleet_prev = redis_int(&state, &fresh_fleet_key).await;
+        let fresh_fleet_expire_at = redis_pexpiretime_ms(&state, &fresh_fleet_key).await;
+        let author = event.pubkey.to_bytes();
+        let expire_at_ms = redis_time_ms(&state).await.saturating_add(
+            i64::try_from(KEYED_HTTP_ATTEMPT_WINDOW_SECS.saturating_mul(1000)).expect("window ms"),
+        );
+        let seeded_attempt_identity =
+            i64::try_from(KEYED_HTTP_FAIR_SHARE_PER_MIN).expect("fair share");
+        let seeded_attempt_community = 1_i64;
+        let seeded_attempt_fleet = 1_i64;
+        redis_set_int_pexpireat(
+            &state,
+            &historical_identity_key,
+            seeded_attempt_identity,
+            expire_at_ms,
+        )
+        .await;
+        redis_set_int_pexpireat(
+            &state,
+            &historical_community_key,
+            seeded_attempt_community,
+            expire_at_ms,
+        )
+        .await;
+        redis_set_int_pexpireat(
+            &state,
+            &historical_fleet_key,
+            seeded_attempt_fleet,
+            expire_at_ms,
+        )
+        .await;
+        let seeded_i_expire_at = redis_pexpiretime_ms(&state, &historical_identity_key).await;
+        let seeded_c_expire_at = redis_pexpiretime_ms(&state, &historical_community_key).await;
+        let seeded_f_expire_at = redis_pexpiretime_ms(&state, &historical_fleet_key).await;
+        let key = unique_idempotency_key_hex();
+        let key_bytes = parse_test_idempotency_key(&key);
+        let response = post_events_with_idempotency_response(
+            Arc::clone(&state),
+            &host,
+            &keys,
+            &body,
+            Some(&key),
+        )
+        .await;
+        let status = response.status();
+        let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 256)
+            .await
+            .expect("bounded keyed-busy body");
+        let historical_i1 = redis_int(&state, &historical_identity_key).await;
+        let historical_c1 = redis_int(&state, &historical_community_key).await;
+        let historical_f1 = redis_int(&state, &historical_fleet_key).await;
+        let fresh_i1 = redis_int(&state, &fresh_identity_key).await;
+        let fresh_c1 = redis_int(&state, &fresh_community_key).await;
+        let fresh_f1 = redis_int(&state, &fresh_fleet_key).await;
+        let fresh_i_expire_at = redis_pexpiretime_ms(&state, &fresh_identity_key).await;
+        let fresh_c_expire_at = redis_pexpiretime_ms(&state, &fresh_community_key).await;
+        let fresh_f_expire_at = redis_pexpiretime_ms(&state, &fresh_fleet_key).await;
+        let persist_c1 = redis_int(&state, &persist_community_key).await;
+        let persist_f1 = redis_int(&state, &persist_fleet_key).await;
+        let principal_1 = redis_int(&state, &principal_key).await;
+        let classified = state
+            .db
+            .classify_committed_keyed_stream(
+                tenant.community(),
+                author,
+                key_bytes,
+                &event,
+                Some(channel),
+                None,
+            )
+            .await
+            .expect("classify committed keyed stream");
+        let event_id = event.id.to_bytes();
+        let stored = state
+            .db
+            .get_events_by_ids_routed("bridge_query", tenant.community(), &[event_id.as_slice()])
+            .await
+            .expect("fetch event");
+        let pool = sqlx::PgPool::connect(&state.config.database_url)
+            .await
+            .expect("connect test db");
+        let idempotency_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event_idempotency_keys WHERE community_id = $1 AND author_pubkey = $2 AND idempotency_key = $3",
+        )
+        .bind(*tenant.community().as_uuid())
+        .bind(author.as_slice())
+        .bind(key_bytes.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("count idempotency rows");
+        sqlx::query(
+            "DELETE FROM event_idempotency_keys WHERE community_id = $1 AND author_pubkey = $2 AND idempotency_key = $3",
+        )
+        .bind(*tenant.community().as_uuid())
+        .bind(author.as_slice())
+        .bind(key_bytes.as_slice())
+        .execute(&pool)
+        .await
+        .expect("cleanup idempotency row");
+        redis_del(&state, &fresh_identity_key).await;
+        redis_del(&state, &fresh_community_key).await;
+        redis_del(&state, &principal_key).await;
+        redis_del(&state, &historical_identity_key).await;
+        redis_del(&state, &historical_community_key).await;
+        redis_restore_int(
+            &state,
+            &historical_fleet_key,
+            historical_f0,
+            redis_pexpiretime_ms(&state, &historical_fleet_key).await,
+        )
+        .await;
+        redis_restore_int(
+            &state,
+            &fresh_fleet_key,
+            fresh_fleet_prev,
+            fresh_fleet_expire_at,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            retry_after.is_some(),
+            "attempt identity denial must keep the opaque keyed busy Retry-After"
+        );
+        let body: Value = serde_json::from_slice(&body_bytes).expect("keyed-busy JSON");
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "idempotency unavailable"})
+        );
+        assert_eq!(
+            historical_i0, 0,
+            "historical identity must be uncharged before seeding attempt denial"
+        );
+        assert_eq!(
+            historical_c0, 0,
+            "historical community must be uncharged before seeding attempt denial"
+        );
+        assert_eq!(
+            historical_i1, seeded_attempt_identity,
+            "attempt identity denial must not increment the historical identity counter"
+        );
+        assert_eq!(
+            historical_c1, seeded_attempt_community,
+            "attempt identity denial must not increment the historical community counter"
+        );
+        assert_eq!(historical_f1, seeded_attempt_fleet);
+        assert_eq!(fresh_i1, 0);
+        assert_eq!(fresh_c1, 0);
+        assert_eq!(fresh_f1, fresh_fleet_prev);
+        let _ = (
+            fresh_i_expire_at,
+            fresh_c_expire_at,
+            fresh_f_expire_at,
+            seeded_i_expire_at,
+            seeded_c_expire_at,
+            seeded_f_expire_at,
+        );
+        assert_eq!(persist_c1, persist_c0);
+        assert_eq!(persist_f1, persist_f0);
+        assert_eq!(principal_1, principal_0);
+        assert!(
+            classified.is_none(),
+            "attempt identity denial must not reserve or persist a keyed row"
+        );
+        assert!(
+            stored.is_empty(),
+            "attempt identity denial must not persist the event"
+        );
+        assert_eq!(idempotency_rows, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn router_keyed_replay_does_not_charge_principal_or_fleet() {
+        let _router_fleet_guard = ROUTER_FLEET_SENTINEL_LOCK.lock().await;
+        let state = bridge_handler_test_state()
+            .await
+            .expect("local Postgres/Redis not reachable");
+        let host = format!("keyed-replay-{}.local", uuid::Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("community");
+        let channel = insert_open_channel(&state.config.database_url, community.id).await;
+        let tenant = crate::tenant::bind_community(&state.db, &host)
+            .await
+            .expect("bind");
+        let keys = Keys::generate();
+        let (body, _) = kind9_event(&keys, channel);
+        let principal_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keys.public_key(),
+            &LimitType::ApiCalls,
+        );
+        let tenant_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keyed_community_admission_principal(),
+            &KEYED_COMMUNITY_ADMISSION_LIMIT_TYPE,
+        );
+        let fleet_key =
+            buzz_auth::rate_limit::ip_rate_limit_key(&KEYED_EVENTS_FLEET_ADMISSION_SENTINEL);
+        let p0 = redis_int(&state, &principal_key).await;
+        let t0 = redis_int(&state, &tenant_key).await;
+        let f0 = redis_int(&state, &fleet_key).await;
+        let key = "ef".repeat(32);
+        let first =
+            post_events_with_idempotency(Arc::clone(&state), &host, &keys, &body, Some(&key)).await;
+        assert_eq!(first, axum::http::StatusCode::OK, "first keyed insert");
+        assert_eq!(redis_int(&state, &principal_key).await, p0 + 1);
+        assert_eq!(redis_int(&state, &tenant_key).await, t0 + 1);
+        assert_eq!(redis_int(&state, &fleet_key).await, f0 + 1);
+        let replay =
+            post_events_with_idempotency(Arc::clone(&state), &host, &keys, &body, Some(&key)).await;
+        assert_eq!(replay, axum::http::StatusCode::OK, "exact replay");
+        assert_eq!(
+            redis_int(&state, &principal_key).await,
+            p0 + 1,
+            "replay must not charge principal quota"
+        );
+        assert_eq!(
+            redis_int(&state, &tenant_key).await,
+            t0 + 1,
+            "replay must not charge the community bucket"
+        );
+        assert_eq!(
+            redis_int(&state, &fleet_key).await,
+            f0 + 1,
+            "replay must not charge the fleet sentinel"
+        );
+    }
+
+    #[test]
+    fn keyed_principal_quota_keeps_http_429() {
+        let (status, Json(body)) =
+            http_admission_error_response(crate::admission::AdmissionError::Exceeded {
+                reset_in_secs: 11,
+            });
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let text = body.to_string();
+        assert!(
+            text.contains("retry in 11s"),
+            "principal denial must keep the existing 429 contract, got {text}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn router_malformed_keyed_and_unkeyed_do_not_charge_admission() {
+        let _router_fleet_guard = ROUTER_FLEET_SENTINEL_LOCK.lock().await;
+        let state = bridge_handler_test_state()
+            .await
+            .expect("local Postgres/Redis not reachable");
+        let host = format!("keyed-pre-{}.local", uuid::Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("community");
+        let channel = insert_open_channel(&state.config.database_url, community.id).await;
+        let tenant = crate::tenant::bind_community(&state.db, &host)
+            .await
+            .expect("bind");
+        let keys = Keys::generate();
+        let (body, _) = kind9_event(&keys, channel);
+        let tenant_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keyed_community_admission_principal(),
+            &KEYED_COMMUNITY_ADMISSION_LIMIT_TYPE,
+        );
+        let fleet_key =
+            buzz_auth::rate_limit::ip_rate_limit_key(&KEYED_EVENTS_FLEET_ADMISSION_SENTINEL);
+        let t0 = redis_int(&state, &tenant_key).await;
+        let f0 = redis_int(&state, &fleet_key).await;
+        let key = "cd".repeat(32);
+        let malformed =
+            post_events_with_idempotency(Arc::clone(&state), &host, &keys, b"{", Some(&key)).await;
+        assert_eq!(malformed, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(redis_int(&state, &tenant_key).await, t0);
+        assert_eq!(redis_int(&state, &fleet_key).await, f0);
+        let unkeyed =
+            post_events_with_idempotency(Arc::clone(&state), &host, &keys, &body, None).await;
+        assert_eq!(unkeyed, axum::http::StatusCode::OK);
+        assert_eq!(redis_int(&state, &tenant_key).await, t0);
+        assert_eq!(redis_int(&state, &fleet_key).await, f0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn router_two_communities_charge_distinct_tenant_keys_and_one_fleet_key() {
+        let _router_fleet_guard = ROUTER_FLEET_SENTINEL_LOCK.lock().await;
+        let state = bridge_handler_test_state()
+            .await
+            .expect("local Postgres/Redis not reachable");
+        let host_a = format!("keyed-a-{}.local", uuid::Uuid::new_v4().simple());
+        let host_b = format!("keyed-b-{}.local", uuid::Uuid::new_v4().simple());
+        let community_a = state
+            .db
+            .ensure_configured_community(&host_a)
+            .await
+            .expect("community a");
+        let community_b = state
+            .db
+            .ensure_configured_community(&host_b)
+            .await
+            .expect("community b");
+        let channel_a = insert_open_channel(&state.config.database_url, community_a.id).await;
+        let channel_b = insert_open_channel(&state.config.database_url, community_b.id).await;
+        let tenant_a = crate::tenant::bind_community(&state.db, &host_a)
+            .await
+            .expect("bind a");
+        let tenant_b = crate::tenant::bind_community(&state.db, &host_b)
+            .await
+            .expect("bind b");
+        let keys_a = Keys::generate();
+        let keys_b = Keys::generate();
+        let (body_a, _) = kind9_event(&keys_a, channel_a);
+        let (body_b, _) = kind9_event(&keys_b, channel_b);
+        let key_a = buzz_auth::rate_limit::rate_limit_key(
+            &tenant_a,
+            &keyed_community_admission_principal(),
+            &KEYED_COMMUNITY_ADMISSION_LIMIT_TYPE,
+        );
+        let key_b = buzz_auth::rate_limit::rate_limit_key(
+            &tenant_b,
+            &keyed_community_admission_principal(),
+            &KEYED_COMMUNITY_ADMISSION_LIMIT_TYPE,
+        );
+        let fleet_key =
+            buzz_auth::rate_limit::ip_rate_limit_key(&KEYED_EVENTS_FLEET_ADMISSION_SENTINEL);
+        assert_ne!(key_a, key_b);
+        let a0 = redis_int(&state, &key_a).await;
+        let b0 = redis_int(&state, &key_b).await;
+        let f0 = redis_int(&state, &fleet_key).await;
+        let status_a = post_events_with_idempotency(
+            Arc::clone(&state),
+            &host_a,
+            &keys_a,
+            &body_a,
+            Some(&"11".repeat(32)),
+        )
+        .await;
+        let status_b = post_events_with_idempotency(
+            Arc::clone(&state),
+            &host_b,
+            &keys_b,
+            &body_b,
+            Some(&"22".repeat(32)),
+        )
+        .await;
+        assert_eq!(status_a, axum::http::StatusCode::OK);
+        assert_eq!(status_b, axum::http::StatusCode::OK);
+        assert_eq!(redis_int(&state, &key_a).await, a0 + 1);
+        assert_eq!(redis_int(&state, &key_b).await, b0 + 1);
+        assert_eq!(redis_int(&state, &fleet_key).await, f0 + 2);
+    }
+
+    #[derive(Clone, Copy)]
+    enum IdentityPeekOutcome {
+        NotDenied,
+        Denied,
+        Fail,
+    }
+
+    struct LaneRecordingLimiter {
+        increment_outcome: FleetLimiterOutcome,
+        attempt_pair_outcome: FleetLimiterOutcome,
+        fresh_pair_outcome: FleetLimiterOutcome,
+        peek_outcome: IdentityPeekOutcome,
+        steps: Arc<Mutex<Vec<&'static str>>>,
+        paired_types: Mutex<Vec<LimitType>>,
+        principal_types: Mutex<Vec<LimitType>>,
+        increment_pubkeys: Mutex<Vec<[u8; 32]>>,
+        paired_pubkeys: Mutex<Vec<[u8; 32]>>,
+        paired_fleet_ips: Mutex<Vec<IpAddr>>,
+        identity_pubkeys: Mutex<Vec<[u8; 32]>>,
+        community_pubkeys: Mutex<Vec<[u8; 32]>>,
+        peek_calls: AtomicUsize,
+        peek_identities: Mutex<Vec<[u8; 32]>>,
+        peek_limit_types: Mutex<Vec<LimitType>>,
+        peek_fleet_ips: Mutex<Vec<IpAddr>>,
+        peek_identity_limits: Mutex<Vec<u64>>,
+        attempt_identity_charged: AtomicUsize,
+        attempt_tenant_charged: AtomicUsize,
+        attempt_fleet_charged: AtomicUsize,
+        fresh_identity_charged: AtomicUsize,
+        fresh_tenant_charged: AtomicUsize,
+        fresh_fleet_charged: AtomicUsize,
+        hierarchical_calls: AtomicUsize,
+        paired_calls: AtomicUsize,
+        principal_calls: AtomicUsize,
+        attempt_fleet_deny: bool,
+    }
+
+    impl LaneRecordingLimiter {
+        fn new(outcome: FleetLimiterOutcome) -> Self {
+            Self::lanes(FleetLimiterOutcome::Allow, outcome, outcome)
+        }
+
+        fn lanes(
+            increment_outcome: FleetLimiterOutcome,
+            attempt_pair_outcome: FleetLimiterOutcome,
+            fresh_pair_outcome: FleetLimiterOutcome,
+        ) -> Self {
+            Self::with_peek(
+                increment_outcome,
+                attempt_pair_outcome,
+                fresh_pair_outcome,
+                IdentityPeekOutcome::NotDenied,
+            )
+        }
+
+        fn with_peek(
+            increment_outcome: FleetLimiterOutcome,
+            attempt_pair_outcome: FleetLimiterOutcome,
+            fresh_pair_outcome: FleetLimiterOutcome,
+            peek_outcome: IdentityPeekOutcome,
+        ) -> Self {
+            Self {
+                increment_outcome,
+                attempt_pair_outcome,
+                fresh_pair_outcome,
+                peek_outcome,
+                steps: Arc::new(Mutex::new(Vec::new())),
+                paired_types: Mutex::new(Vec::new()),
+                principal_types: Mutex::new(Vec::new()),
+                increment_pubkeys: Mutex::new(Vec::new()),
+                paired_pubkeys: Mutex::new(Vec::new()),
+                paired_fleet_ips: Mutex::new(Vec::new()),
+                identity_pubkeys: Mutex::new(Vec::new()),
+                community_pubkeys: Mutex::new(Vec::new()),
+                peek_calls: AtomicUsize::new(0),
+                peek_identities: Mutex::new(Vec::new()),
+                peek_limit_types: Mutex::new(Vec::new()),
+                peek_fleet_ips: Mutex::new(Vec::new()),
+                peek_identity_limits: Mutex::new(Vec::new()),
+                attempt_identity_charged: AtomicUsize::new(0),
+                attempt_tenant_charged: AtomicUsize::new(0),
+                attempt_fleet_charged: AtomicUsize::new(0),
+                fresh_identity_charged: AtomicUsize::new(0),
+                fresh_tenant_charged: AtomicUsize::new(0),
+                fresh_fleet_charged: AtomicUsize::new(0),
+                hierarchical_calls: AtomicUsize::new(0),
+                paired_calls: AtomicUsize::new(0),
+                principal_calls: AtomicUsize::new(0),
+                attempt_fleet_deny: false,
+            }
+        }
+
+        fn attempt_fleet_denied() -> Self {
+            let mut limiter = Self::lanes(
+                FleetLimiterOutcome::Allow,
+                FleetLimiterOutcome::Deny,
+                FleetLimiterOutcome::Allow,
+            );
+            limiter.attempt_fleet_deny = true;
+            limiter
+        }
+
+        fn pair_outcome(&self, limit_type: &LimitType) -> FleetLimiterOutcome {
+            match limit_type {
+                LimitType::KeyedHttpFresh => self.fresh_pair_outcome,
+                _ => self.attempt_pair_outcome,
+            }
+        }
+
+        fn hierarchical_lane_outcome(&self, limit_type: &LimitType) -> FleetLimiterOutcome {
+            match self.increment_outcome {
+                FleetLimiterOutcome::Deny | FleetLimiterOutcome::Fail => self.increment_outcome,
+                FleetLimiterOutcome::Allow => self.pair_outcome(limit_type),
+            }
+        }
+    }
+
+    impl RateLimiter for LaneRecordingLimiter {
+        async fn check_and_increment(
+            &self,
+            _ctx: &TenantContext,
+            pubkey: &nostr::PublicKey,
+            limit_type: LimitType,
+            window_secs: u64,
+            limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            let step = match &limit_type {
+                LimitType::KeyedHttpAttempts => "attempt_fair_share",
+                LimitType::KeyedHttpFresh => "fresh_fair_share",
+                LimitType::ApiCalls => "unkeyed_api",
+                _ => "other_increment",
+            };
+            self.steps.lock().unwrap().push(step);
+            self.principal_calls.fetch_add(1, Ordering::Relaxed);
+            self.principal_types.lock().unwrap().push(limit_type);
+            self.increment_pubkeys
+                .lock()
+                .unwrap()
+                .push(pubkey.to_bytes());
+            match self.increment_outcome {
+                FleetLimiterOutcome::Allow => {
+                    Ok(buzz_auth::RateLimitResult::allowed(1, limit, window_secs))
+                }
+                FleetLimiterOutcome::Deny => {
+                    Ok(buzz_auth::RateLimitResult::denied(limit + 1, limit, 13))
+                }
+                FleetLimiterOutcome::Fail => Err(buzz_auth::AuthError::Internal(
+                    "shared admission unavailable".to_owned(),
+                )),
+            }
+        }
+
+        async fn check_ip_connection(
+            &self,
+            _ip: &IpAddr,
+            window_secs: u64,
+            limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            Ok(buzz_auth::RateLimitResult::allowed(1, limit, window_secs))
+        }
+
+        async fn check_paired_admission(
+            &self,
+            request: PairedAdmissionRequest<'_>,
+        ) -> Result<PairedAdmissionOutcome, buzz_auth::AuthError> {
+            let step = match &request.limit_type {
+                LimitType::KeyedHttpAttempts => "attempt_shared",
+                LimitType::KeyedHttpFresh => "fresh_shared",
+                _ => "other_shared",
+            };
+            self.steps.lock().unwrap().push(step);
+            self.paired_calls.fetch_add(1, Ordering::Relaxed);
+            self.paired_types
+                .lock()
+                .unwrap()
+                .push(request.limit_type.clone());
+            self.paired_pubkeys
+                .lock()
+                .unwrap()
+                .push(request.pubkey.to_bytes());
+            self.paired_fleet_ips
+                .lock()
+                .unwrap()
+                .push(*request.fleet_ip);
+            match self.pair_outcome(&request.limit_type) {
+                FleetLimiterOutcome::Allow => {
+                    match request.limit_type {
+                        LimitType::KeyedHttpFresh => {
+                            self.fresh_tenant_charged.fetch_add(1, Ordering::Relaxed);
+                            self.fresh_fleet_charged.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {
+                            self.attempt_tenant_charged.fetch_add(1, Ordering::Relaxed);
+                            self.attempt_fleet_charged.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(PairedAdmissionOutcome::Allowed {
+                        tenant: buzz_auth::RateLimitResult::allowed(
+                            1,
+                            request.tenant_limit,
+                            request.window_secs(),
+                        ),
+                        fleet: buzz_auth::RateLimitResult::allowed(
+                            1,
+                            request.fleet_limit,
+                            request.window_secs(),
+                        ),
+                    })
+                }
+                FleetLimiterOutcome::Deny => Ok(PairedAdmissionOutcome::TenantDenied(
+                    buzz_auth::RateLimitResult::denied(
+                        request.tenant_limit + 1,
+                        request.tenant_limit,
+                        17,
+                    ),
+                )),
+                FleetLimiterOutcome::Fail => Err(buzz_auth::AuthError::Internal(
+                    "shared admission unavailable".to_owned(),
+                )),
+            }
+        }
+
+        async fn check_hierarchical_admission(
+            &self,
+            request: HierarchicalAdmissionRequest<'_>,
+        ) -> Result<HierarchicalAdmissionOutcome, buzz_auth::AuthError> {
+            let step = match &request.limit_type {
+                LimitType::KeyedHttpAttempts => "attempt_hierarchical",
+                LimitType::KeyedHttpFresh => "fresh_hierarchical",
+                _ => "other_hierarchical",
+            };
+            self.steps.lock().unwrap().push(step);
+            self.hierarchical_calls.fetch_add(1, Ordering::Relaxed);
+            self.principal_types
+                .lock()
+                .unwrap()
+                .push(request.limit_type.clone());
+            self.paired_types
+                .lock()
+                .unwrap()
+                .push(request.limit_type.clone());
+            self.increment_pubkeys
+                .lock()
+                .unwrap()
+                .push(request.identity.to_bytes());
+            self.identity_pubkeys
+                .lock()
+                .unwrap()
+                .push(request.identity.to_bytes());
+            self.community_pubkeys
+                .lock()
+                .unwrap()
+                .push(request.community.to_bytes());
+            self.paired_pubkeys
+                .lock()
+                .unwrap()
+                .push(request.community.to_bytes());
+            self.paired_fleet_ips
+                .lock()
+                .unwrap()
+                .push(*request.fleet_ip);
+            let identity_deny = matches!(self.increment_outcome, FleetLimiterOutcome::Deny);
+            match self.hierarchical_lane_outcome(&request.limit_type) {
+                FleetLimiterOutcome::Allow => {
+                    match request.limit_type {
+                        LimitType::KeyedHttpFresh => {
+                            self.fresh_identity_charged.fetch_add(1, Ordering::Relaxed);
+                            self.fresh_tenant_charged.fetch_add(1, Ordering::Relaxed);
+                            self.fresh_fleet_charged.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {
+                            self.attempt_identity_charged
+                                .fetch_add(1, Ordering::Relaxed);
+                            self.attempt_tenant_charged.fetch_add(1, Ordering::Relaxed);
+                            self.attempt_fleet_charged.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(HierarchicalAdmissionOutcome::Allowed {
+                        identity: buzz_auth::RateLimitResult::allowed(
+                            1,
+                            request.limits.identity,
+                            request.window_secs(),
+                        ),
+                        community: buzz_auth::RateLimitResult::allowed(
+                            1,
+                            request.limits.community,
+                            request.window_secs(),
+                        ),
+                        fleet: buzz_auth::RateLimitResult::allowed(
+                            1,
+                            request.limits.fleet,
+                            request.window_secs(),
+                        ),
+                    })
+                }
+                FleetLimiterOutcome::Deny if identity_deny => {
+                    Ok(HierarchicalAdmissionOutcome::IdentityDenied(
+                        buzz_auth::RateLimitResult::denied(
+                            request.limits.identity + 1,
+                            request.limits.identity,
+                            13,
+                        ),
+                    ))
+                }
+                FleetLimiterOutcome::Deny if self.attempt_fleet_deny => Ok(
+                    HierarchicalAdmissionOutcome::FleetDenied(buzz_auth::RateLimitResult::denied(
+                        request.limits.fleet + 1,
+                        request.limits.fleet,
+                        23,
+                    )),
+                ),
+                FleetLimiterOutcome::Deny => Ok(HierarchicalAdmissionOutcome::CommunityDenied(
+                    buzz_auth::RateLimitResult::denied(
+                        request.limits.community + 1,
+                        request.limits.community,
+                        17,
+                    ),
+                )),
+                FleetLimiterOutcome::Fail => Err(buzz_auth::AuthError::Internal(
+                    "shared admission unavailable".to_owned(),
+                )),
+            }
+        }
+
+        async fn peek_hierarchical_identity_denial(
+            &self,
+            request: HierarchicalIdentityDenialPeekRequest<'_>,
+        ) -> Result<HierarchicalIdentityDenialPeekOutcome, buzz_auth::AuthError> {
+            self.steps.lock().unwrap().push("attempt_peek");
+            self.peek_calls.fetch_add(1, Ordering::Relaxed);
+            self.peek_identities
+                .lock()
+                .unwrap()
+                .push(request.identity.to_bytes());
+            self.peek_limit_types
+                .lock()
+                .unwrap()
+                .push(request.limit_type.clone());
+            self.peek_fleet_ips.lock().unwrap().push(*request.fleet_ip);
+            self.peek_identity_limits
+                .lock()
+                .unwrap()
+                .push(request.identity_limit());
+            match self.peek_outcome {
+                IdentityPeekOutcome::NotDenied => {
+                    Ok(HierarchicalIdentityDenialPeekOutcome::NotDenied)
+                }
+                IdentityPeekOutcome::Denied => Ok(HierarchicalIdentityDenialPeekOutcome::Denied(
+                    buzz_auth::RateLimitResult::denied(
+                        request.identity_limit() + 1,
+                        request.identity_limit(),
+                        19,
+                    ),
+                )),
+                IdentityPeekOutcome::Fail => Err(buzz_auth::AuthError::Internal(
+                    "shared admission unavailable".to_owned(),
+                )),
+            }
+        }
+    }
+
+    struct OrderedReplayGuard {
+        steps: Arc<Mutex<Vec<&'static str>>>,
+        admit: bool,
+    }
+
+    impl Nip98ReplayGuard for OrderedReplayGuard {
+        fn try_mark_in_scope<'a>(
+            &'a self,
+            _scope: &'a str,
+            _event_id: &'a nostr::EventId,
+            _ttl_secs: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>> + Send + 'a>,
+        > {
+            Box::pin(async {
+                self.steps.lock().unwrap().push("replay");
+                Ok(self.admit)
+            })
+        }
+    }
+
+    type MembershipReady =
+        std::future::Ready<Result<Option<nostr::PublicKey>, (StatusCode, Json<Value>)>>;
+    type KeyedBodyValidationCase = (
+        &'static str,
+        Vec<u8>,
+        nostr::PublicKey,
+        fn(&IngestError) -> bool,
+    );
+
+    fn recording_membership(
+        steps: &Arc<Mutex<Vec<&'static str>>>,
+        result: Result<Option<nostr::PublicKey>, (StatusCode, Json<Value>)>,
+    ) -> impl FnOnce() -> MembershipReady {
+        let steps = Arc::clone(steps);
+        move || {
+            steps.lock().unwrap().push("membership");
+            std::future::ready(result)
+        }
+    }
+
+    fn recording_owner<'a>(
+        steps: &Arc<Mutex<Vec<&'static str>>>,
+        result: Option<&'a str>,
+    ) -> impl FnOnce() -> Option<&'a str> {
+        let steps = Arc::clone(steps);
+        move || {
+            steps.lock().unwrap().push("owner_select");
+            result
+        }
+    }
+
+    fn unreachable_membership() -> impl FnOnce() -> MembershipReady {
+        || {
+            panic!(
+                "membership must not run before attempt, ingress, replay, parse, \
+             signature, and author binding succeed"
+            )
+        }
+    }
+
+    fn unreachable_owner() -> impl FnOnce() -> Option<&'static str> {
+        || {
+            panic!(
+            "owner selection must not run before signature, author binding, and membership succeed"
+        )
+        }
+    }
+
+    fn signed_text_note_body(keys: &Keys) -> Vec<u8> {
+        let event = EventBuilder::new(Kind::TextNote, "fresh")
+            .sign_with_keys(keys)
+            .expect("sign");
+        serde_json::to_vec(&event).expect("serialize")
+    }
+
+    fn signed_kind9_body(keys: &Keys) -> Vec<u8> {
+        let event = EventBuilder::new(Kind::Custom(9), "fresh")
+            .sign_with_keys(keys)
+            .expect("sign");
+        serde_json::to_vec(&event).expect("serialize")
+    }
+
+    fn stale_kind9_body(keys: &Keys) -> Vec<u8> {
+        let event = EventBuilder::new(Kind::Custom(9), "fresh")
+            .custom_created_at(Timestamp::from(1u64))
+            .sign_with_keys(keys)
+            .expect("sign");
+        serde_json::to_vec(&event).expect("serialize")
+    }
+
+    fn extreme_signed_kind9_body(keys: &Keys) -> Vec<u8> {
+        let fixed_now: u64 = 1_700_000_000;
+        let event = EventBuilder::new(Kind::Custom(9), "fresh")
+            .custom_created_at(Timestamp::from(fixed_now.wrapping_add(1u64 << 63)))
+            .sign_with_keys(keys)
+            .expect("sign");
+        serde_json::to_vec(&event).expect("serialize")
+    }
+
+    fn oversized_kind9_body(keys: &Keys) -> Vec<u8> {
+        let content = "x".repeat(256 * 1024 + 1);
+        let event = EventBuilder::new(Kind::Custom(9), content)
+            .sign_with_keys(keys)
+            .expect("sign");
+        serde_json::to_vec(&event).expect("serialize")
+    }
+
+    fn excessive_p_tag_kind9_body(keys: &Keys) -> Vec<u8> {
+        let hex = keys.public_key().to_hex();
+        let tags: Vec<Tag> = (0..=buzz_core::idempotency::KEYED_MAX_P_TAGS)
+            .map(|_| Tag::parse(["p", &hex]).expect("p tag"))
+            .collect();
+        let event = EventBuilder::new(Kind::Custom(9), "fresh")
+            .tags(tags)
+            .allow_self_tagging()
+            .sign_with_keys(keys)
+            .expect("sign");
+        assert_eq!(
+            event.tags.len(),
+            buzz_core::idempotency::KEYED_MAX_P_TAGS + 1
+        );
+        serde_json::to_vec(&event).expect("serialize")
+    }
+
+    fn forged_kind9_body(keys: &Keys) -> Vec<u8> {
+        let event = EventBuilder::new(Kind::Custom(9), "fresh")
+            .sign_with_keys(keys)
+            .expect("sign");
+        let mut value = serde_json::to_value(&event).expect("json");
+        for field in ["id", "sig"] {
+            let Some(serde_json::Value::String(hex)) = value.get(field).cloned() else {
+                panic!("{field} must serialize as hex");
+            };
+            let flipped = format!(
+                "{}{}",
+                if hex.as_bytes()[0] == b'0' { '1' } else { '0' },
+                &hex[1..]
+            );
+            value[field] = serde_json::Value::String(flipped);
+        }
+        serde_json::to_vec(&value).expect("serialize")
+    }
+
+    fn assert_fresh_untouched(limiter: &LaneRecordingLimiter) {
+        assert_eq!(limiter.fresh_identity_charged.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.fresh_tenant_charged.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.fresh_fleet_charged.load(Ordering::Relaxed), 0);
+        assert!(
+            !limiter
+                .paired_types
+                .lock()
+                .unwrap()
+                .contains(&LimitType::KeyedHttpFresh),
+            "fresh LimitType must not be consulted"
+        );
+        assert!(
+            !limiter
+                .steps
+                .lock()
+                .unwrap()
+                .contains(&"fresh_hierarchical"),
+            "fresh hierarchy must not run before committed miss"
+        );
+    }
+
+    fn assert_attempt_charged_once(limiter: &LaneRecordingLimiter, pubkey: &nostr::PublicKey) {
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(limiter.attempt_identity_charged.load(Ordering::Relaxed), 1);
+        assert_eq!(limiter.attempt_tenant_charged.load(Ordering::Relaxed), 1);
+        assert_eq!(limiter.attempt_fleet_charged.load(Ordering::Relaxed), 1);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            limiter.identity_pubkeys.lock().unwrap()[0],
+            pubkey.to_bytes()
+        );
+        assert_eq!(
+            limiter.community_pubkeys.lock().unwrap()[0],
+            keyed_http_attempt_admission_principal().to_bytes()
+        );
+        assert_eq!(
+            limiter.paired_fleet_ips.lock().unwrap()[0],
+            KEYED_HTTP_ATTEMPT_FLEET_SENTINEL
+        );
+        assert_eq!(
+            limiter.principal_types.lock().unwrap()[0],
+            LimitType::KeyedHttpAttempts
+        );
+    }
+
+    fn assert_attempt_invoked_without_charge(limiter: &LaneRecordingLimiter) {
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(limiter.attempt_identity_charged.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.attempt_tenant_charged.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.attempt_fleet_charged.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+    }
+
+    async fn attempt_then_after<'req, 'tag, L, Mem, MemFut, Tag>(
+        limiter: &L,
+        replay_guard: &dyn Nip98ReplayGuard,
+        request: KeyedHttpAdmitRequest<'req>,
+        membership: Mem,
+        open_relay_auth_tag: Tag,
+    ) -> Result<(KeyedHttpValidatedEvent, Option<nostr::PublicKey>), KeyedHttpAdmitError>
+    where
+        L: RateLimiter,
+        Mem: FnOnce() -> MemFut + 'req,
+        MemFut: Future<Output = Result<Option<nostr::PublicKey>, (StatusCode, Json<Value>)>>
+            + Send
+            + 'req,
+        Tag: FnOnce() -> Option<&'tag str> + 'req,
+    {
+        let _ingress_lock = lock_keyed_ingress_tests_async().await;
+        admit_keyed_http_attempt(limiter, request.tenant, &request.pubkey)
+            .await
+            .map_err(KeyedHttpAdmitError::PreIngest)?;
+        let community = *request.tenant.community().as_uuid();
+        let ingress = try_acquire_keyed_ingress(community).map_err(|_| {
+            KeyedHttpAdmitError::PreIngest(KeyedPreIngestError::Attempt(
+                crate::admission::AdmissionError::Unavailable,
+            ))
+        })?;
+        let early = KeyedHttpEarlyContext {
+            ingress: Some(ingress),
+            deadline: KeyedEarlyDeadline::start(),
+            verified_owner: None,
+        };
+        let (validated, early) = admit_keyed_http_after_attempt(
+            replay_guard,
+            request,
+            membership,
+            open_relay_auth_tag,
+            early,
+        )
+        .await?;
+        Ok((validated, early.verified_owner))
+    }
+
+    #[test]
+    fn keyed_handler_header_errors_are_rejected_before_ingress() {
+        let headers = idempotency_header_map(&["not-a-key"]);
+        let parse_err = parse_idempotency_key_header(&headers).expect_err("invalid key");
+        let err = keyed_handler_error_response(KeyedHandlerError::InvalidHeader(parse_err));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(KEYED_INGRESS_GLOBAL_MAX, 32);
+        assert_eq!(KEYED_INGRESS_COMMUNITY_MAX, 16);
+    }
+
+    #[test]
+    fn unkeyed_parse_consumes_no_ingress() {
+        let headers = HeaderMap::new();
+        let key = parse_idempotency_key_header(&headers).expect("unkeyed parse");
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn unmapped_host_and_failed_auth_happen_before_attempt_and_ingress() {
+        let hex = "ab".repeat(32);
+        let mut headers = idempotency_header_map(&[&hex]);
+        headers.insert(header::HOST, "unmapped.example".parse().expect("host"));
+        let key = parse_idempotency_key_header(&headers)
+            .expect("valid key parses before bind")
+            .expect("decoded key");
+        assert_eq!(hex::encode(key), hex);
+
+        let missing_auth = verify_bridge_auth(
+            &headers,
+            "POST",
+            "http://unmapped.example/events",
+            Some(b"{}"),
+            true,
+        );
+        assert!(missing_auth.is_err(), "missing Nostr auth must fail closed");
+
+        headers.insert(
+            header::AUTHORIZATION,
+            "Nostr not-base64".parse().expect("authorization"),
+        );
+        let invalid_auth = verify_bridge_auth(
+            &headers,
+            "POST",
+            "http://unmapped.example/events",
+            Some(b"{}"),
+            true,
+        );
+        assert!(
+            invalid_auth.is_err(),
+            "invalid NIP-98 auth must fail closed"
+        );
+    }
+
+    #[test]
+    fn unkeyed_dev_x_pubkey_identity_is_accepted() {
+        let keys = Keys::generate();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-pubkey",
+            keys.public_key().to_hex().parse().expect("x-pubkey"),
+        );
+        let VerifiedBridgeAuth {
+            pubkey,
+            event_id_bytes,
+            ..
+        } = verify_bridge_auth(
+            &headers,
+            "POST",
+            "https://relay.example/events",
+            Some(b"{}"),
+            false,
+        )
+        .expect("unkeyed development X-Pubkey remains accepted");
+        assert_eq!(pubkey, keys.public_key());
+        assert_eq!(event_id_bytes, [0u8; 32]);
+    }
+
+    /// Keyed POST /events with dev `require_auth_token = false`, a valid
+    /// Idempotency-Key, and only `X-Pubkey` must 401 after host bind and
+    /// before pre-attempt capacity. Bites if `submit_event` drops
+    /// `require_auth_token || idempotency_key.is_some()` or acquires capacity
+    /// first (community slots are already full, so that path would 503).
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn keyed_unsigned_dev_identity_is_rejected_after_host_binding_before_capacity() {
+        let _router_fleet_guard = ROUTER_FLEET_SENTINEL_LOCK.lock().await;
+        let state = bridge_handler_test_state()
+            .await
+            .expect("local Postgres/Redis not reachable");
+        assert!(
+            !state.config.require_auth_token,
+            "dev config must leave the X-Pubkey fallback available"
+        );
+
+        let host = format!("keyed-unsigned-{}.local", uuid::Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("community");
+        let channel = insert_open_channel(&state.config.database_url, community.id).await;
+        let tenant = crate::tenant::bind_community(&state.db, &host)
+            .await
+            .expect("host binding is a required prerequisite");
+        let community_id = *tenant.community().as_uuid();
+        let keys = Keys::generate();
+        let (body, pubkey_hex) = kind9_event(&keys, channel);
+        let event: nostr::Event = serde_json::from_slice(&body).expect("kind 9 event");
+        let author = event.pubkey.to_bytes();
+        let key = unique_idempotency_key_hex();
+        let key_bytes = parse_test_idempotency_key(&key);
+
+        let unmapped = post_events_unsigned_x_pubkey_with_key(
+            Arc::clone(&state),
+            &format!("unmapped-{}.local", uuid::Uuid::new_v4().simple()),
+            &pubkey_hex,
+            &body,
+            &key,
+        )
+        .await;
+        assert_eq!(
+            unmapped.status(),
+            StatusCode::NOT_FOUND,
+            "unsigned keyed traffic on an unbound host must fail at host binding"
+        );
+
+        let capacity = keyed_pre_attempt_capacity().expect("production pre-attempt capacity");
+        let global_before_hold = capacity.global_available();
+        let mut held = Vec::with_capacity(KEYED_PRE_ATTEMPT_COMMUNITY_MAX);
+        for _ in 0..KEYED_PRE_ATTEMPT_COMMUNITY_MAX {
+            held.push(
+                try_acquire_keyed_pre_attempt(community_id).expect("hold community pre-attempt"),
+            );
+        }
+        assert_eq!(
+            capacity.community_count(community_id),
+            Some(KEYED_PRE_ATTEMPT_COMMUNITY_MAX)
+        );
+        let global_held = capacity.global_available();
+        assert_eq!(
+            global_held,
+            global_before_hold - KEYED_PRE_ATTEMPT_COMMUNITY_MAX
+        );
+
+        let historical_identity_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keys.public_key(),
+            &KEYED_HTTP_ATTEMPT_LIMIT_TYPE,
+        );
+        let historical_community_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keyed_http_attempt_admission_principal(),
+            &KEYED_HTTP_ATTEMPT_LIMIT_TYPE,
+        );
+        let historical_fleet_key =
+            buzz_auth::rate_limit::ip_rate_limit_key(&KEYED_HTTP_ATTEMPT_FLEET_SENTINEL);
+        let persist_community_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keyed_community_admission_principal(),
+            &KEYED_COMMUNITY_ADMISSION_LIMIT_TYPE,
+        );
+        let persist_fleet_key =
+            buzz_auth::rate_limit::ip_rate_limit_key(&KEYED_EVENTS_FLEET_ADMISSION_SENTINEL);
+        let principal_key = buzz_auth::rate_limit::rate_limit_key(
+            &tenant,
+            &keys.public_key(),
+            &LimitType::ApiCalls,
+        );
+        let historical_i0 = redis_int(&state, &historical_identity_key).await;
+        let historical_c0 = redis_int(&state, &historical_community_key).await;
+        let historical_f0 = redis_int(&state, &historical_fleet_key).await;
+        let persist_c0 = redis_int(&state, &persist_community_key).await;
+        let persist_f0 = redis_int(&state, &persist_fleet_key).await;
+        let principal_0 = redis_int(&state, &principal_key).await;
+
+        let response = post_events_unsigned_x_pubkey_with_key(
+            Arc::clone(&state),
+            &host,
+            &pubkey_hex,
+            &body,
+            &key,
+        )
+        .await;
+        let status = response.status();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 256)
+            .await
+            .expect("bounded unsigned-keyed body");
+        let json: Value = serde_json::from_slice(&body_bytes).expect("unsigned-keyed JSON");
+        let msg = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_ne!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "full pre-attempt capacity must not be consulted for unsigned keyed identity"
+        );
+        assert_ne!(status, StatusCode::NOT_FOUND);
+        assert!(
+            msg.contains("missing Nostr auth"),
+            "keyed unsigned identity must fail closed as missing NIP-98 after host binding; got {msg}"
+        );
+        assert_eq!(
+            capacity.community_count(community_id),
+            Some(KEYED_PRE_ATTEMPT_COMMUNITY_MAX)
+        );
+        assert_eq!(capacity.global_available(), global_held);
+        assert_eq!(
+            redis_int(&state, &historical_identity_key).await,
+            historical_i0
+        );
+        assert_eq!(
+            redis_int(&state, &historical_community_key).await,
+            historical_c0
+        );
+        assert_eq!(
+            redis_int(&state, &historical_fleet_key).await,
+            historical_f0
+        );
+        assert_eq!(redis_int(&state, &persist_community_key).await, persist_c0);
+        assert_eq!(redis_int(&state, &persist_fleet_key).await, persist_f0);
+        assert_eq!(redis_int(&state, &principal_key).await, principal_0);
+
+        let pool = sqlx::PgPool::connect(&state.config.database_url)
+            .await
+            .expect("connect test db");
+        let idempotency_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event_idempotency_keys WHERE community_id = $1 AND author_pubkey = $2 AND idempotency_key = $3",
+        )
+        .bind(community_id)
+        .bind(author.as_slice())
+        .bind(key_bytes.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("count idempotency rows");
+        assert_eq!(
+            idempotency_rows, 0,
+            "unsigned keyed reject must not reserve"
+        );
+
+        let unkeyed_keys = Keys::generate();
+        let (unkeyed_body, _) = kind9_event(&unkeyed_keys, channel);
+        let unkeyed = post_events_with_idempotency(
+            Arc::clone(&state),
+            &host,
+            &unkeyed_keys,
+            &unkeyed_body,
+            None,
+        )
+        .await;
+        assert_eq!(
+            unkeyed,
+            StatusCode::OK,
+            "unkeyed development X-Pubkey remains accepted"
+        );
+        assert_eq!(
+            capacity.community_count(community_id),
+            Some(KEYED_PRE_ATTEMPT_COMMUNITY_MAX),
+            "unkeyed development success must not take keyed pre-attempt capacity"
+        );
+        assert_eq!(
+            redis_int(&state, &historical_identity_key).await,
+            historical_i0
+        );
+        assert_eq!(redis_int(&state, &persist_community_key).await, persist_c0);
+
+        drop(held);
+        let signed =
+            post_events_with_idempotency(Arc::clone(&state), &host, &keys, &body, Some(&key)).await;
+        let signed_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event_idempotency_keys WHERE community_id = $1 AND author_pubkey = $2 AND idempotency_key = $3",
+        )
+        .bind(community_id)
+        .bind(author.as_slice())
+        .bind(key_bytes.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("count signed keyed idempotency rows");
+        sqlx::query(
+            "DELETE FROM event_idempotency_keys WHERE community_id = $1 AND author_pubkey = $2 AND idempotency_key = $3",
+        )
+        .bind(community_id)
+        .bind(author.as_slice())
+        .bind(key_bytes.as_slice())
+        .execute(&pool)
+        .await
+        .expect("cleanup idempotency row");
+        assert_eq!(
+            signed,
+            StatusCode::OK,
+            "signed keyed NIP-98 remains accepted"
+        );
+        assert_eq!(signed_rows, 1);
+    }
+
+    #[test]
+    fn keyed_locally_signed_nip98_succeeds_without_payload_tag() {
+        let keys = Keys::generate();
+        let url = "https://relay.example/events";
+        let event_json = build_nip98_event_json(&keys, url, "POST");
+        let mut headers = nip98_auth_headers(&event_json);
+        let hex = "cd".repeat(32);
+        headers.append(
+            buzz_core::idempotency::HEADER_NAME,
+            hex.parse().expect("idempotency key"),
+        );
+        headers.insert(header::HOST, "relay.example".parse().expect("host"));
+        headers.insert(
+            "x-pubkey",
+            keys.public_key().to_hex().parse().expect("x-pubkey"),
+        );
+
+        let key = parse_idempotency_key_header(&headers)
+            .expect("valid key parses before bind")
+            .expect("decoded key");
+        assert_eq!(hex::encode(key), hex);
+        assert!(
+            headers.contains_key(header::HOST),
+            "host binding remains the first post-header-parse prerequisite"
+        );
+
+        let VerifiedBridgeAuth {
+            pubkey,
+            event_id_bytes,
+            ..
+        } = verify_bridge_auth(&headers, "POST", url, Some(b"{}"), true)
+            .expect("keyed lane accepts locally signed NIP-98 without a payload tag");
+        assert_eq!(pubkey, keys.public_key());
+        assert_ne!(event_id_bytes, [0u8; 32]);
+        assert!(!event_json.contains("payload"));
+    }
+
+    fn assert_pre_attempt_busy_is_opaque_503() {
+        let (status, retry_after, Json(body)) = keyed_busy_http_parts(KEYED_BUSY_RETRY_AFTER_SECS);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(retry_after[0].0, header::RETRY_AFTER);
+        assert_eq!(retry_after[0].1, "5");
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "idempotency unavailable"})
+        );
+        let dumped = body.to_string();
+        assert!(!dumped.contains("capacity"));
+        assert!(!dumped.contains("redis"));
+        assert!(!dumped.contains("quota"));
+        assert!(!dumped.contains("tenant"));
+    }
+
+    fn isolated_pre_attempt_communities(capacity: &KeyedPreAttemptCapacity) -> (Uuid, Uuid) {
+        for a in 1u128..4_096 {
+            let mix = a.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17);
+            let community_a = Uuid::from_u128(mix ^ 0xA11);
+            let Some(hold_a) = capacity.try_hold_registry(community_a) else {
+                continue;
+            };
+            for b in a + 1..a + 512 {
+                let mix_b = b.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17);
+                let community_b = Uuid::from_u128(mix_b ^ 0xB22);
+                if let Some(hold_b) = capacity.try_hold_registry(community_b) {
+                    drop(hold_b);
+                    drop(hold_a);
+                    return (community_a, community_b);
+                }
+            }
+            drop(hold_a);
+        }
+        panic!("could not find two communities on distinct pre-attempt registry shards");
+    }
+
+    fn same_shard_pre_attempt_communities(capacity: &KeyedPreAttemptCapacity) -> (Uuid, Uuid) {
+        for a in 1u128..8_192 {
+            let mix = a.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17);
+            let community_a = Uuid::from_u128(mix ^ 0x51A);
+            let Some(hold_a) = capacity.try_hold_registry(community_a) else {
+                continue;
+            };
+            for b in a + 1..a + 4_096 {
+                let mix_b = b.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17);
+                let community_b = Uuid::from_u128(mix_b ^ 0x51B);
+                if community_a == community_b {
+                    continue;
+                }
+                if capacity.try_hold_registry(community_b).is_none() {
+                    drop(hold_a);
+                    return (community_a, community_b);
+                }
+            }
+            drop(hold_a);
+        }
+        panic!("could not find two communities on the same pre-attempt registry shard");
+    }
+
+    fn assert_pre_attempt_fully_idle(capacity: &KeyedPreAttemptCapacity) {
+        reap_dead_keyed_pre_attempt_entries(capacity);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        assert_eq!(capacity.registry_len(), 0);
+        assert_eq!(capacity.registry_bound(), 0);
+    }
+
+    fn wait_pre_attempt_key_absent(
+        capacity: &KeyedPreAttemptCapacity,
+        community: Uuid,
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while capacity.registry_contains(community) {
+            if Instant::now() >= deadline {
+                panic!("reaper did not remove stale pre-attempt key without a new checkout");
+            }
+            capacity.unpark_reaper();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn keyed_pre_attempt_community_isolation_and_global_exhaustion() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let capacity = KeyedPreAttemptCapacity::new();
+        let community_a = Uuid::from_u128(0xA11);
+        let community_b = Uuid::from_u128(0xB22);
+        let community_c = Uuid::from_u128(0xC33);
+        assert_eq!(KEYED_PRE_ATTEMPT_GLOBAL_MAX, 32);
+        assert_eq!(KEYED_PRE_ATTEMPT_COMMUNITY_MAX, 16);
+
+        let mut held_a = Vec::with_capacity(KEYED_PRE_ATTEMPT_COMMUNITY_MAX);
+        for _ in 0..KEYED_PRE_ATTEMPT_COMMUNITY_MAX {
+            held_a.push(
+                try_acquire_keyed_pre_attempt_from(&capacity, community_a).expect("community A"),
+            );
+        }
+        assert_eq!(
+            capacity.community_count(community_a),
+            Some(KEYED_PRE_ATTEMPT_COMMUNITY_MAX)
+        );
+        assert_eq!(
+            capacity.community_live_handles(community_a),
+            Some(KEYED_PRE_ATTEMPT_COMMUNITY_MAX)
+        );
+        assert_eq!(
+            capacity.global_available(),
+            KEYED_PRE_ATTEMPT_GLOBAL_MAX - KEYED_PRE_ATTEMPT_COMMUNITY_MAX
+        );
+        match try_acquire_keyed_pre_attempt_from(&capacity, community_a) {
+            Err(()) => assert_pre_attempt_busy_is_opaque_503(),
+            Ok(_) => panic!("community A at 16 must fail fast without queueing"),
+        }
+        assert_eq!(
+            capacity.community_count(community_a),
+            Some(KEYED_PRE_ATTEMPT_COMMUNITY_MAX)
+        );
+        assert_eq!(
+            capacity.community_live_handles(community_a),
+            Some(KEYED_PRE_ATTEMPT_COMMUNITY_MAX)
+        );
+        assert_eq!(
+            capacity.global_available(),
+            KEYED_PRE_ATTEMPT_GLOBAL_MAX - KEYED_PRE_ATTEMPT_COMMUNITY_MAX
+        );
+        assert!(!capacity.registry_contains(community_b));
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.principal_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+
+        let mut held_b = Vec::with_capacity(KEYED_PRE_ATTEMPT_COMMUNITY_MAX);
+        for _ in 0..KEYED_PRE_ATTEMPT_COMMUNITY_MAX {
+            held_b.push(
+                try_acquire_keyed_pre_attempt_from(&capacity, community_b)
+                    .expect("community B while A is full"),
+            );
+        }
+        assert_eq!(
+            capacity.community_count(community_b),
+            Some(KEYED_PRE_ATTEMPT_COMMUNITY_MAX)
+        );
+        assert_eq!(capacity.global_available(), 0);
+        assert_eq!(capacity.registry_len(), 2);
+        match try_acquire_keyed_pre_attempt_from(&capacity, community_c) {
+            Err(()) => assert_pre_attempt_busy_is_opaque_503(),
+            Ok(_) => panic!("global 32 must fail fast for a third community"),
+        }
+        assert!(!capacity.registry_contains(community_c));
+        assert_eq!(capacity.community_count(community_c), None);
+        assert_eq!(capacity.community_live_handles(community_c), None);
+        assert_eq!(capacity.registry_len(), 2);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.principal_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+
+        drop(held_a);
+        drop(held_b);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        assert_pre_attempt_fully_idle(&capacity);
+        assert!(!capacity.registry_contains(community_a));
+        assert!(!capacity.registry_contains(community_b));
+        let restored =
+            try_acquire_keyed_pre_attempt_from(&capacity, community_a).expect("restored");
+        assert_eq!(
+            capacity.global_available(),
+            KEYED_PRE_ATTEMPT_GLOBAL_MAX - 1
+        );
+        assert_eq!(capacity.community_count(community_a), Some(1));
+        drop(restored);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        assert_pre_attempt_fully_idle(&capacity);
+    }
+
+    #[test]
+    fn unkeyed_path_does_not_acquire_pre_attempt_capacity() {
+        let capacity = KeyedPreAttemptCapacity::new();
+        let headers = HeaderMap::new();
+        let key = parse_idempotency_key_header(&headers).expect("unkeyed parse");
+        // Production acquires only inside `if idempotency_key.is_some()` after auth.
+        match key {
+            None => {}
+            Some(_) => {
+                let community = Uuid::from_u128(0xE11);
+                let _permit = try_acquire_keyed_pre_attempt_from(&capacity, community)
+                    .expect("would acquire only for keyed");
+                panic!("unkeyed parse must not present a key");
+            }
+        }
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        assert_eq!(capacity.registry_len(), 0);
+    }
+
+    #[test]
+    fn malformed_idempotency_header_is_rejected_before_pre_attempt_capacity() {
+        let capacity = KeyedPreAttemptCapacity::new();
+        let headers = idempotency_header_map(&["not-a-key"]);
+        let parse_err = parse_idempotency_key_header(&headers).expect_err("invalid key");
+        let err = keyed_handler_error_response(KeyedHandlerError::InvalidHeader(parse_err));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_ne!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        assert_eq!(capacity.registry_len(), 0);
+    }
+
+    #[test]
+    fn keyed_pre_attempt_handoff_holds_through_attempt_then_releases_after_ingress() {
+        let _ingress_lock = lock_keyed_ingress_tests();
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let tenant = fresh_tenant("keyed-pre-attempt.example");
+        let keys = Keys::generate();
+        let capacity = KeyedPreAttemptCapacity::new();
+        let community = *tenant.community().as_uuid();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let pre_attempt =
+            try_acquire_keyed_pre_attempt_from(&capacity, community).expect("pre-attempt");
+        assert_eq!(
+            capacity.global_available(),
+            KEYED_PRE_ATTEMPT_GLOBAL_MAX - 1
+        );
+        assert_eq!(capacity.community_count(community), Some(1));
+        rt.block_on(admit_keyed_http_attempt(
+            &limiter,
+            &tenant,
+            &keys.public_key(),
+        ))
+        .expect("attempt allowed");
+        assert_eq!(
+            capacity.global_available(),
+            KEYED_PRE_ATTEMPT_GLOBAL_MAX - 1
+        );
+        assert_eq!(capacity.community_count(community), Some(1));
+        assert_attempt_charged_once(&limiter, &keys.public_key());
+        let ingress = try_acquire_keyed_ingress(community).expect("ingress");
+        assert_eq!(
+            capacity.global_available(),
+            KEYED_PRE_ATTEMPT_GLOBAL_MAX - 1,
+            "pre-attempt stays held until after ingress is acquired"
+        );
+        assert_eq!(capacity.community_count(community), Some(1));
+        let ingress = handoff_keyed_pre_attempt_to_ingress(ingress, pre_attempt);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        assert_eq!(capacity.community_count(community), None);
+        assert_pre_attempt_fully_idle(&capacity);
+        drop(ingress);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_fresh_untouched(&limiter);
+    }
+
+    #[test]
+    fn keyed_pre_attempt_denial_and_early_drop_reclaim() {
+        let capacity = KeyedPreAttemptCapacity::new();
+        let community = Uuid::from_u128(0xD44);
+        let held = try_acquire_keyed_pre_attempt_from(&capacity, community).expect("held");
+        assert_eq!(
+            capacity.global_available(),
+            KEYED_PRE_ATTEMPT_GLOBAL_MAX - 1
+        );
+        assert_eq!(capacity.community_count(community), Some(1));
+        drop(held);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        assert_pre_attempt_fully_idle(&capacity);
+        assert!(!capacity.registry_contains(community));
+
+        let mut held = Vec::with_capacity(KEYED_PRE_ATTEMPT_COMMUNITY_MAX);
+        for _ in 0..KEYED_PRE_ATTEMPT_COMMUNITY_MAX {
+            held.push(try_acquire_keyed_pre_attempt_from(&capacity, community).expect("fill"));
+        }
+        let global_at_community_cap = capacity.global_available();
+        assert!(try_acquire_keyed_pre_attempt_from(&capacity, community).is_err());
+        assert_eq!(capacity.global_available(), global_at_community_cap);
+        assert_eq!(
+            capacity.community_count(community),
+            Some(KEYED_PRE_ATTEMPT_COMMUNITY_MAX)
+        );
+        assert_eq!(
+            capacity.community_live_handles(community),
+            Some(KEYED_PRE_ATTEMPT_COMMUNITY_MAX)
+        );
+        drop(held);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        assert_pre_attempt_fully_idle(&capacity);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = try_acquire_keyed_pre_attempt_from(&capacity, community).expect("permit");
+            panic!("pre-attempt must drop on unwind");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        assert_eq!(capacity.community_live_handles(community), None);
+        assert_pre_attempt_fully_idle(&capacity);
+        assert!(!capacity.registry_contains(community));
+    }
+
+    #[test]
+    fn keyed_pre_attempt_registry_contention_is_fail_fast_and_preserves_capacity() {
+        let capacity = KeyedPreAttemptCapacity::new();
+        let community = Uuid::from_u128(0xA11);
+        let global_before = capacity.global_available();
+        let registry_before = capacity.registry_len();
+        {
+            let _hold = capacity
+                .try_hold_registry(community)
+                .expect("occupy registry shard");
+            let started = Instant::now();
+            match try_acquire_keyed_pre_attempt_from(&capacity, community) {
+                Err(()) => assert_pre_attempt_busy_is_opaque_503(),
+                Ok(_) => panic!("registry contention must fail fast without queueing"),
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "registry contention must not park a Tokio/request worker"
+            );
+            assert_eq!(capacity.global_available(), global_before);
+        }
+        assert_eq!(capacity.global_available(), global_before);
+        assert_eq!(capacity.registry_len(), registry_before);
+        assert_eq!(capacity.community_count(community), None);
+        assert_eq!(capacity.community_live_handles(community), None);
+        assert!(!capacity.registry_contains(community));
+    }
+
+    #[test]
+    fn keyed_pre_attempt_overcap_a_registry_contention_does_not_consume_global_or_starve_b() {
+        let capacity = Arc::new(KeyedPreAttemptCapacity::new());
+        let (community_a, community_b) = isolated_pre_attempt_communities(&capacity);
+        let mut held_a = Vec::with_capacity(KEYED_PRE_ATTEMPT_COMMUNITY_MAX);
+        for _ in 0..KEYED_PRE_ATTEMPT_COMMUNITY_MAX {
+            held_a.push(
+                try_acquire_keyed_pre_attempt_from(&capacity, community_a).expect("community A"),
+            );
+        }
+        let global_before = capacity.global_available();
+        assert_eq!(
+            global_before,
+            KEYED_PRE_ATTEMPT_GLOBAL_MAX - KEYED_PRE_ATTEMPT_COMMUNITY_MAX
+        );
+        assert_eq!(
+            capacity.community_count(community_a),
+            Some(KEYED_PRE_ATTEMPT_COMMUNITY_MAX)
+        );
+        let overcap = KEYED_PRE_ATTEMPT_COMMUNITY_MAX;
+        let (tx, rx) = mpsc::channel();
+        let hold = capacity
+            .try_hold_registry(community_a)
+            .expect("coordinate old registry-contention interleaving on A");
+        let mut workers = Vec::with_capacity(overcap);
+        for _ in 0..overcap {
+            let tx = tx.clone();
+            let capacity = Arc::clone(&capacity);
+            workers.push(std::thread::spawn(move || {
+                let started = Instant::now();
+                let result = try_acquire_keyed_pre_attempt_from(&capacity, community_a);
+                tx.send((result.is_err(), started.elapsed()))
+                    .expect("send over-cap A outcome");
+            }));
+        }
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        for _ in 0..overcap {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok((failed, elapsed)) => {
+                    assert!(
+                        failed,
+                        "over-cap A must fail closed during registry contention"
+                    );
+                    assert!(
+                        elapsed < Duration::from_secs(1),
+                        "over-cap A must fail fast, not park on the registry"
+                    );
+                }
+                Err(_) => {
+                    drop(hold);
+                    panic!("over-cap A contenders parked on the registry instead of fail-fast");
+                }
+            }
+        }
+        assert_eq!(
+            capacity.global_available(),
+            global_before,
+            "over-cap A must never reduce global availability"
+        );
+        let held_b = try_acquire_keyed_pre_attempt_from(&capacity, community_b)
+            .expect("eligible B must acquire while over-cap A registry is contended");
+        assert_eq!(capacity.global_available(), global_before - 1);
+        assert_eq!(capacity.community_count(community_b), Some(1));
+        drop(held_b);
+        assert_eq!(capacity.global_available(), global_before);
+        drop(hold);
+        for worker in workers {
+            worker.join().expect("over-cap A worker");
+        }
+        assert_eq!(capacity.global_available(), global_before);
+        assert_eq!(
+            capacity.community_count(community_a),
+            Some(KEYED_PRE_ATTEMPT_COMMUNITY_MAX)
+        );
+        assert_eq!(
+            capacity.community_live_handles(community_a),
+            Some(KEYED_PRE_ATTEMPT_COMMUNITY_MAX)
+        );
+        assert_eq!(capacity.community_count(community_b), None);
+        drop(held_a);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        assert_pre_attempt_fully_idle(&capacity);
+    }
+
+    #[test]
+    fn keyed_pre_attempt_global_failure_rolls_back_community_reservation() {
+        let capacity = KeyedPreAttemptCapacity::new();
+        let community_a = Uuid::from_u128(0xA11);
+        let community_b = Uuid::from_u128(0xB22);
+        let community_c = Uuid::from_u128(0xC33);
+        let mut held = Vec::with_capacity(KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        for _ in 0..KEYED_PRE_ATTEMPT_COMMUNITY_MAX {
+            held.push(try_acquire_keyed_pre_attempt_from(&capacity, community_a).expect("A"));
+        }
+        for _ in 0..KEYED_PRE_ATTEMPT_COMMUNITY_MAX {
+            held.push(try_acquire_keyed_pre_attempt_from(&capacity, community_b).expect("B"));
+        }
+        assert_eq!(capacity.global_available(), 0);
+        match try_acquire_keyed_pre_attempt_from(&capacity, community_c) {
+            Err(()) => assert_pre_attempt_busy_is_opaque_503(),
+            Ok(_) => panic!("global exhaustion must fail closed"),
+        }
+        assert_eq!(capacity.global_available(), 0);
+        assert_eq!(capacity.community_count(community_c), None);
+        assert_eq!(capacity.community_live_handles(community_c), None);
+        assert!(!capacity.registry_contains(community_c));
+        drop(held.pop());
+        assert_eq!(capacity.global_available(), 1);
+        let held_c = try_acquire_keyed_pre_attempt_from(&capacity, community_c)
+            .expect("C after exact community rollback");
+        assert_eq!(capacity.community_count(community_c), Some(1));
+        assert_eq!(capacity.community_live_handles(community_c), Some(1));
+        assert_eq!(capacity.global_available(), 0);
+        drop(held_c);
+        drop(held);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        assert_pre_attempt_fully_idle(&capacity);
+    }
+
+    #[test]
+    fn keyed_pre_attempt_error_return_and_cancellation_reclaim() {
+        let capacity = KeyedPreAttemptCapacity::new();
+        let community = Uuid::from_u128(0xE77);
+        let result: Result<(), ()> = (|| {
+            let _guard = try_acquire_keyed_pre_attempt_from(&capacity, community)?;
+            Err(())
+        })();
+        assert!(result.is_err());
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        assert_eq!(capacity.community_count(community), None);
+        assert_eq!(capacity.community_live_handles(community), None);
+        assert_pre_attempt_fully_idle(&capacity);
+        assert!(!capacity.registry_contains(community));
+
+        let first = try_acquire_keyed_pre_attempt_from(&capacity, community).expect("first");
+        drop(first);
+        assert_pre_attempt_fully_idle(&capacity);
+        assert!(!capacity.registry_contains(community));
+        let second =
+            try_acquire_keyed_pre_attempt_from(&capacity, community).expect("next generation");
+        assert_eq!(capacity.community_count(community), Some(1));
+        assert_eq!(capacity.community_live_handles(community), Some(1));
+        drop(second);
+        assert_pre_attempt_fully_idle(&capacity);
+
+        let capacity = Arc::new(KeyedPreAttemptCapacity::new());
+        let community = Uuid::from_u128(0xCA11);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let cap = Arc::clone(&capacity);
+            let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = tokio::spawn(async move {
+                let _guard = try_acquire_keyed_pre_attempt_from(&cap, community).expect("permit");
+                let _ = acquired_tx.send(());
+                std::future::pending::<()>().await;
+            });
+            acquired_rx.await.expect("acquired");
+            assert_eq!(
+                capacity.global_available(),
+                KEYED_PRE_ATTEMPT_GLOBAL_MAX - 1
+            );
+            assert_eq!(capacity.community_count(community), Some(1));
+            handle.abort();
+            let _ = handle.await;
+            assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+            assert_eq!(capacity.community_count(community), None);
+            assert_eq!(capacity.community_live_handles(community), None);
+            assert_pre_attempt_fully_idle(&capacity);
+            assert!(!capacity.registry_contains(community));
+        });
+    }
+
+    #[test]
+    fn keyed_pre_attempt_last_drop_while_shard_held_returns_and_reaper_removes_key() {
+        let capacity = KeyedPreAttemptCapacity::new();
+        let community = Uuid::from_u128(0x51AD);
+        let guard = try_acquire_keyed_pre_attempt_from(&capacity, community).expect("live permit");
+        assert_eq!(
+            capacity.global_available(),
+            KEYED_PRE_ATTEMPT_GLOBAL_MAX - 1
+        );
+        assert_eq!(capacity.community_count(community), Some(1));
+        assert_eq!(capacity.registry_bound(), 1);
+        let hold = capacity
+            .try_hold_registry(community)
+            .expect("hold the live community's registry shard");
+        let started = Instant::now();
+        drop(guard);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "last Drop must return promptly while the registry shard is held"
+        );
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        drop(hold);
+        assert!(
+            capacity.registry_contains(community),
+            "stale key must remain until reaper runs; no checkout in between"
+        );
+        assert_eq!(capacity.community_count(community), None);
+        assert_eq!(capacity.community_live_handles(community), None);
+        assert_eq!(capacity.registry_bound(), 1);
+        reap_dead_keyed_pre_attempt_entries(&capacity);
+        assert!(
+            !capacity.registry_contains(community),
+            "shared reaper must remove the stale key without a new checkout"
+        );
+        assert_eq!(capacity.registry_bound(), 0);
+        assert_eq!(capacity.registry_len(), 0);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+    }
+
+    #[test]
+    fn keyed_pre_attempt_reaper_thread_removes_stale_key_without_checkout() {
+        let capacity = try_init_keyed_pre_attempt_capacity().expect("cleanup thread");
+        let community = Uuid::from_u128(0x5EED);
+        let guard = try_acquire_keyed_pre_attempt_from(&capacity, community).expect("live permit");
+        let hold = capacity
+            .try_hold_registry(community)
+            .expect("hold occupied shard so Drop cannot reap");
+        drop(guard);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        drop(hold);
+        wait_pre_attempt_key_absent(&capacity, community, Duration::from_secs(2));
+        assert_eq!(capacity.community_count(community), None);
+        assert_eq!(capacity.registry_bound(), 0);
+        assert_eq!(capacity.registry_len(), 0);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+    }
+
+    #[test]
+    fn keyed_pre_attempt_registry_bound_fails_closed_until_reap() {
+        let capacity = KeyedPreAttemptCapacity::new();
+        assert_eq!(KEYED_PRE_ATTEMPT_REGISTRY_MAX, 64);
+        let mut communities = Vec::with_capacity(KEYED_PRE_ATTEMPT_REGISTRY_MAX);
+        for i in 0..KEYED_PRE_ATTEMPT_REGISTRY_MAX {
+            let community = Uuid::from_u128(0xB000 + i as u128);
+            let guard = try_acquire_keyed_pre_attempt_from(&capacity, community)
+                .expect("fill bounded registry");
+            communities.push(community);
+            drop(guard);
+        }
+        assert_eq!(capacity.registry_len(), KEYED_PRE_ATTEMPT_REGISTRY_MAX);
+        assert_eq!(capacity.registry_bound(), KEYED_PRE_ATTEMPT_REGISTRY_MAX);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+        let extra = Uuid::from_u128(0xB0FF);
+        match try_acquire_keyed_pre_attempt_from(&capacity, extra) {
+            Err(()) => assert_pre_attempt_busy_is_opaque_503(),
+            Ok(_) => panic!("new UUID must fail closed while the registry bound is full"),
+        }
+        assert!(!capacity.registry_contains(extra));
+        assert_eq!(capacity.registry_bound(), KEYED_PRE_ATTEMPT_REGISTRY_MAX);
+        assert_eq!(capacity.registry_len(), KEYED_PRE_ATTEMPT_REGISTRY_MAX);
+        reap_dead_keyed_pre_attempt_entries(&capacity);
+        assert_eq!(capacity.registry_bound(), 0);
+        assert_eq!(capacity.registry_len(), 0);
+        let restored = try_acquire_keyed_pre_attempt_from(&capacity, extra)
+            .expect("acquire after reaper restored the bound");
+        assert_eq!(capacity.registry_bound(), 1);
+        assert_eq!(capacity.community_count(extra), Some(1));
+        drop(restored);
+        assert_pre_attempt_fully_idle(&capacity);
+        let _ = communities;
+    }
+
+    #[test]
+    fn keyed_pre_attempt_same_shard_communities_do_not_corrupt_each_other() {
+        let capacity = KeyedPreAttemptCapacity::new();
+        let (community_a, community_b) = same_shard_pre_attempt_communities(&capacity);
+        assert_ne!(community_a, community_b);
+        let hold_a = capacity.try_hold_registry(community_a).expect("hold A");
+        assert!(
+            capacity.try_hold_registry(community_b).is_none(),
+            "A and B must share a registry shard"
+        );
+        drop(hold_a);
+
+        let guard_a = try_acquire_keyed_pre_attempt_from(&capacity, community_a).expect("A");
+        let guard_b = try_acquire_keyed_pre_attempt_from(&capacity, community_b).expect("B");
+        let gen_a = capacity
+            .community_live_generation(community_a)
+            .expect("live A");
+        let gen_b = capacity
+            .community_live_generation(community_b)
+            .expect("live B");
+        assert_eq!(capacity.community_count(community_a), Some(1));
+        assert_eq!(capacity.community_count(community_b), Some(1));
+        assert_eq!(capacity.registry_bound(), 2);
+
+        drop(guard_a);
+        reclaim_dead_keyed_pre_attempt_generation(&capacity, community_a, gen_a);
+        assert!(!capacity.registry_contains(community_a));
+        assert_eq!(capacity.community_count(community_b), Some(1));
+        assert_eq!(capacity.community_live_generation(community_b), Some(gen_b));
+        reclaim_dead_keyed_pre_attempt_generation(&capacity, community_b, gen_a);
+        assert_eq!(capacity.community_count(community_b), Some(1));
+        assert_eq!(capacity.community_live_generation(community_b), Some(gen_b));
+        assert_eq!(
+            capacity.global_available(),
+            KEYED_PRE_ATTEMPT_GLOBAL_MAX - 1
+        );
+        drop(guard_b);
+        assert_pre_attempt_fully_idle(&capacity);
+    }
+
+    #[test]
+    fn keyed_pre_attempt_stale_generation_cleanup_does_not_remove_replacement() {
+        let capacity = KeyedPreAttemptCapacity::new();
+        let community = Uuid::from_u128(0xABA1);
+        let first = try_acquire_keyed_pre_attempt_from(&capacity, community).expect("generation 1");
+        let gen1 = capacity
+            .community_generation(community)
+            .expect("generation 1 id");
+        assert_eq!(capacity.community_live_generation(community), Some(gen1));
+        drop(first);
+        assert!(capacity.registry_contains(community));
+        assert_eq!(capacity.community_live_generation(community), None);
+        assert_eq!(capacity.community_generation(community), Some(gen1));
+        assert_eq!(capacity.registry_bound(), 1);
+
+        let second =
+            try_acquire_keyed_pre_attempt_from(&capacity, community).expect("generation 2");
+        let gen2 = capacity
+            .community_live_generation(community)
+            .expect("generation 2 id");
+        assert_ne!(gen1, gen2);
+        assert_eq!(capacity.community_count(community), Some(1));
+        assert_eq!(capacity.registry_bound(), 1);
+
+        reclaim_dead_keyed_pre_attempt_generation(&capacity, community, gen1);
+        assert!(capacity.registry_contains(community));
+        assert_eq!(capacity.community_live_generation(community), Some(gen2));
+        assert_eq!(capacity.community_count(community), Some(1));
+        assert_eq!(capacity.registry_bound(), 1);
+        assert_eq!(
+            capacity.global_available(),
+            KEYED_PRE_ATTEMPT_GLOBAL_MAX - 1
+        );
+
+        drop(second);
+        reap_dead_keyed_pre_attempt_entries(&capacity);
+        assert!(!capacity.registry_contains(community));
+        assert_eq!(capacity.registry_bound(), 0);
+        assert_eq!(capacity.global_available(), KEYED_PRE_ATTEMPT_GLOBAL_MAX);
+    }
+
+    #[test]
+    fn local_capacity_denial_is_after_attempt_and_before_replay() {
+        let _ingress_lock = lock_keyed_ingress_tests();
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(admit_keyed_http_attempt(
+            &limiter,
+            &tenant,
+            &keys.public_key(),
+        ))
+        .expect("attempt allowed");
+        assert_attempt_charged_once(&limiter, &keys.public_key());
+        let community = *tenant.community().as_uuid();
+        let mut held = Vec::new();
+        for _ in 0..KEYED_INGRESS_COMMUNITY_MAX {
+            held.push(try_acquire_keyed_ingress(community).expect("fill community"));
+        }
+        match try_acquire_keyed_ingress(community) {
+            Err(KeyedHttpError::Busy { .. }) => {}
+            other => panic!("ingress saturation must fail fast after attempt, got {other:?}"),
+        }
+        drop(held);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_fresh_untouched(&limiter);
+    }
+
+    #[test]
+    fn keyed_attempt_quota_denial_maps_to_opaque_busy_without_limiter_details() {
+        let outcome = keyed_pre_ingest_outcome(KeyedPreIngestError::Attempt(
+            crate::admission::AdmissionError::Exceeded { reset_in_secs: 17 },
+        ));
+        match outcome {
+            SubmitOutcome::Busy { status, response } => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("17")
+                );
+            }
+            other => panic!("attempt Exceeded must be opaque Busy, got {other:?}"),
+        }
+        let unavailable = keyed_pre_ingest_outcome(KeyedPreIngestError::Attempt(
+            crate::admission::AdmissionError::Unavailable,
+        ));
+        match unavailable {
+            SubmitOutcome::Busy { status, response } => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("5")
+                );
+            }
+            other => panic!("attempt Unavailable must be opaque Busy, got {other:?}"),
+        }
+        let (status, _retry, Json(body)) = keyed_busy_http_parts(17);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let dumped = body.to_string();
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "idempotency unavailable"})
+        );
+        assert!(!dumped.contains("redis"));
+        assert!(!dumped.contains("quota"));
+        assert!(!dumped.contains("katt"));
+        assert!(!dumped.contains("kfsh"));
+    }
+
+    #[test]
+    fn keyed_attempt_identity_is_the_authenticated_signer_not_the_owner() {
+        let agent = Keys::generate().public_key();
+        let owner = Keys::generate().public_key();
+        assert_ne!(agent, owner);
+        assert_eq!(keyed_http_verified_owner(None, Some(owner)), Some(owner));
+    }
+
+    #[test]
+    fn keyed_verified_owner_ignores_absent_extraction_and_prefers_membership() {
+        let member_owner = Keys::generate().public_key();
+        let extracted = Keys::generate().public_key();
+        assert_eq!(keyed_http_verified_owner(None, None), None);
+        assert_eq!(
+            keyed_http_verified_owner(None, Some(extracted)),
+            Some(extracted)
+        );
+        assert_eq!(
+            keyed_http_verified_owner(Some(member_owner), Some(extracted)),
+            Some(member_owner)
+        );
+        assert_eq!(
+            keyed_http_verified_owner(Some(member_owner), None),
+            Some(member_owner)
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_attempt_allow_then_malformed_body_charges_attempt_not_fresh() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        match attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: b"{",
+            },
+            unreachable_membership(),
+            unreachable_owner(),
+        )
+        .await
+        {
+            Err(KeyedHttpAdmitError::Parse(error)) => {
+                assert_eq!(error.classify(), serde_json::error::Category::Eof);
+            }
+            other => panic!("malformed body must fail at parse, got {other:?}"),
+        }
+        assert_eq!(
+            *limiter.steps.lock().unwrap(),
+            vec!["attempt_hierarchical", "replay"]
+        );
+        assert_attempt_charged_once(&limiter, &keys.public_key());
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_fresh_untouched(&limiter);
+        assert_eq!(limiter.principal_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn keyed_attempt_identity_denial_skips_replay_and_writes_nothing() {
+        let limiter = LaneRecordingLimiter::lanes(
+            FleetLimiterOutcome::Deny,
+            FleetLimiterOutcome::Allow,
+            FleetLimiterOutcome::Allow,
+        );
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        let err = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: b"{\"id\":\"00\"}",
+            },
+            unreachable_membership(),
+            unreachable_owner(),
+        )
+        .await
+        .expect_err("denied attempt");
+        assert!(matches!(
+            err,
+            KeyedHttpAdmitError::PreIngest(KeyedPreIngestError::Attempt(
+                crate::admission::AdmissionError::Exceeded { reset_in_secs: 13 }
+            ))
+        ));
+        assert_eq!(*limiter.steps.lock().unwrap(), vec!["attempt_hierarchical"]);
+        assert_attempt_invoked_without_charge(&limiter);
+        assert_fresh_untouched(&limiter);
+        assert_eq!(limiter.principal_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_after_attempt_does_not_charge_fresh() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        let (validated, owner) = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: &signed_kind9_body(&keys),
+            },
+            recording_membership(&limiter.steps, Ok(None)),
+            recording_owner(&limiter.steps, None),
+        )
+        .await
+        .expect("validated after attempt");
+        assert_eq!(validated.event().pubkey, keys.public_key());
+        assert_eq!(owner, None);
+        assert_eq!(
+            *limiter.steps.lock().unwrap(),
+            vec![
+                "attempt_hierarchical",
+                "replay",
+                "membership",
+                "owner_select"
+            ]
+        );
+        assert_attempt_charged_once(&limiter, &keys.public_key());
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+        assert_fresh_untouched(&limiter);
+        assert_eq!(
+            *limiter.increment_pubkeys.lock().unwrap().last().unwrap(),
+            keys.public_key().to_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_does_not_start_detached_verification() {
+        let _ingress_lock = lock_keyed_ingress_tests_async().await;
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "fresh")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let body = serde_json::to_vec(&event).expect("serialize");
+        let guard = install_keyed_verify_watch(event.id);
+        let community = *tenant.community().as_uuid();
+        let ingress = try_acquire_keyed_ingress(community).expect("permit");
+        let early = KeyedHttpEarlyContext {
+            ingress: Some(ingress),
+            deadline: KeyedEarlyDeadline::already_expired(),
+            verified_owner: None,
+        };
+        let err = admit_keyed_http_after_attempt(
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: &body,
+            },
+            unreachable_membership(),
+            unreachable_owner(),
+            early,
+        )
+        .await
+        .err()
+        .expect("expired verification guard");
+        assert!(matches!(
+            err,
+            KeyedHttpAdmitError::PreIngest(KeyedPreIngestError::Attempt(
+                crate::admission::AdmissionError::Unavailable
+            ))
+        ));
+        assert_eq!(guard.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_rotating_signers_replay_parse_and_membership_cannot_charge_fresh() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let parse_keys = Keys::generate();
+        let replay_keys = Keys::generate();
+        let member_keys = Keys::generate();
+        let error_keys = Keys::generate();
+        assert_ne!(parse_keys.public_key(), replay_keys.public_key());
+        assert_ne!(replay_keys.public_key(), member_keys.public_key());
+        assert_ne!(member_keys.public_key(), error_keys.public_key());
+
+        let replay_ok = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        match attempt_then_after(
+            &limiter,
+            &replay_ok,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: parse_keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: b"{",
+            },
+            unreachable_membership(),
+            unreachable_owner(),
+        )
+        .await
+        {
+            Err(KeyedHttpAdmitError::Parse(error)) => {
+                assert_eq!(error.classify(), serde_json::error::Category::Eof);
+            }
+            other => panic!("malformed must fail at parse, got {other:?}"),
+        }
+
+        let replay_hit = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: false,
+        };
+        match attempt_then_after(
+            &limiter,
+            &replay_hit,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: replay_keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: &signed_kind9_body(&replay_keys),
+            },
+            unreachable_membership(),
+            unreachable_owner(),
+        )
+        .await
+        {
+            Err(KeyedHttpAdmitError::PreIngest(KeyedPreIngestError::Replay(response))) => {
+                assert_eq!(response.0, StatusCode::UNAUTHORIZED);
+            }
+            other => panic!("exact NIP-98 replay must keep replay HTTP mapping, got {other:?}"),
+        }
+
+        let replay_member = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        match attempt_then_after(
+            &limiter,
+            &replay_member,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: member_keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: &signed_kind9_body(&member_keys),
+            },
+            recording_membership(
+                &limiter.steps,
+                Err(api_error(
+                    StatusCode::FORBIDDEN,
+                    "restricted: not a relay member",
+                )),
+            ),
+            unreachable_owner(),
+        )
+        .await
+        {
+            Err(KeyedHttpAdmitError::Membership(response)) => {
+                assert_eq!(response.0, StatusCode::FORBIDDEN);
+            }
+            other => panic!("non-member must keep membership HTTP mapping, got {other:?}"),
+        }
+
+        match attempt_then_after(
+            &limiter,
+            &replay_member,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: error_keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: &signed_kind9_body(&error_keys),
+            },
+            recording_membership(
+                &limiter.steps,
+                Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "relay membership unavailable",
+                )),
+            ),
+            unreachable_owner(),
+        )
+        .await
+        {
+            Err(KeyedHttpAdmitError::Membership(response)) => {
+                assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+            }
+            other => panic!("membership error must fail before fresh, got {other:?}"),
+        }
+
+        assert!(limiter
+            .paired_types
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|limit_type| *limit_type != LimitType::ApiCalls
+                && *limit_type != LimitType::IpConnections
+                && *limit_type != LimitType::Messages));
+        assert_fresh_untouched(&limiter);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 4);
+        assert_eq!(limiter.attempt_identity_charged.load(Ordering::Relaxed), 4);
+        assert_eq!(limiter.attempt_tenant_charged.load(Ordering::Relaxed), 4);
+        assert_eq!(limiter.attempt_fleet_charged.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            limiter.identity_pubkeys.lock().unwrap().clone(),
+            vec![
+                parse_keys.public_key().to_bytes(),
+                replay_keys.public_key().to_bytes(),
+                member_keys.public_key().to_bytes(),
+                error_keys.public_key().to_bytes(),
+            ]
+        );
+        assert_eq!(
+            *limiter.steps.lock().unwrap(),
+            vec![
+                "attempt_hierarchical",
+                "replay",
+                "attempt_hierarchical",
+                "replay",
+                "attempt_hierarchical",
+                "replay",
+                "membership",
+                "attempt_hierarchical",
+                "replay",
+                "membership",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_invalid_id_signature_and_author_mismatch_do_not_reach_membership() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        let caller = Keys::generate();
+
+        let cases: [KeyedBodyValidationCase; 3] = [
+            (
+                "invalid id/signature",
+                forged_kind9_body(&keys),
+                keys.public_key(),
+                |error| matches!(error, IngestError::Rejected(msg) if msg.starts_with("invalid:")),
+            ),
+            (
+                "oversized content",
+                oversized_kind9_body(&keys),
+                keys.public_key(),
+                |error| {
+                    matches!(
+                        error,
+                        IngestError::Rejected(msg)
+                            if msg.starts_with("invalid: content exceeds maximum size of")
+                    )
+                },
+            ),
+            (
+                "authenticated-pubkey mismatch",
+                signed_kind9_body(&keys),
+                caller.public_key(),
+                |error| {
+                    matches!(
+                        error,
+                        IngestError::AuthFailed(msg)
+                            if msg == "invalid: event pubkey does not match authenticated identity"
+                    )
+                },
+            ),
+        ];
+
+        for (name, body, pubkey, check) in cases {
+            match attempt_then_after(
+                &limiter,
+                &replay,
+                KeyedHttpAdmitRequest {
+                    tenant: &tenant,
+                    pubkey,
+                    event_id_bytes: fresh_nip98_event_id_bytes(),
+                    signed_created_at: None,
+                    body: &body,
+                },
+                unreachable_membership(),
+                unreachable_owner(),
+            )
+            .await
+            {
+                Err(KeyedHttpAdmitError::Body { error, .. }) => {
+                    assert!(check(&error), "{name} mapped to {error:?}");
+                }
+                other => panic!("{name} must fail before membership, got {other:?}"),
+            }
+        }
+
+        assert_fresh_untouched(&limiter);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert!(!limiter.steps.lock().unwrap().contains(&"membership"));
+        assert!(!limiter.steps.lock().unwrap().contains(&"owner_select"));
+        assert!(!limiter
+            .steps
+            .lock()
+            .unwrap()
+            .contains(&"fresh_hierarchical"));
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(limiter.attempt_identity_charged.load(Ordering::Relaxed), 3);
+        assert_eq!(limiter.fresh_identity_charged.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_body_validation_failures_do_not_charge_fresh() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+
+        let cases: [KeyedBodyValidationCase; 3] = [
+            (
+                "unsupported kind 1",
+                signed_text_note_body(&keys),
+                keys.public_key(),
+                |error| {
+                    matches!(
+                        error,
+                        IngestError::Rejected(msg)
+                            if msg == "invalid: Idempotency-Key is not supported for this event kind"
+                    )
+                },
+            ),
+            (
+                "stale timestamp",
+                stale_kind9_body(&keys),
+                keys.public_key(),
+                |error| {
+                    matches!(
+                        error,
+                        IngestError::Rejected(msg)
+                            if msg == "invalid: event timestamp too far from server time"
+                    )
+                },
+            ),
+            (
+                "excessive p-tags",
+                excessive_p_tag_kind9_body(&keys),
+                keys.public_key(),
+                |error| {
+                    matches!(
+                        error,
+                        IngestError::Rejected(msg) if msg == "invalid: too many p tags for keyed ingest"
+                    )
+                },
+            ),
+        ];
+
+        for (name, body, pubkey, check) in cases {
+            match attempt_then_after(
+                &limiter,
+                &replay,
+                KeyedHttpAdmitRequest {
+                    tenant: &tenant,
+                    pubkey,
+                    event_id_bytes: fresh_nip98_event_id_bytes(),
+                    signed_created_at: None,
+                    body: &body,
+                },
+                recording_membership(&limiter.steps, Ok(None)),
+                recording_owner(&limiter.steps, Some("not-a-nip-oa-tag")),
+            )
+            .await
+            {
+                Err(KeyedHttpAdmitError::Body { error, .. }) => {
+                    assert!(check(&error), "{name} mapped to {error:?}");
+                }
+                other => panic!("{name} must fail at body validation, got {other:?}"),
+            }
+        }
+
+        assert_fresh_untouched(&limiter);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert!(!limiter
+            .steps
+            .lock()
+            .unwrap()
+            .contains(&"fresh_hierarchical"));
+        assert!(limiter
+            .steps
+            .lock()
+            .unwrap()
+            .contains(&"attempt_hierarchical"));
+        assert!(limiter.steps.lock().unwrap().contains(&"membership"));
+        assert!(limiter.steps.lock().unwrap().contains(&"owner_select"));
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(limiter.attempt_identity_charged.load(Ordering::Relaxed), 3);
+        assert_eq!(limiter.fresh_identity_charged.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_extreme_signed_timestamp_rejects_body_without_fresh_charge() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        match attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: &extreme_signed_kind9_body(&keys),
+            },
+            recording_membership(&limiter.steps, Ok(None)),
+            recording_owner(&limiter.steps, None),
+        )
+        .await
+        {
+            Err(KeyedHttpAdmitError::Body { error, .. }) => {
+                assert!(
+                    matches!(
+                        error,
+                        IngestError::Rejected(ref msg)
+                            if msg == "invalid: event timestamp too far from server time"
+                    ),
+                    "extreme timestamp mapped to {error:?}"
+                );
+            }
+            other => panic!("extreme signed timestamp must fail at body validation, got {other:?}"),
+        }
+        assert_fresh_untouched(&limiter);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert!(!limiter
+            .steps
+            .lock()
+            .unwrap()
+            .contains(&"fresh_hierarchical"));
+        assert_eq!(limiter.fresh_identity_charged.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.fresh_tenant_charged.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.fresh_fleet_charged.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+        assert_attempt_charged_once(&limiter, &keys.public_key());
+    }
+
+    #[tokio::test]
+    async fn keyed_denied_paired_fresh_admission_is_not_in_the_after_attempt_helper() {
+        let limiter = LaneRecordingLimiter::lanes(
+            FleetLimiterOutcome::Allow,
+            FleetLimiterOutcome::Allow,
+            FleetLimiterOutcome::Deny,
+        );
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        let (validated, owner) = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: &signed_kind9_body(&keys),
+            },
+            recording_membership(&limiter.steps, Ok(None)),
+            recording_owner(&limiter.steps, None),
+        )
+        .await
+        .expect("fresh denial is not part of after-attempt");
+        assert_eq!(validated.event().pubkey, keys.public_key());
+        assert_eq!(owner, None);
+        assert_eq!(
+            *limiter.steps.lock().unwrap(),
+            vec![
+                "attempt_hierarchical",
+                "replay",
+                "membership",
+                "owner_select"
+            ]
+        );
+        assert_attempt_charged_once(&limiter, &keys.public_key());
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+        assert_fresh_untouched(&limiter);
+        let outcome = keyed_pre_ingest_outcome(KeyedPreIngestError::Attempt(
+            crate::admission::AdmissionError::Exceeded { reset_in_secs: 17 },
+        ));
+        match outcome {
+            SubmitOutcome::Busy { status, .. } => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            }
+            other => panic!("fresh capacity denial must stay opaque 503, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_attempt_backend_failure_fails_closed_without_replay_or_fresh() {
+        let limiter = LaneRecordingLimiter::lanes(
+            FleetLimiterOutcome::Fail,
+            FleetLimiterOutcome::Fail,
+            FleetLimiterOutcome::Allow,
+        );
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        let err = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: &signed_kind9_body(&keys),
+            },
+            unreachable_membership(),
+            unreachable_owner(),
+        )
+        .await
+        .expect_err("attempt backend failure");
+        assert!(matches!(
+            err,
+            KeyedHttpAdmitError::PreIngest(KeyedPreIngestError::Attempt(
+                crate::admission::AdmissionError::Unavailable
+            ))
+        ));
+        assert_eq!(*limiter.steps.lock().unwrap(), vec!["attempt_hierarchical"]);
+        assert_attempt_invoked_without_charge(&limiter);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_fresh_untouched(&limiter);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(limiter.principal_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_attempt_community_denial_skips_replay_and_charges_none() {
+        let limiter = LaneRecordingLimiter::lanes(
+            FleetLimiterOutcome::Allow,
+            FleetLimiterOutcome::Deny,
+            FleetLimiterOutcome::Allow,
+        );
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        let err = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: b"{",
+            },
+            unreachable_membership(),
+            unreachable_owner(),
+        )
+        .await
+        .expect_err("community denial at attempt");
+        assert!(matches!(
+            err,
+            KeyedHttpAdmitError::PreIngest(KeyedPreIngestError::Attempt(
+                crate::admission::AdmissionError::Exceeded { reset_in_secs: 17 }
+            ))
+        ));
+        assert_eq!(*limiter.steps.lock().unwrap(), vec!["attempt_hierarchical"]);
+        assert_attempt_invoked_without_charge(&limiter);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_fresh_untouched(&limiter);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn keyed_attempt_fleet_denial_skips_replay_and_charges_none() {
+        let limiter = LaneRecordingLimiter::attempt_fleet_denied();
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        let err = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: b"{",
+            },
+            unreachable_membership(),
+            unreachable_owner(),
+        )
+        .await
+        .expect_err("fleet denial at attempt");
+        assert!(matches!(
+            err,
+            KeyedHttpAdmitError::PreIngest(KeyedPreIngestError::Attempt(
+                crate::admission::AdmissionError::Exceeded { reset_in_secs: 23 }
+            ))
+        ));
+        assert_eq!(*limiter.steps.lock().unwrap(), vec!["attempt_hierarchical"]);
+        assert_attempt_invoked_without_charge(&limiter);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_fresh_untouched(&limiter);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn keyed_attempt_path_does_not_consult_identity_peek() {
+        for peek_outcome in [IdentityPeekOutcome::Denied, IdentityPeekOutcome::Fail] {
+            let limiter = LaneRecordingLimiter::with_peek(
+                FleetLimiterOutcome::Allow,
+                FleetLimiterOutcome::Allow,
+                FleetLimiterOutcome::Allow,
+                peek_outcome,
+            );
+            let replay = OrderedReplayGuard {
+                steps: Arc::clone(&limiter.steps),
+                admit: true,
+            };
+            let tenant = fresh_tenant("keyed-attempt.example");
+            let keys = Keys::generate();
+            attempt_then_after(
+                &limiter,
+                &replay,
+                KeyedHttpAdmitRequest {
+                    tenant: &tenant,
+                    pubkey: keys.public_key(),
+                    event_id_bytes: fresh_nip98_event_id_bytes(),
+                    signed_created_at: None,
+                    body: b"{",
+                },
+                unreachable_membership(),
+                unreachable_owner(),
+            )
+            .await
+            .expect_err("malformed body after attempt");
+            assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+            assert_attempt_charged_once(&limiter, &keys.public_key());
+            assert_fresh_untouched(&limiter);
+            assert!(limiter
+                .steps
+                .lock()
+                .unwrap()
+                .contains(&"attempt_hierarchical"));
+            assert!(limiter.steps.lock().unwrap().contains(&"replay"));
+            assert!(!limiter.steps.lock().unwrap().contains(&"attempt_peek"));
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_valid_member_reaches_validation_without_fresh_charge() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        let (validated, owner) = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: &signed_kind9_body(&keys),
+            },
+            recording_membership(&limiter.steps, Ok(None)),
+            recording_owner(&limiter.steps, None),
+        )
+        .await
+        .expect("validated member must reach keyed ingest without fresh");
+        assert_eq!(validated.event().pubkey, keys.public_key());
+        assert_eq!(owner, None);
+        assert_eq!(
+            *limiter.steps.lock().unwrap(),
+            vec![
+                "attempt_hierarchical",
+                "replay",
+                "membership",
+                "owner_select"
+            ]
+        );
+        assert_eq!(
+            limiter.community_pubkeys.lock().unwrap()[0],
+            keyed_http_attempt_admission_principal().to_bytes()
+        );
+        assert_eq!(
+            limiter.paired_fleet_ips.lock().unwrap()[0],
+            KEYED_HTTP_ATTEMPT_FLEET_SENTINEL
+        );
+        assert_attempt_charged_once(&limiter, &keys.public_key());
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+        assert_fresh_untouched(&limiter);
+        assert_ne!(
+            KEYED_HTTP_ATTEMPT_FLEET_SENTINEL, KEYED_HTTP_FRESH_FLEET_SENTINEL,
+            "historical attempt and legitimate fleet keys must not alias"
+        );
+        assert_eq!(KEYED_HTTP_PREAUTH_IDENTITY_CARDINALITY_BOUND, 1_200);
+    }
+
+    #[tokio::test]
+    async fn keyed_two_agents_with_the_same_verified_owner_charge_distinct_attempt_identities() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let owner = Keys::generate().public_key();
+        let agent_a = Keys::generate();
+        let agent_b = Keys::generate();
+        assert_ne!(agent_a.public_key(), agent_b.public_key());
+        assert_ne!(agent_a.public_key(), owner);
+
+        let (_, owner_a) = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: agent_a.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: &signed_kind9_body(&agent_a),
+            },
+            recording_membership(&limiter.steps, Ok(Some(owner))),
+            recording_owner(&limiter.steps, None),
+        )
+        .await
+        .expect("agent a");
+        let (_, owner_b) = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: agent_b.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: &signed_kind9_body(&agent_b),
+            },
+            recording_membership(&limiter.steps, Ok(Some(owner))),
+            recording_owner(&limiter.steps, None),
+        )
+        .await
+        .expect("agent b");
+
+        assert_eq!(owner_a, Some(owner));
+        assert_eq!(owner_b, Some(owner));
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(limiter.attempt_identity_charged.load(Ordering::Relaxed), 2);
+        assert_eq!(limiter.attempt_tenant_charged.load(Ordering::Relaxed), 2);
+        assert_eq!(limiter.attempt_fleet_charged.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            limiter.identity_pubkeys.lock().unwrap()[0],
+            agent_a.public_key().to_bytes()
+        );
+        assert_eq!(
+            limiter.identity_pubkeys.lock().unwrap()[1],
+            agent_b.public_key().to_bytes()
+        );
+        assert_ne!(
+            limiter.identity_pubkeys.lock().unwrap()[0],
+            owner.to_bytes()
+        );
+        assert_fresh_untouched(&limiter);
+    }
+
+    #[tokio::test]
+    async fn keyed_direct_membership_uses_the_authenticated_agent_as_attempt_identity() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        let (_, owner) = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: &signed_kind9_body(&keys),
+            },
+            recording_membership(&limiter.steps, Ok(None)),
+            recording_owner(&limiter.steps, None),
+        )
+        .await
+        .expect("direct member");
+        assert_eq!(owner, None);
+        assert_attempt_charged_once(&limiter, &keys.public_key());
+        assert_eq!(
+            limiter.identity_pubkeys.lock().unwrap()[0],
+            keys.public_key().to_bytes()
+        );
+        assert_eq!(limiter.identity_pubkeys.lock().unwrap().len(), 1);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+        assert_fresh_untouched(&limiter);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_router_open_relay_raw_tag_for_a_different_agent_cannot_select_owner() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let agent = Keys::generate();
+        let other_agent = Keys::generate();
+        let owner_keys = Keys::generate();
+        assert_ne!(agent.public_key(), other_agent.public_key());
+        assert_ne!(agent.public_key(), owner_keys.public_key());
+        let foreign_tag = compute_auth_tag(&owner_keys, &other_agent.public_key(), "")
+            .expect("compute_auth_tag must succeed");
+        let (validated, owner) = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: agent.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: Some(Timestamp::now().as_secs()),
+                body: &signed_kind9_body(&agent),
+            },
+            recording_membership(&limiter.steps, Ok(None)),
+            recording_owner(&limiter.steps, Some(foreign_tag.as_str())),
+        )
+        .await
+        .expect("foreign-agent tag must not admit an owner");
+        assert_eq!(validated.event().pubkey, agent.public_key());
+        assert_eq!(owner, None);
+        assert_ne!(owner, Some(owner_keys.public_key()));
+        assert_eq!(
+            *limiter.steps.lock().unwrap(),
+            vec![
+                "attempt_hierarchical",
+                "replay",
+                "membership",
+                "owner_select"
+            ]
+        );
+        assert_attempt_charged_once(&limiter, &agent.public_key());
+        assert_eq!(
+            limiter.identity_pubkeys.lock().unwrap()[0],
+            agent.public_key().to_bytes()
+        );
+        assert_eq!(limiter.identity_pubkeys.lock().unwrap().len(), 1);
+        assert_ne!(
+            limiter.identity_pubkeys.lock().unwrap()[0],
+            owner_keys.public_key().to_bytes()
+        );
+        assert_ne!(
+            limiter.identity_pubkeys.lock().unwrap()[0],
+            other_agent.public_key().to_bytes()
+        );
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+        assert_fresh_untouched(&limiter);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_router_open_relay_verified_raw_auth_tag_keeps_attempt_on_the_agent() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let agent = Keys::generate();
+        let owner_keys = Keys::generate();
+        assert_ne!(agent.public_key(), owner_keys.public_key());
+        let tag = compute_auth_tag(&owner_keys, &agent.public_key(), "")
+            .expect("compute_auth_tag must succeed");
+        let (validated, owner) = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: agent.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: Some(Timestamp::now().as_secs()),
+                body: &signed_kind9_body(&agent),
+            },
+            recording_membership(&limiter.steps, Ok(None)),
+            recording_owner(&limiter.steps, Some(tag.as_str())),
+        )
+        .await
+        .expect("verified open-relay tag must yield the owner");
+        assert_eq!(validated.event().pubkey, agent.public_key());
+        assert_eq!(owner, Some(owner_keys.public_key()));
+        assert_eq!(
+            *limiter.steps.lock().unwrap(),
+            vec![
+                "attempt_hierarchical",
+                "replay",
+                "membership",
+                "owner_select"
+            ]
+        );
+        assert_attempt_charged_once(&limiter, &agent.public_key());
+        assert_eq!(
+            limiter.identity_pubkeys.lock().unwrap()[0],
+            agent.public_key().to_bytes()
+        );
+        assert_ne!(
+            limiter.identity_pubkeys.lock().unwrap()[0],
+            owner_keys.public_key().to_bytes()
+        );
+        assert_eq!(limiter.identity_pubkeys.lock().unwrap().len(), 1);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+        assert_fresh_untouched(&limiter);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_router_membership_owner_wins_over_open_relay_extraction() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let agent = Keys::generate();
+        let member_owner = Keys::generate().public_key();
+        let extracted_owner_keys = Keys::generate();
+        assert_ne!(member_owner, extracted_owner_keys.public_key());
+        let extracted_tag = compute_auth_tag(&extracted_owner_keys, &agent.public_key(), "")
+            .expect("compute_auth_tag must succeed");
+        let (_, owner) = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: agent.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: Some(Timestamp::now().as_secs()),
+                body: &signed_kind9_body(&agent),
+            },
+            recording_membership(&limiter.steps, Ok(Some(member_owner))),
+            recording_owner(&limiter.steps, Some(extracted_tag.as_str())),
+        )
+        .await
+        .expect("membership owner wins");
+        assert_eq!(owner, Some(member_owner));
+        assert_ne!(owner, Some(extracted_owner_keys.public_key()));
+        assert_eq!(
+            *limiter.steps.lock().unwrap(),
+            vec![
+                "attempt_hierarchical",
+                "replay",
+                "membership",
+                "owner_select"
+            ]
+        );
+        assert_attempt_charged_once(&limiter, &agent.public_key());
+        assert_eq!(
+            limiter.identity_pubkeys.lock().unwrap()[0],
+            agent.public_key().to_bytes()
+        );
+        assert_ne!(
+            limiter.identity_pubkeys.lock().unwrap()[0],
+            member_owner.to_bytes()
+        );
+        assert_ne!(
+            limiter.identity_pubkeys.lock().unwrap()[0],
+            extracted_owner_keys.public_key().to_bytes()
+        );
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 1);
+        assert_fresh_untouched(&limiter);
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_refactor_preserves_unkeyed_path_without_attempt_or_fresh_admission() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Deny);
+        let tenant = fresh_tenant("keyed-attempt.example");
+        crate::admission::check_principal(
+            &limiter,
+            &tenant,
+            &Keys::generate().public_key(),
+            LimitType::ApiCalls,
+            60,
+            300,
+        )
+        .await
+        .expect("unkeyed principal admission is independent");
+        assert!(limiter.paired_types.lock().unwrap().is_empty());
+        assert_eq!(
+            limiter.principal_types.lock().unwrap().clone(),
+            vec![LimitType::ApiCalls]
+        );
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.hierarchical_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.attempt_tenant_charged.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.attempt_fleet_charged.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.fresh_tenant_charged.load(Ordering::Relaxed), 0);
+        assert_eq!(limiter.fresh_fleet_charged.load(Ordering::Relaxed), 0);
+        assert_eq!(*limiter.steps.lock().unwrap(), vec!["unkeyed_api"]);
+    }
+
+    #[tokio::test]
+    async fn keyed_membership_rejection_does_not_invoke_fresh_admission() {
+        let limiter = LaneRecordingLimiter::new(FleetLimiterOutcome::Allow);
+        let replay = OrderedReplayGuard {
+            steps: Arc::clone(&limiter.steps),
+            admit: true,
+        };
+        let tenant = fresh_tenant("keyed-attempt.example");
+        let keys = Keys::generate();
+        let rejected = attempt_then_after(
+            &limiter,
+            &replay,
+            KeyedHttpAdmitRequest {
+                tenant: &tenant,
+                pubkey: keys.public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_created_at: None,
+                body: &signed_kind9_body(&keys),
+            },
+            recording_membership(
+                &limiter.steps,
+                Err(api_error(
+                    StatusCode::FORBIDDEN,
+                    "restricted: not a relay member",
+                )),
+            ),
+            unreachable_owner(),
+        )
+        .await
+        .expect_err("membership denial");
+        assert!(matches!(
+            rejected,
+            KeyedHttpAdmitError::Membership((StatusCode::FORBIDDEN, _))
+        ));
+        assert_eq!(
+            *limiter.steps.lock().unwrap(),
+            vec!["attempt_hierarchical", "replay", "membership"]
+        );
+        assert_attempt_charged_once(&limiter, &keys.public_key());
+        assert_eq!(limiter.peek_calls.load(Ordering::Relaxed), 0);
+        assert_fresh_untouched(&limiter);
     }
 }

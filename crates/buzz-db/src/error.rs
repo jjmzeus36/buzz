@@ -78,3 +78,84 @@ pub enum DbError {
 
 /// Convenience alias for `Result<T, DbError>`.
 pub type Result<T> = std::result::Result<T, DbError>;
+
+pub(crate) const IDEMPOTENCY_AUTHOR_MISMATCH: &str =
+    "idempotency author does not match event pubkey";
+pub(crate) const IDEMPOTENCY_UNSUPPORTED_KIND: &str =
+    "idempotency is not supported for this event kind";
+pub(crate) const IDEMPOTENCY_THREAD_METADATA_MISMATCH: &str =
+    "idempotency thread metadata is not bound to the event";
+pub(crate) const IDEMPOTENCY_TOO_MANY_MENTIONS: &str = "idempotency event exceeds the p-tag cap";
+pub(crate) const IDEMPOTENCY_UNAVAILABLE: &str = "idempotency writer is busy";
+
+impl DbError {
+    pub(crate) fn idempotency_author_mismatch() -> Self {
+        Self::InvalidData(IDEMPOTENCY_AUTHOR_MISMATCH.into())
+    }
+
+    pub(crate) fn idempotency_unsupported_kind() -> Self {
+        Self::InvalidData(IDEMPOTENCY_UNSUPPORTED_KIND.into())
+    }
+
+    pub(crate) fn idempotency_thread_metadata_mismatch() -> Self {
+        Self::InvalidData(IDEMPOTENCY_THREAD_METADATA_MISMATCH.into())
+    }
+
+    pub(crate) fn idempotency_too_many_mentions() -> Self {
+        Self::InvalidData(IDEMPOTENCY_TOO_MANY_MENTIONS.into())
+    }
+
+    pub(crate) fn idempotency_unavailable() -> Self {
+        Self::InvalidData(IDEMPOTENCY_UNAVAILABLE.into())
+    }
+
+    pub(crate) fn idempotency_canonicalize(
+        error: buzz_core::idempotency::IdempotencyError,
+    ) -> Self {
+        Self::InvalidData(error.to_string())
+    }
+
+    /// True when a keyed writer timed out on a lock or statement slot.
+    pub fn is_idempotency_unavailable(&self) -> bool {
+        matches!(self, Self::InvalidData(message) if message == IDEMPOTENCY_UNAVAILABLE)
+    }
+
+    /// True when a keyed insert was attempted for an unsupported kind.
+    pub fn is_idempotency_unsupported_kind(&self) -> bool {
+        matches!(self, Self::InvalidData(message) if message == IDEMPOTENCY_UNSUPPORTED_KIND)
+    }
+
+    /// True when a keyed event exceeded the p-tag cap.
+    pub fn is_idempotency_too_many_mentions(&self) -> bool {
+        matches!(self, Self::InvalidData(message) if message == IDEMPOTENCY_TOO_MANY_MENTIONS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DbError;
+
+    #[test]
+    fn public_dberror_exhaustive_match_has_no_idempotency_variants() {
+        fn classify(error: DbError) -> &'static str {
+            match error {
+                DbError::Sqlx(_) => "sqlx",
+                DbError::Migrate(_) => "migrate",
+                DbError::AuthEventRejected => "auth",
+                DbError::EphemeralEventRejected(_) => "ephemeral",
+                DbError::ChannelNotFound(_) => "channel",
+                DbError::MemberNotFound(_) => "member",
+                DbError::NotFound(_) => "not_found",
+                DbError::AccessDenied(_) => "access",
+                DbError::Serde(_) => "serde",
+                DbError::InvalidData(_) => "invalid",
+                DbError::ServingWritesNotDrained { .. } => "serving",
+                DbError::DeletionSafety(_) => "deletion",
+                DbError::InvalidTimestamp(_) => "timestamp",
+                DbError::LastOperator => "last_operator",
+            }
+        }
+        assert_eq!(classify(DbError::idempotency_unavailable()), "invalid");
+        assert_eq!(classify(DbError::LastOperator), "last_operator");
+    }
+}

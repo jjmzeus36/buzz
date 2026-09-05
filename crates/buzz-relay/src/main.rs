@@ -104,6 +104,19 @@ impl EmissionScope {
 }
 
 const USAGE_METRICS_LOCK_KEY: i64 = 0x4255_5A5A_4D45_5452;
+const EVENT_IDEMPOTENCY_REAP_LOCK_KEY: i64 = 0x4255_5A5A_4944_4D50;
+const EVENT_IDEMPOTENCY_REAP_INTERVAL_SECS: u64 = 300;
+/// One transaction per batch, eight batches per 300s tick: at most eight
+/// cleanup transactions and 8,000 deleted rows, matching NIP-MI.
+const EVENT_IDEMPOTENCY_REAP_BATCHES: u32 = 8;
+const EVENT_IDEMPOTENCY_REAP_BATCH_LIMIT: i64 = 1000;
+const EVENT_IDEMPOTENCY_REAPER_FAILURES_TOTAL: &str =
+    "buzz_event_idempotency_reaper_tick_failures_total";
+const EVENT_IDEMPOTENCY_REAPER_OPERATION: &str = "event_idempotency_reaper";
+const EVENT_IDEMPOTENCY_REAPER_STAGE: &str = "tick";
+const EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_UNKNOWN: &str = "unknown";
+const EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_SQLX: &str = "sqlx";
+const EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_INVALID_DATA: &str = "invalid_data";
 
 fn main() -> anyhow::Result<()> {
     let (runtime, boot) = BootTracker::start_before_runtime(|| {
@@ -281,6 +294,10 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     } else {
         info!("Skipping database migrations because BUZZ_AUTO_MIGRATE is not enabled");
     }
+    db.require_event_idempotency_schema().await.map_err(|e| {
+        error!("Event idempotency schema is not available: {e}");
+        anyhow::anyhow!("event idempotency schema prerequisite failed: {e}")
+    })?;
 
     if let Err(e) = db.ensure_future_partitions(3).await {
         error!("Failed to ensure partitions: {e}");
@@ -1214,6 +1231,29 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
         });
     }
 
+    // NIP-MI expired-key reaper: a dedicated 300s leader-only sweep, fully
+    // decoupled from usage-metrics cadence and leadership.
+    {
+        let reaper_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            info!(
+                interval_secs = EVENT_IDEMPOTENCY_REAP_INTERVAL_SECS,
+                "Event idempotency reaper started"
+            );
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                EVENT_IDEMPOTENCY_REAP_INTERVAL_SECS,
+            ));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut leader = None;
+            loop {
+                interval.tick().await;
+                apply_event_idempotency_reaper_tick_result(
+                    run_event_idempotency_reaper_tick(&reaper_state, &mut leader).await,
+                );
+            }
+        });
+    }
+
     serve(router, health_router, Arc::clone(&state)).await?;
     state.community_revalidator_cancel.cancel();
 
@@ -1277,6 +1317,84 @@ mod env_filter_tests {
             otel_env_filter(Some("buzz_relay=debug")).to_string(),
             "buzz_relay=debug"
         );
+    }
+}
+
+#[cfg(test)]
+mod reap_tick_tests {
+    use super::{
+        event_idempotency_reap_tick_budget_spent, idempotency_reap_should_advance_cursor,
+        idempotency_reap_tick_complete, EVENT_IDEMPOTENCY_REAP_BATCHES,
+        EVENT_IDEMPOTENCY_REAP_BATCH_LIMIT, EVENT_IDEMPOTENCY_REAP_INTERVAL_SECS,
+    };
+
+    #[test]
+    fn tick_stops_on_exhaustion_or_eight_batches() {
+        assert!(idempotency_reap_tick_complete(true, 1));
+        assert!(idempotency_reap_tick_complete(
+            false,
+            EVENT_IDEMPOTENCY_REAP_BATCHES
+        ));
+        assert!(!idempotency_reap_tick_complete(
+            false,
+            EVENT_IDEMPOTENCY_REAP_BATCHES - 1
+        ));
+    }
+
+    #[test]
+    fn cursor_reuses_only_after_positive_expired_progress() {
+        assert!(
+            !idempotency_reap_should_advance_cursor(true, 1, false),
+            "positive delete with remaining expired work must reuse the exclusive cursor"
+        );
+        assert!(
+            idempotency_reap_should_advance_cursor(true, 0, false),
+            "zero-progress SKIP LOCKED must advance so other tenants are not starved"
+        );
+        assert!(
+            idempotency_reap_should_advance_cursor(true, 1, true),
+            "spent tick budget must persist the visited tenant"
+        );
+        assert!(
+            idempotency_reap_should_advance_cursor(false, 1, false),
+            "an exact-full delete that exhausted expired rows must advance"
+        );
+        assert!(
+            idempotency_reap_should_advance_cursor(false, 0, false),
+            "a tenant with no remaining expired work must advance"
+        );
+    }
+
+    #[test]
+    fn eighth_call_budget_semantics_are_exact() {
+        assert!(!event_idempotency_reap_tick_budget_spent(0));
+        for batch in 1..EVENT_IDEMPOTENCY_REAP_BATCHES {
+            assert!(
+                !event_idempotency_reap_tick_budget_spent(batch),
+                "calls 1..=7 must keep tick_budget_spent false"
+            );
+        }
+        assert!(event_idempotency_reap_tick_budget_spent(
+            EVENT_IDEMPOTENCY_REAP_BATCHES
+        ));
+        assert!(
+            !event_idempotency_reap_tick_budget_spent(EVENT_IDEMPOTENCY_REAP_BATCHES + 1),
+            "only the eighth allowed call spends the tick budget"
+        );
+    }
+
+    #[test]
+    fn eight_transactions_cannot_walk_a_thousand_cold_tenants() {
+        const COLD_TENANTS: u32 = 1000;
+        let ticks = COLD_TENANTS.div_ceil(EVENT_IDEMPOTENCY_REAP_BATCHES);
+        let minutes = u64::from(ticks) * EVENT_IDEMPOTENCY_REAP_INTERVAL_SECS / 60;
+        assert_eq!(
+            minutes, 625,
+            "walking one cold tenant per transaction delays a hot tenant by 625 minutes"
+        );
+        assert_eq!(EVENT_IDEMPOTENCY_REAP_BATCHES, 8);
+        assert_eq!(EVENT_IDEMPOTENCY_REAP_INTERVAL_SECS, 300);
+        assert_eq!(EVENT_IDEMPOTENCY_REAP_BATCH_LIMIT, 1000);
     }
 }
 
@@ -1553,9 +1671,15 @@ fn reminder_to_event(reminder: &buzz_db::event::DueReminder) -> nostr::Event {
 
 /// Return the usage poll interval, with a floor that prevents a busy loop.
 fn usage_metrics_interval_secs() -> u64 {
-    std::env::var("BUZZ_USAGE_METRICS_INTERVAL_SECS")
-        .ok()
-        .and_then(|value| value.parse().ok())
+    parse_usage_metrics_interval_secs(
+        std::env::var("BUZZ_USAGE_METRICS_INTERVAL_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_usage_metrics_interval_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.parse().ok())
         .unwrap_or(300)
         .max(5)
 }
@@ -1677,6 +1801,155 @@ fn dropped_in_memory_keys(
     previously_emitted.difference(current).cloned().collect()
 }
 
+async fn demote_advisory_leader_if_unlive(
+    leader: &mut Option<buzz_db::UsageMetricsLeader>,
+    lock_label: &'static str,
+) -> bool {
+    if let Some(leader_guard) = leader.as_mut() {
+        if !leader_guard.is_live().await {
+            warn!("{lock_label} lock connection failed liveness check; demoting");
+            *leader = None;
+            return true;
+        }
+    }
+    false
+}
+
+fn idempotency_reap_tick_complete(exhausted: bool, batches_done: u32) -> bool {
+    exhausted || batches_done >= EVENT_IDEMPOTENCY_REAP_BATCHES
+}
+
+fn event_idempotency_reap_tick_budget_spent(batch: u32) -> bool {
+    batch == EVENT_IDEMPOTENCY_REAP_BATCHES
+}
+
+/// Closed-set class for a failed NIP-MI reaper tick. Never formats, interpolates,
+/// or records the raw error, driver string, or database values.
+fn event_idempotency_reaper_error_class(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        if let Some(db_error) = cause.downcast_ref::<buzz_db::DbError>() {
+            return event_idempotency_reaper_db_error_class(db_error);
+        }
+    }
+    EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_UNKNOWN
+}
+
+fn event_idempotency_reaper_db_error_class(error: &buzz_db::DbError) -> &'static str {
+    match error {
+        buzz_db::DbError::Sqlx(_) => EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_SQLX,
+        buzz_db::DbError::Migrate(_) => "migrate",
+        buzz_db::DbError::AuthEventRejected => "auth",
+        buzz_db::DbError::EphemeralEventRejected(_) => "ephemeral",
+        buzz_db::DbError::ChannelNotFound(_) => "channel_not_found",
+        buzz_db::DbError::MemberNotFound(_) => "member_not_found",
+        buzz_db::DbError::NotFound(_) => "not_found",
+        buzz_db::DbError::AccessDenied(_) => "access_denied",
+        buzz_db::DbError::Serde(_) => "serde",
+        buzz_db::DbError::InvalidData(_) => EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_INVALID_DATA,
+        buzz_db::DbError::ServingWritesNotDrained { .. } => "serving_writes",
+        buzz_db::DbError::DeletionSafety(_) => "deletion_safety",
+        buzz_db::DbError::InvalidTimestamp(_) => "invalid_timestamp",
+        buzz_db::DbError::LastOperator => "last_operator",
+    }
+}
+
+/// One failed-tick signal: ERROR with closed-set fields, plus exactly one
+/// dedicated counter increment. The raw error is used only for type/variant
+/// classification.
+fn report_event_idempotency_reaper_tick_failure(error: &anyhow::Error) {
+    let class = event_idempotency_reaper_error_class(error);
+    metrics::counter!(
+        EVENT_IDEMPOTENCY_REAPER_FAILURES_TOTAL,
+        "class" => class
+    )
+    .increment(1);
+    error!(
+        class,
+        operation = EVENT_IDEMPOTENCY_REAPER_OPERATION,
+        stage = EVENT_IDEMPOTENCY_REAPER_STAGE,
+        "Event idempotency reaper tick failed"
+    );
+}
+
+fn apply_event_idempotency_reaper_tick_result(result: Result<(), anyhow::Error>) {
+    if let Err(error) = result {
+        report_event_idempotency_reaper_tick_failure(&error);
+    }
+}
+
+/// Keep the exclusive scan cursor on a tenant that still has expired work
+/// and made positive deletion progress, so the next transaction can drain it.
+/// Advance on zero progress (`SKIP LOCKED` contention) and as soon as the
+/// just-processed tenant has no remaining expired rows, even if a full
+/// 1,000-row delete left fresh keys in place. Always persist the visited
+/// tenant when the tick is complete so a >8,000-row backlog cannot starve
+/// the rest of the fleet on the following 300s tick.
+#[cfg(test)]
+fn idempotency_reap_should_advance_cursor(
+    more_expired: bool,
+    deleted: u64,
+    tick_complete: bool,
+) -> bool {
+    tick_complete || !(more_expired && deleted > 0)
+}
+
+/// Leader-owned cleanup: one committed-cursor read for `cycle_origin`, then at
+/// most eight one-transaction deletes. Each transaction skip-probes tenants
+/// that have no expired rows, so a thousand cold tenants cannot spend the
+/// eight-slot tick. `wrapped` is tick-local. `tick_budget_spent` is true only
+/// on the eighth allowed delete.
+async fn reap_expired_event_idempotency_key_batches(state: &AppState) -> anyhow::Result<()> {
+    let cycle_origin = state.db.event_idempotency_reaper_cursor().await?;
+    let mut wrapped = false;
+    for batch in 1..=EVENT_IDEMPOTENCY_REAP_BATCHES {
+        let tick_budget_spent = event_idempotency_reap_tick_budget_spent(batch);
+        let progress = state
+            .db
+            .reap_expired_event_idempotency_keys_progress(
+                EVENT_IDEMPOTENCY_REAP_BATCH_LIMIT,
+                wrapped,
+                cycle_origin,
+                tick_budget_spent,
+            )
+            .await?;
+        if progress.deleted > 0 {
+            info!(
+                deleted = progress.deleted,
+                "reaped expired event idempotency keys"
+            );
+        }
+        wrapped = progress.wrapped;
+        if idempotency_reap_tick_complete(progress.exhausted, batch) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// One NIP-MI reaper tick: liveness on the lock-owning connection, acquire
+/// only when no guard exists at tick start, and never sweep without a live
+/// guard. Failures return to the caller for a bounded ERROR + counter; the
+/// 300-second cadence retries. Cleanup errors do not demote leadership.
+async fn run_event_idempotency_reaper_tick(
+    state: &AppState,
+    leader: &mut Option<buzz_db::UsageMetricsLeader>,
+) -> anyhow::Result<()> {
+    let demoted = demote_advisory_leader_if_unlive(leader, "Event idempotency reaper").await;
+    if leader.is_none() && !demoted {
+        *leader = state
+            .db
+            .try_lock_usage_metrics(EVENT_IDEMPOTENCY_REAP_LOCK_KEY)
+            .await?;
+        if leader.is_some() {
+            info!("Acquired event idempotency reaper leader lock");
+        }
+    }
+    if leader.is_some() {
+        reap_expired_event_idempotency_key_batches(state).await?;
+    }
+    Ok(())
+}
+
 /// Run one usage-metrics tick. Every pod emits its own in-memory gauges, while
 /// one leader owns the heavier database-derived snapshot.
 async fn run_usage_metrics_tick(
@@ -1685,6 +1958,19 @@ async fn run_usage_metrics_tick(
     leader: &mut Option<buzz_db::UsageMetricsLeader>,
     emitted_in_memory: &mut HashSet<InMemoryMetricKey>,
 ) -> anyhow::Result<()> {
+    // Liveness and same-tick acquire run before host-map collection so a
+    // host-map error cannot skip leadership demotion.
+    let demoted = demote_advisory_leader_if_unlive(leader, "Usage metrics leader").await;
+    if leader.is_none() && !demoted {
+        *leader = state
+            .db
+            .try_lock_usage_metrics(USAGE_METRICS_LOCK_KEY)
+            .await?;
+        if leader.is_some() {
+            info!("Acquired usage metrics leader lock");
+        }
+    }
+
     let host_map: HashMap<Uuid, String> = match state.db.usage_community_hosts().await {
         Ok(hosts) => hosts
             .into_iter()
@@ -1701,23 +1987,6 @@ async fn run_usage_metrics_tick(
     };
     emit_in_memory_usage_metrics(state, emission_scope, Some(&host_map), emitted_in_memory);
 
-    let mut demoted = false;
-    if let Some(leader_guard) = leader.as_mut() {
-        if !leader_guard.is_live().await {
-            warn!("Usage metrics leader lock connection failed liveness check; demoting");
-            *leader = None;
-            demoted = true;
-        }
-    }
-    if leader.is_none() && !demoted {
-        *leader = state
-            .db
-            .try_lock_usage_metrics(USAGE_METRICS_LOCK_KEY)
-            .await?;
-        if leader.is_some() {
-            info!("Acquired usage metrics leader lock");
-        }
-    }
     if leader.is_some() {
         if let Err(error) = emit_db_usage_metrics(state, emission_scope, &host_map).await {
             warn!("Usage metrics leader demoting: DB collection failed");
@@ -2127,9 +2396,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        buzz_auto_migrate_enabled, connect_audit_pool, dropped_in_memory_keys, idle_timeout_secs,
+        buzz_auto_migrate_enabled, connect_audit_pool, dropped_in_memory_keys,
+        idempotency_reap_tick_complete, idle_timeout_secs, parse_usage_metrics_interval_secs,
         refresh_legacy_active_gauge_recency, relay_keypair_from_config,
         run_periodic_until_cancelled, EmissionScope, InMemoryMetricKey,
+        EVENT_IDEMPOTENCY_REAP_BATCHES, EVENT_IDEMPOTENCY_REAP_BATCH_LIMIT,
+        EVENT_IDEMPOTENCY_REAP_INTERVAL_SECS, EVENT_IDEMPOTENCY_REAP_LOCK_KEY,
+        USAGE_METRICS_LOCK_KEY,
     };
     use buzz_db::DbConfig;
     use metrics::GaugeFn;
@@ -2228,6 +2501,24 @@ mod tests {
         async fn audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits() {
             super::audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits().await;
         }
+    }
+
+    #[test]
+    fn idempotency_reaper_continues_after_underfilled_tenant_batches() {
+        assert_eq!(EVENT_IDEMPOTENCY_REAP_BATCHES, 8);
+        assert_eq!(EVENT_IDEMPOTENCY_REAP_BATCH_LIMIT, 1000);
+        assert_eq!(EVENT_IDEMPOTENCY_REAP_INTERVAL_SECS, 300);
+        assert!(
+            !idempotency_reap_tick_complete(false, 1),
+            "an underfilled tenant batch must not stop the remaining tick budget"
+        );
+        assert!(
+            !idempotency_reap_tick_complete(false, 7),
+            "tick must keep walking tenants through the eighth transaction"
+        );
+        assert!(idempotency_reap_tick_complete(true, 1));
+        assert!(idempotency_reap_tick_complete(false, 8));
+        assert!(idempotency_reap_tick_complete(true, 8));
     }
 
     #[test]
@@ -2333,5 +2624,407 @@ mod tests {
     fn test_idle_timeout_is_at_least_three_usage_intervals() {
         assert_eq!(idle_timeout_secs(None, 300), 900);
         assert_eq!(idle_timeout_secs(Some(10), 1_000), 3_000);
+    }
+
+    #[test]
+    fn event_idempotency_reaper_stays_bounded() {
+        assert_eq!(EVENT_IDEMPOTENCY_REAP_INTERVAL_SECS, 300);
+        assert_eq!(EVENT_IDEMPOTENCY_REAP_BATCHES, 8);
+        assert_eq!(EVENT_IDEMPOTENCY_REAP_BATCH_LIMIT, 1000);
+        assert_eq!(
+            EVENT_IDEMPOTENCY_REAP_BATCHES as i64 * EVENT_IDEMPOTENCY_REAP_BATCH_LIMIT,
+            8_000
+        );
+    }
+
+    #[test]
+    fn event_idempotency_reaper_lock_is_distinct_from_usage_metrics() {
+        assert_ne!(USAGE_METRICS_LOCK_KEY, EVENT_IDEMPOTENCY_REAP_LOCK_KEY);
+    }
+
+    #[test]
+    fn usage_interval_parser_cannot_alter_event_idempotency_reaper_cadence() {
+        assert_eq!(EVENT_IDEMPOTENCY_REAP_INTERVAL_SECS, 300);
+        assert_eq!(parse_usage_metrics_interval_secs(Some("3600")), 3600);
+        assert_eq!(parse_usage_metrics_interval_secs(None), 300);
+        assert_eq!(parse_usage_metrics_interval_secs(Some("1")), 5);
+        assert_ne!(
+            parse_usage_metrics_interval_secs(Some("3600")),
+            EVENT_IDEMPOTENCY_REAP_INTERVAL_SECS
+        );
+        assert_eq!(EVENT_IDEMPOTENCY_REAP_INTERVAL_SECS, 300);
+    }
+}
+
+#[cfg(test)]
+mod event_idempotency_reaper_signal_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        apply_event_idempotency_reaper_tick_result, event_idempotency_reaper_error_class,
+        EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_INVALID_DATA,
+        EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_SQLX, EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_UNKNOWN,
+        EVENT_IDEMPOTENCY_REAPER_FAILURES_TOTAL, EVENT_IDEMPOTENCY_REAPER_OPERATION,
+        EVENT_IDEMPOTENCY_REAPER_STAGE,
+    };
+
+    const SENTINEL: &str = "n1p-mi/raw-driver:super-secret-password=hunter2";
+
+    #[derive(Clone)]
+    struct CapturingMakeWriter {
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturingWriter {
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CapturingWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.buf.lock().expect("log buffer").extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingMakeWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturingWriter {
+                buf: Arc::clone(&self.buf),
+            }
+        }
+    }
+
+    struct FailureCapture {
+        log: String,
+        events: Vec<serde_json::Value>,
+        counters: Vec<(Vec<(String, String)>, u64)>,
+    }
+
+    fn json_field<'a>(value: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+        value
+            .get(name)
+            .or_else(|| value.get("fields").and_then(|fields| fields.get(name)))
+    }
+
+    fn collect_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(text) => out.push(text.clone()),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_strings(item, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values() {
+                    collect_strings(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn capture_tick_result(result: Result<(), anyhow::Error>) -> FailureCapture {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let make_writer = CapturingMakeWriter {
+            buf: Arc::clone(&buf),
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_writer(make_writer)
+            .finish();
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        tracing::subscriber::with_default(subscriber, || {
+            metrics::with_local_recorder(&recorder, || {
+                apply_event_idempotency_reaper_tick_result(result);
+            });
+        });
+        let log = String::from_utf8(buf.lock().expect("log buffer").clone()).unwrap_or_default();
+        let events = log
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .unwrap_or_else(|error| panic!("expected json log line, got {line}: {error}"))
+            })
+            .collect();
+        let counters = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, ..)| key.key().name() == EVENT_IDEMPOTENCY_REAPER_FAILURES_TOTAL)
+            .map(|(key, _, _, value)| {
+                let metrics_util::debugging::DebugValue::Counter(n) = value else {
+                    panic!("{} must be a counter", key.key().name());
+                };
+                let labels = key
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_owned(), label.value().to_owned()))
+                    .collect::<Vec<_>>();
+                (labels, n)
+            })
+            .collect();
+        FailureCapture {
+            log,
+            events,
+            counters,
+        }
+    }
+
+    fn sqlx_sentinel_error() -> anyhow::Error {
+        anyhow::Error::from(buzz_db::DbError::Sqlx(sqlx::Error::Io(
+            std::io::Error::other(SENTINEL),
+        )))
+    }
+
+    fn assert_no_sentinel(capture: &FailureCapture) {
+        assert!(
+            !capture.log.contains(SENTINEL),
+            "captured log leaked sentinel: {}",
+            capture.log
+        );
+        for event in &capture.events {
+            let mut strings = Vec::new();
+            collect_strings(event, &mut strings);
+            assert!(
+                strings.iter().all(|value| !value.contains(SENTINEL)),
+                "captured fields leaked sentinel: {strings:?}"
+            );
+        }
+        for (labels, _) in &capture.counters {
+            assert!(
+                labels
+                    .iter()
+                    .all(|(key, value)| !key.contains(SENTINEL) && !value.contains(SENTINEL)),
+                "counter labels leaked sentinel: {labels:?}"
+            );
+        }
+    }
+
+    fn assert_one_error_and_counter(capture: &FailureCapture, class: &str) {
+        assert_eq!(capture.events.len(), 1, "expected one ERROR event");
+        let event = &capture.events[0];
+        let level = event.get("level").and_then(|value| value.as_str());
+        assert!(
+            matches!(level, Some("ERROR") | Some("error")),
+            "expected ERROR level, got {level:?}"
+        );
+        assert_eq!(
+            json_field(event, "message").and_then(|value| value.as_str()),
+            Some("Event idempotency reaper tick failed")
+        );
+        assert_eq!(
+            json_field(event, "class").and_then(|value| value.as_str()),
+            Some(class)
+        );
+        assert_eq!(
+            json_field(event, "operation").and_then(|value| value.as_str()),
+            Some(EVENT_IDEMPOTENCY_REAPER_OPERATION)
+        );
+        assert_eq!(
+            json_field(event, "stage").and_then(|value| value.as_str()),
+            Some(EVENT_IDEMPOTENCY_REAPER_STAGE)
+        );
+        assert_eq!(capture.counters.len(), 1, "expected one dedicated counter");
+        assert_eq!(
+            capture.counters[0].1, 1,
+            "exactly one increment per helper call"
+        );
+        let class_label = capture.counters[0]
+            .0
+            .iter()
+            .find(|(key, _)| key == "class")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(class_label, Some(class));
+        assert_no_sentinel(capture);
+    }
+
+    fn source_window<'a>(src: &'a str, marker: &str, len: usize) -> &'a str {
+        let start = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing source marker {marker}"));
+        let end = (start + len).min(src.len());
+        &src[start..end]
+    }
+
+    fn source_between<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+        let start = src
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("missing source marker {start_marker}"));
+        let after_start = &src[start..];
+        let rel_end = after_start
+            .find(end_marker)
+            .unwrap_or_else(|| panic!("missing source end marker {end_marker}"));
+        &after_start[..rel_end]
+    }
+
+    #[test]
+    fn failed_tick_emits_error_and_one_counter_without_raw_error() {
+        let error = sqlx_sentinel_error();
+        assert_eq!(
+            event_idempotency_reaper_error_class(&error),
+            EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_SQLX
+        );
+        let capture = capture_tick_result(Err(error));
+        assert_one_error_and_counter(&capture, EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_SQLX);
+    }
+
+    #[test]
+    fn helper_call_increments_counter_once_each_time() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let make_writer = CapturingMakeWriter {
+            buf: Arc::clone(&buf),
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_writer(make_writer)
+            .finish();
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        tracing::subscriber::with_default(subscriber, || {
+            metrics::with_local_recorder(&recorder, || {
+                apply_event_idempotency_reaper_tick_result(Err(sqlx_sentinel_error()));
+                apply_event_idempotency_reaper_tick_result(Err(sqlx_sentinel_error()));
+            });
+        });
+        let counters: Vec<u64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, ..)| key.key().name() == EVENT_IDEMPOTENCY_REAPER_FAILURES_TOTAL)
+            .map(|(_, _, _, value)| {
+                let metrics_util::debugging::DebugValue::Counter(n) = value else {
+                    panic!("failure metric must be a counter");
+                };
+                n
+            })
+            .collect();
+        assert_eq!(counters, vec![2]);
+        let log = String::from_utf8(buf.lock().expect("log buffer").clone()).unwrap_or_default();
+        assert!(!log.contains(SENTINEL));
+    }
+
+    #[test]
+    fn ok_tick_does_not_emit_failure_signal() {
+        let capture = capture_tick_result(Ok(()));
+        assert!(capture.log.is_empty(), "Ok must not emit a log event");
+        assert!(capture.events.is_empty());
+        assert!(
+            capture.counters.is_empty(),
+            "Ok must not increment the failure counter"
+        );
+    }
+
+    #[test]
+    fn invalid_data_and_anyhow_sentinels_never_appear() {
+        let invalid = anyhow::Error::from(buzz_db::DbError::InvalidData(SENTINEL.into()));
+        assert_eq!(
+            event_idempotency_reaper_error_class(&invalid),
+            EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_INVALID_DATA
+        );
+        let invalid_capture = capture_tick_result(Err(invalid));
+        assert_one_error_and_counter(
+            &invalid_capture,
+            EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_INVALID_DATA,
+        );
+
+        let raw = anyhow::anyhow!("{SENTINEL}");
+        assert_eq!(
+            event_idempotency_reaper_error_class(&raw),
+            EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_UNKNOWN
+        );
+        let raw_capture = capture_tick_result(Err(raw));
+        assert_one_error_and_counter(&raw_capture, EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_UNKNOWN);
+    }
+
+    #[test]
+    fn counter_name_and_class_label_are_stable() {
+        assert_eq!(
+            EVENT_IDEMPOTENCY_REAPER_FAILURES_TOTAL,
+            "buzz_event_idempotency_reaper_tick_failures_total"
+        );
+        assert_eq!(
+            EVENT_IDEMPOTENCY_REAPER_OPERATION,
+            "event_idempotency_reaper"
+        );
+        assert_eq!(EVENT_IDEMPOTENCY_REAPER_STAGE, "tick");
+        assert_eq!(EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_SQLX, "sqlx");
+        assert_eq!(
+            EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_INVALID_DATA,
+            "invalid_data"
+        );
+        assert_eq!(EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_UNKNOWN, "unknown");
+        let capture = capture_tick_result(Err(sqlx_sentinel_error()));
+        assert_eq!(
+            capture.counters[0]
+                .0
+                .iter()
+                .find(|(key, _)| key == "class")
+                .map(|(_, value)| value.as_str()),
+            Some(EVENT_IDEMPOTENCY_REAPER_ERROR_CLASS_SQLX)
+        );
+    }
+
+    #[test]
+    fn production_loop_calls_helper_on_err_instead_of_discarding() {
+        let src = include_str!("main.rs");
+        let loop_src = source_between(
+            src,
+            "Event idempotency reaper started",
+            "serve(router, health_router",
+        );
+        assert!(
+            loop_src.contains("apply_event_idempotency_reaper_tick_result"),
+            "production loop must pass the tick Result to the failure helper"
+        );
+        assert!(
+            !loop_src.contains("is_err()"),
+            "production loop must not discard the tick error with is_err()"
+        );
+        assert!(
+            !loop_src.contains("let mut after"),
+            "production loop must not keep a process-initialized stale cursor"
+        );
+
+        let report_src = source_window(src, "fn report_event_idempotency_reaper_tick_failure", 700);
+        assert!(report_src.contains("EVENT_IDEMPOTENCY_REAPER_FAILURES_TOTAL"));
+        assert!(!report_src.contains("%error"));
+        assert!(!report_src.contains("?error"));
+        assert!(!report_src.contains("{error}"));
+        assert!(!report_src.contains("error.to_string"));
+        assert!(!report_src.contains("format!"));
+
+        let reap_src = source_window(
+            src,
+            "async fn reap_expired_event_idempotency_key_batches",
+            1200,
+        );
+        assert!(reap_src.contains("event_idempotency_reaper_cursor()"));
+        assert!(reap_src.contains("event_idempotency_reap_tick_budget_spent(batch)"));
+        let call_at = reap_src
+            .find("reap_expired_event_idempotency_keys_progress")
+            .expect("progress call");
+        let call_src = &reap_src[call_at..];
+        let limit_at = call_src
+            .find("EVENT_IDEMPOTENCY_REAP_BATCH_LIMIT")
+            .expect("batch limit argument");
+        let wrapped_at = call_src.find("wrapped").expect("wrapped argument");
+        let origin_at = call_src
+            .find("cycle_origin")
+            .expect("cycle_origin argument");
+        let budget_at = call_src
+            .find("tick_budget_spent")
+            .expect("tick_budget_spent argument");
+        assert!(limit_at < wrapped_at && wrapped_at < origin_at && origin_at < budget_at);
+        assert!(!reap_src.contains("*after"));
+        assert!(!reap_src.contains("after:"));
     }
 }

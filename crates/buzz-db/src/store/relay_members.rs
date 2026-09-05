@@ -1029,6 +1029,7 @@ impl Db {
             .map_err(|e| {
                 crate::error::DbError::InvalidData(format!("failed to sign kind:13534: {e}"))
             })?;
+        let _enforced = crate::runtime::enforce_kind9_p_tag_limit(&event)?;
 
         let created_at_secs = event.created_at.as_secs() as i64;
         let created_at = chrono::DateTime::from_timestamp(created_at_secs, 0)
@@ -1072,6 +1073,7 @@ impl Db {
 
         let was_inserted = insert_result.rows_affected() > 0;
         if was_inserted {
+            crate::insert_mentions_in_transaction(&mut tx, community_id, &event, None).await?;
             tx.commit().await?;
         } else {
             tx.rollback().await?;
@@ -1079,12 +1081,6 @@ impl Db {
         Ok::<_, DbError>((event, received_at, was_inserted, member_count))
             })
             .await?;
-
-        if was_inserted {
-            if let Err(e) = crate::insert_mentions(&self.pool, community_id, &event, None).await {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-            }
-        }
 
         Ok((
             StoredEvent::with_received_at(event, received_at, None, was_inserted),

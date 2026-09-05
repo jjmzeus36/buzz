@@ -299,6 +299,53 @@ CREATE INDEX idx_event_mentions_pubkey_created
 CREATE INDEX idx_event_mentions_pubkey_kind_created
     ON event_mentions (community_id, pubkey_hex, event_kind, event_created_at DESC);
 
+-- Keyed POST /events reservation (NIP-MI). No FK to partitioned events.
+CREATE TABLE event_idempotency_keys (
+    community_id     UUID NOT NULL REFERENCES communities(id),
+    author_pubkey    BYTEA NOT NULL CHECK (octet_length(author_pubkey) = 32),
+    idempotency_key  BYTEA NOT NULL CHECK (octet_length(idempotency_key) = 32),
+    intent_hash      BYTEA NOT NULL CHECK (octet_length(intent_hash) = 32),
+    event_id         BYTEA NOT NULL CHECK (octet_length(event_id) = 32),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    -- Per-reservation unforgeable ownership witness. Bound in the same
+    -- transaction as the key and event so a lost COMMIT acknowledgement can
+    -- recover as this request's fresh insert only when the committed row
+    -- matches this exact witness.
+    reservation_witness BYTEA NOT NULL CHECK (octet_length(reservation_witness) = 32),
+    PRIMARY KEY (community_id, author_pubkey, idempotency_key)
+);
+
+CREATE INDEX idx_event_idempotency_keys_created_at
+    ON event_idempotency_keys (created_at, community_id, author_pubkey, idempotency_key);
+
+CREATE INDEX idx_event_idempotency_keys_community_created_at
+    ON event_idempotency_keys (community_id, created_at, author_pubkey, idempotency_key);
+
+CREATE FUNCTION prevent_event_idempotency_keys_update()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'event_idempotency_keys rows are immutable'
+        USING ERRCODE = 'integrity_constraint_violation';
+END;
+$$;
+
+CREATE TRIGGER event_idempotency_keys_immutable
+BEFORE UPDATE ON event_idempotency_keys
+FOR EACH ROW
+EXECUTE FUNCTION prevent_event_idempotency_keys_update();
+
+-- Singleton operator-global NIP-MI reaper cursor (migration 0041). One row
+-- for the deployment so leader/process replacement continues from the
+-- committed exclusive bound instead of restarting at the lowest tenant.
+CREATE TABLE event_idempotency_reaper_cursor (
+    id SMALLINT PRIMARY KEY CHECK (id = 1),
+    after_community_id UUID
+);
+
+INSERT INTO event_idempotency_reaper_cursor (id, after_community_id) VALUES (1, NULL);
+
 -- ── Subscriptions ─────────────────────────────────────────────────────────────
 -- Conformance: "Mesh, agents, ACP/MCP, and CLI" (persisted subscriptions).
 
@@ -800,6 +847,8 @@ INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('communities',           'the tenant registry itself; id IS the community key'),
     ('rate_limit_violations', 'deployment abuse/health; never tenant-observable; community_id is an attribution label only'),
     ('_operator_global_tables', 'the registry table itself');
+INSERT INTO _operator_global_tables (table_name, reason) VALUES
+    ('event_idempotency_reaper_cursor', 'singleton operator-global NIP-MI expired-key reaper cursor; never tenant-scoped');
 
 -- ── Additive tenant tables represented in migrations 0002/0007/0017 ──────────
 -- Keep desired-state schema parity with the embedded SQLx migration path.
@@ -1733,6 +1782,7 @@ SELECT attach_community_write_fence('channels');
 SELECT attach_community_write_fence('community_bans');
 SELECT attach_community_write_fence('delivery_log');
 SELECT attach_community_write_fence('event_mentions');
+SELECT attach_community_write_fence('event_idempotency_keys');
 SELECT attach_community_write_fence('events');
 SELECT attach_community_write_fence('git_repo_names');
 SELECT attach_community_write_fence('join_policy_acceptances');

@@ -378,8 +378,16 @@ test-unit:
         # script, not startup state) and the tenant-scoping lints. The
         # Postgres-backed buzz-db tests are
         # #[ignore]d, so --lib runs only the infra-free set. Without this gate a
-        # stray file in migrations/ or a broken lint ships green.
+        # stray file in migrations/ or a broken lint ships green. The Goal 1
+        # ignored idempotency/reaper + live catalog-parity suite runs from
+        # `just test-integration` / postgres-test-run.sh with --run-ignored.
         cargo nextest run -p buzz-db --lib
+        # buzz-pubsub paired/hierarchical admission unit tests (shared-window
+        # constructor, corrupt Lua code, request builder). Infra-free; the
+        # real-Redis paired_* and hierarchical_* suites are #[ignore]d and
+        # run from `just test-integration` / Backend Integration, not this
+        # unit lane.
+        cargo nextest run -p buzz-pubsub --lib
         # Multi-tenant conformance gate (buzz-conformance): the independent
         # replay checker + golden fixtures. No infra — pure in-process trace
         # replay — so it belongs in the unit job. Run all targets (lib + the
@@ -447,6 +455,35 @@ test-unit:
         # unit job either.
         cargo nextest run -p buzz-relay --lib \
             -E '(test(/^api::admin::/) - test(=api::admin::tests::disabled_mode_allows_unauthenticated_requests_on_the_admin_host) - test(=api::admin::tests::nip98_mode_unrostered_signer_does_not_consume_a_replay_slot)) + test(/^handlers::channel_authz::/) + test(/^handlers::moderation_authz::/) + test(/^handlers::side_effects::tests::/)'
+        # Goal 1 NIP-MI / paired-admission relay library unit tests. Focused
+        # name filters: api::media and other Postgres-backed non-ignored
+        # relay tests stay out of the infra-free lane. Bridge and ingest
+        # coverage are the complete api::bridge::postgres_tests:: and
+        # handlers::ingest::postgres_tests:: modules (not function-name
+        # prefixes); nextest skips #[ignore]d Postgres/Redis cases here, and
+        # the same modules run ignored-only through postgres-test-run.sh /
+        # Backend Integration. --no-tests=fail: an empty selector must fail,
+        # not pass silently.
+        cargo nextest run -p buzz-relay --lib --no-tests=fail \
+            -E 'test(/^admission::tests::/)'
+        cargo nextest run -p buzz-relay --lib --no-tests=fail \
+            -E 'test(/^nip11::tests::idempotency_/)'
+        cargo nextest run -p buzz-relay --lib --no-tests=fail \
+            -E 'test(/^nip11::tests::served_nip11_/)'
+        cargo nextest run -p buzz-relay --lib --no-tests=fail \
+            -E 'test(/^nip11::tests::relay_info_/)'
+        cargo nextest run -p buzz-relay --lib --no-tests=fail \
+            -E 'test(/^nip11::tests::optional_fields_keep_historical_omission_and_null_behavior$/)'
+        cargo nextest run -p buzz-relay --lib --no-tests=fail \
+            -E 'test(/^nip11::tests::served_relay_info_serializes_to_object_and_keeps_rollout_atomicity$/)'
+        cargo nextest run -p buzz-relay --lib --no-tests=fail \
+            -E 'test(/^api::bridge::postgres_tests::/)'
+        cargo nextest run -p buzz-relay --lib --no-tests=fail \
+            -E 'test(/^handlers::ingest::tests::/)'
+        # Goal 1 event-idempotency reaper helpers live in the buzz-relay
+        # binary harness (src/main.rs), which a global --lib selector misses.
+        cargo nextest run -p buzz-relay --bin buzz-relay --no-tests=fail \
+            -E 'test(/^reap_tick_tests::/) or test(/^event_idempotency_reaper_signal_tests::/) or test(/^tests::idempotency_reaper_continues_after_underfilled_tenant_batches$/) or test(/^tests::event_idempotency_reaper_/) or test(/^tests::usage_interval_parser_cannot_alter_event_idempotency_reaper_cadence$/)'
         # ACP author-gate and queue tests protect the trust boundary between
         # relay events and agent prompts. They are infra-free; ignored lifecycle
         # tests remain excluded and run in their dedicated integration lanes.

@@ -606,18 +606,54 @@ pub struct SendMessageParams {
     pub broadcast: bool,
     pub files: Vec<String>,
     pub mentions: Vec<String>,
+    pub idempotency_key: Option<String>,
+}
+
+fn send_effective_kind(kind: Option<u16>) -> u16 {
+    kind.unwrap_or(9)
+}
+
+fn send_allows_idempotency_key(kind: Option<u16>) -> bool {
+    buzz_core::idempotency::supports_keyed_kind(u32::from(send_effective_kind(kind)))
+}
+
+fn unsupported_idempotency_key_kind(kind: u16) -> CliError {
+    CliError::Usage(format!(
+        "--idempotency-key is only supported for kind 9 (got {kind})"
+    ))
 }
 
 pub async fn cmd_send_message(
     client: &BuzzClient,
     mut p: SendMessageParams,
 ) -> Result<(), CliError> {
+    let idempotency_key = if let Some(ref key) = p.idempotency_key {
+        let effective_kind = send_effective_kind(p.kind);
+        if !send_allows_idempotency_key(p.kind) {
+            return Err(unsupported_idempotency_key_kind(effective_kind));
+        }
+        Some(
+            buzz_core::idempotency::parse_idempotency_key(key)
+                .map_err(|e| CliError::Usage(e.to_string()))?,
+        )
+    } else {
+        None
+    };
     // Allow '-' to read content from stdin. This keeps callers from having to
     // jam shell-metacharacter-heavy text (backticks, $vars, etc.) through argv
     // quoting — the source of countless self-inflicted command-substitution
     // bugs for agent and human users alike.
     p.content = read_or_stdin(&p.content)?;
     validate_content_size(&p.content)?;
+    if idempotency_key.is_some() {
+        let doc: serde_json::Value = serde_json::from_str(&client.get_public_metadata("/").await?)
+            .map_err(|e| CliError::Other(format!("NIP-11 JSON: {e}")))?;
+        if !buzz_core::idempotency::nip11_keyed_client_accepts(&doc) {
+            return Err(CliError::Other(
+                "relay does not advertise buzz-idempotency".into(),
+            ));
+        }
+    }
     if let Some(ref r) = p.reply_to {
         validate_hex64(r)?;
     }
@@ -744,7 +780,9 @@ pub async fn cmd_send_message(
 
     let event = client.sign_event(builder)?;
     let emitted_mentions = event_mention_pubkeys(&event);
-    let resp = client.submit_event(event).await?;
+    let resp = client
+        .submit_event_with_idempotency_key(event, idempotency_key)
+        .await?;
     let mut output: serde_json::Value = serde_json::from_str(&normalize_write_response(&resp))
         .unwrap_or_else(|_| serde_json::json!({ "response": resp }));
     if let Some(object) = output.as_object_mut() {
@@ -935,6 +973,15 @@ pub async fn dispatch(
     client: &BuzzClient,
     format: &crate::OutputFormat,
 ) -> Result<(), CliError> {
+    dispatch_with_idempotency_key(cmd, client, format, None).await
+}
+
+pub(crate) async fn dispatch_with_idempotency_key(
+    cmd: crate::MessagesCmd,
+    client: &BuzzClient,
+    format: &crate::OutputFormat,
+    idempotency_key: Option<String>,
+) -> Result<(), CliError> {
     use crate::MessagesCmd;
     match cmd {
         MessagesCmd::Send {
@@ -956,6 +1003,7 @@ pub async fn dispatch(
                     broadcast,
                     files,
                     mentions,
+                    idempotency_key,
                 },
             )
             .await
@@ -1087,8 +1135,9 @@ mod tests {
         channel_id_from_event, cmd_get_thread, cmd_send_message, event_mention_pubkeys,
         find_root_from_tags, format_events, match_profiles_by_name, merge_message_mentions,
         missing_members, normalize_explicit_mentions, parse_member_pubkeys,
-        resolve_names_to_pubkeys, resolve_thread_target, thread_ref_from_event,
-        thread_ref_from_parent_tags, BuzzClient, CliError, Uuid,
+        resolve_names_to_pubkeys, resolve_thread_target, send_allows_idempotency_key,
+        send_effective_kind, thread_ref_from_event, thread_ref_from_parent_tags,
+        unsupported_idempotency_key_kind, BuzzClient, CliError, SendMessageParams, Uuid,
     };
     use buzz_sdk::mentions::{
         extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
@@ -1537,6 +1586,136 @@ mod tests {
         assert_eq!(event_mention_pubkeys(&event), vec![PK_VALID_A]);
     }
 
+    #[test]
+    fn send_idempotency_key_allows_default_kind_9() {
+        assert_eq!(send_effective_kind(None), 9);
+        assert!(send_allows_idempotency_key(None));
+        assert!(send_allows_idempotency_key(Some(9)));
+    }
+
+    #[test]
+    fn send_idempotency_key_rejects_forum_post_kind_before_network() {
+        assert!(!send_allows_idempotency_key(Some(45001)));
+        let error = unsupported_idempotency_key_kind(45001);
+        assert!(matches!(error, CliError::Usage(_)));
+        assert!(error.to_string().contains("kind 9"));
+        assert!(error.to_string().contains("45001"));
+    }
+
+    #[test]
+    fn boundary_sized_nip11_json_keeps_keyed_capability_gate() {
+        let mut doc = json!({
+            "supported_extensions": ["buzz-idempotency"],
+            "idempotency": buzz_core::idempotency::canonical_nip11_descriptor(),
+            "pad": ""
+        });
+        let base = serde_json::to_string(&doc).unwrap();
+        let limit = crate::client::NIP11_PUBLIC_METADATA_MAX_BYTES;
+        assert!(limit >= base.len());
+        doc["pad"] = json!("a".repeat(limit - base.len()));
+        let body = serde_json::to_string(&doc).unwrap();
+        assert_eq!(body.len(), limit);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(buzz_core::idempotency::nip11_keyed_client_accepts(&parsed));
+
+        let mut rejected = parsed.clone();
+        rejected
+            .as_object_mut()
+            .expect("object")
+            .remove("idempotency");
+        assert!(!buzz_core::idempotency::nip11_keyed_client_accepts(
+            &rejected
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyed_send_preflight_rejects_oversized_declared_nip11() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let events_hits = Arc::new(AtomicU32::new(0));
+        let events_hits2 = events_hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                if req.starts_with("POST /events") {
+                    events_hits2.fetch_add(1, Ordering::SeqCst);
+                }
+                let limit = crate::client::NIP11_PUBLIC_METADATA_MAX_BYTES;
+                let headers = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", limit + 1);
+                let _ = stream.write_all(headers.as_bytes()).await;
+                let mut unused = [0u8; 1];
+                let _ = stream.read(&mut unused).await;
+            }
+        });
+
+        let client =
+            BuzzClient::new(format!("http://{addr}"), Keys::generate(), None, None).unwrap();
+        let err = cmd_send_message(
+            &client,
+            SendMessageParams {
+                channel_id: "123e4567-e89b-12d3-a456-426614174000".into(),
+                content: "hi".into(),
+                kind: None,
+                reply_to: None,
+                broadcast: false,
+                files: vec![],
+                mentions: vec![],
+                idempotency_key: Some("a".repeat(64)),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CliError::PublicMetadataTooLarge { limit }
+                    if limit == crate::client::NIP11_PUBLIC_METADATA_MAX_BYTES
+            ),
+            "keyed send must fail closed on oversized NIP-11, got {err:?}"
+        );
+        assert!(!crate::error::is_retryable_error(&err));
+        assert_eq!(
+            events_hits.load(Ordering::SeqCst),
+            0,
+            "oversized NIP-11 must not proceed to POST /events"
+        );
+    }
+
+    #[test]
+    fn messages_send_struct_has_no_idempotency_key_field() {
+        let _ = crate::MessagesCmd::Send {
+            channel: String::new(),
+            content: String::new(),
+            kind: None,
+            reply_to: None,
+            broadcast: false,
+            files: Vec::new(),
+            mentions: Vec::new(),
+        };
+    }
+
+    #[test]
+    fn public_dispatch_keeps_the_three_argument_shape() {
+        async fn call_public_dispatch(
+            cmd: crate::MessagesCmd,
+            client: &BuzzClient,
+            format: &crate::OutputFormat,
+        ) -> Result<(), CliError> {
+            super::dispatch(cmd, client, format).await
+        }
+        let _ = call_public_dispatch;
+    }
+
     // ---- match_profiles_by_name (author resolution for `messages search --author`) ----
 
     fn profile_event(
@@ -1717,6 +1896,7 @@ mod tests {
             broadcast: false,
             files: vec![],
             mentions: vec![],
+            idempotency_key: None,
         }
     }
 

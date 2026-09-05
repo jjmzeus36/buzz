@@ -3,13 +3,25 @@
 //! Both WebSocket `["EVENT", ...]` and HTTP `POST /events` feed into
 //! [`ingest_event`] — two doors, one room.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::fmt;
+use std::future::Future;
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::net::{IpAddr, Ipv4Addr};
+use std::num::NonZeroU64;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use buzz_auth::Scope;
+use buzz_auth::rate_limit::{
+    HierarchicalAdmissionLimits, HierarchicalAdmissionOutcome, HierarchicalAdmissionRequest,
+};
+use buzz_auth::{LimitType, RateLimiter, Scope};
+use buzz_core::idempotency::PreparedKeyedIntent;
 use buzz_core::kind::{
     event_kind_u32, is_identity_archive_request_kind, is_parameterized_replaceable,
     is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC,
@@ -47,7 +59,7 @@ use super::event::dispatch_persistent_event;
 
 use crate::conformance::{
     self as conf, channel_label, claimed_community_from_event, emit, msg_id_label,
-    state_for_request, EmitGuard, TraceAction, Verdict,
+    state_for_request, EmitGuard, SanitizedReason, TraceAction, Verdict,
 };
 
 fn huddle_backing_channel_id(event: &Event) -> Result<Uuid, IngestError> {
@@ -389,6 +401,1299 @@ pub enum IngestError {
     AuthFailed(String),
     /// Server error — WS: OK false, HTTP: 500.
     Internal(String),
+}
+
+/// Cryptographically verified keyed event plus authenticated-author binding.
+/// Membership, owner selection, and remaining kind/body/cap checks still run
+/// before [`KeyedHttpValidatedEvent`] is issued.
+#[derive(Debug)]
+pub(crate) struct KeyedHttpSignedEvent {
+    event: Event,
+    auth: IngestAuth,
+    kind_u32: u32,
+}
+
+/// Unforgeable proof that a keyed HTTP event passed the pre-command ingest
+/// checks. Production keyed HTTP constructs this only through
+/// [`Self::finish_after_owner`] after
+/// [`Self::verify_signature_and_author_with_early`], which owns
+/// [`KeyedHttpEarlyContext`] for the blocking verification window.
+/// [`ingest_keyed_http_event`] accepts this type rather than a raw [`Event`]
+/// so an unvalidated body cannot select the skip path. Construction consumes
+/// the exact [`IngestAuth`] used for those checks; that auth cannot be swapped
+/// after the proof is issued.
+#[derive(Debug)]
+pub(crate) struct KeyedHttpValidatedEvent {
+    event: Event,
+    auth: IngestAuth,
+}
+
+impl KeyedHttpValidatedEvent {
+    /// Run the production keyed-HTTP pre-command checks. Failures keep the
+    /// established [`IngestError`] variants and must be mapped before any
+    /// `KeyedHttpFresh` charge. Direct callers do not hold ingress; the
+    /// owned-context production seam is
+    /// [`Self::verify_signature_and_author_with_early`] then
+    /// [`Self::finish_after_owner`].
+    #[cfg(test)]
+    pub(crate) async fn validate(event: Event, auth: IngestAuth) -> Result<Self, IngestError> {
+        match tokio::task::spawn_blocking(move || keyed_validate_pre_command(event, auth)).await {
+            Ok(result) => result,
+            Err(e) => Err(ingest_verify_join_error(e)),
+        }
+    }
+
+    /// Parsed keyed-event signature verification and authenticated-author
+    /// binding with owned early context. The blocking worker holds
+    /// [`KeyedHttpEarlyContext`] (including ingress) for the whole CPU window
+    /// so a request cancel cannot release the permit while verification still
+    /// runs. The join is never wrapped in `timeout` or `select!`. Exactly one
+    /// cryptographic validation of the immutable event.
+    pub(crate) async fn verify_signature_and_author_with_early(
+        event: Event,
+        auth: IngestAuth,
+        early: KeyedHttpEarlyContext,
+    ) -> Result<(KeyedHttpSignedEvent, KeyedHttpEarlyContext), IngestError> {
+        let join = tokio::task::spawn_blocking(move || {
+            let result = keyed_validate_signature_and_author(event, auth);
+            (result, early)
+        });
+        match join.await {
+            Ok((Ok(signed), early)) => Ok((signed, early)),
+            Ok((Err(error), early)) => {
+                drop(early);
+                Err(error)
+            }
+            Err(e) => Err(ingest_verify_join_error(e)),
+        }
+    }
+
+    /// Remaining keyed kind/body/cap checks after membership and verified-owner
+    /// metadata selection. Does not repeat cryptographic validation.
+    pub(crate) fn finish_after_owner(signed: KeyedHttpSignedEvent) -> Result<Self, IngestError> {
+        keyed_finish_pre_command(signed)
+    }
+
+    /// Keyed pre-command validation with owned early context. Test seam for
+    /// join/cancel/ingress ownership; production splits signature/author from
+    /// kind/body/cap around membership.
+    #[cfg(test)]
+    pub(crate) async fn validate_with_early(
+        event: Event,
+        auth: IngestAuth,
+        early: KeyedHttpEarlyContext,
+    ) -> Result<(Self, KeyedHttpEarlyContext), IngestError> {
+        let (signed, early) =
+            Self::verify_signature_and_author_with_early(event, auth, early).await?;
+        match Self::finish_after_owner(signed) {
+            Ok(validated) => Ok((validated, early)),
+            Err(error) => {
+                drop(early);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn event(&self) -> &Event {
+        &self.event
+    }
+
+    #[cfg(test)]
+    fn auth(&self) -> &IngestAuth {
+        &self.auth
+    }
+
+    fn into_event_and_auth(self) -> (Event, IngestAuth) {
+        (self.event, self.auth)
+    }
+}
+
+enum IngestSource {
+    Raw {
+        event: Event,
+    },
+    /// Consumed from [`KeyedHttpValidatedEvent`] in [`ingest_keyed_http_event`],
+    /// so WebSocket and unkeyed HTTP (`ingest_event` → `Raw`) cannot select the
+    /// keyed skip path with an unvalidated body.
+    KeyedValidated(Event),
+}
+
+const MAX_TIMESTAMP_DRIFT_SECS: i64 = 900; // ±15 minutes
+const MAX_EVENT_CONTENT_BYTES: usize = 256 * 1024; // 256 KB
+
+/// Overflow-safe `|event_created_at - now| > MAX_TIMESTAMP_DRIFT_SECS` on i128.
+fn timestamp_drift_exceeds_max(event_created_at_secs: u64, now_unix_secs: i64) -> bool {
+    let drift = i128::from(event_created_at_secs) - i128::from(now_unix_secs);
+    drift.abs() > i128::from(MAX_TIMESTAMP_DRIFT_SECS)
+}
+
+fn ingest_verify_join_error(e: tokio::task::JoinError) -> IngestError {
+    error!("spawn_blocking panicked: {e}");
+    IngestError::Internal("error: internal verification error".into())
+}
+
+/// Prefix checks before signature verification, including keyed size-before-signature.
+fn validate_ingest_pre_command_prefix(
+    event: &Event,
+    auth: &IngestAuth,
+    keyed: bool,
+) -> Result<u32, IngestError> {
+    let kind_u32 = event_kind_u32(event);
+
+    if kind_u32 == KIND_AUTH {
+        return Err(IngestError::Rejected(
+            "invalid: AUTH events cannot be submitted".into(),
+        ));
+    }
+    if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION || kind_u32 == KIND_MEMBER_REMOVED_NOTIFICATION {
+        return Err(IngestError::Rejected(
+            "invalid: membership notifications are relay-signed only".into(),
+        ));
+    }
+
+    if auth.is_http() && (kind_u32 == KIND_GIFT_WRAP || kind_u32 == KIND_PRESENCE_UPDATE) {
+        return Err(IngestError::Rejected(format!(
+            "invalid: kind {kind_u32} is only accepted via WebSocket"
+        )));
+    }
+
+    if buzz_core::kind::is_relay_only_kind(kind_u32) {
+        return Err(IngestError::Rejected("restricted: relay-only kind".into()));
+    }
+
+    if keyed && event.content.len() > MAX_EVENT_CONTENT_BYTES {
+        return Err(IngestError::Rejected(format!(
+            "invalid: content exceeds maximum size of {} bytes (got {})",
+            MAX_EVENT_CONTENT_BYTES,
+            event.content.len()
+        )));
+    }
+
+    Ok(kind_u32)
+}
+
+fn bind_authenticated_event_author(
+    event: &Event,
+    auth: &IngestAuth,
+    kind_u32: u32,
+) -> Result<(), IngestError> {
+    let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
+    if event.pubkey != *auth.pubkey() && !is_gift_wrap {
+        return Err(IngestError::AuthFailed(
+            "invalid: event pubkey does not match authenticated identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Suffix after signature verification: timestamp, unkeyed size, optional
+/// pubkey/auth, scope, keyed-kind allowlist, and p-tag cap.
+fn validate_ingest_pre_command_suffix(
+    event: Event,
+    auth: &IngestAuth,
+    keyed: bool,
+    kind_u32: u32,
+    bind_author: bool,
+) -> Result<Event, IngestError> {
+    let now = chrono::Utc::now().timestamp();
+    if timestamp_drift_exceeds_max(event.created_at.as_secs(), now) {
+        return Err(IngestError::Rejected(
+            "invalid: event timestamp too far from server time".into(),
+        ));
+    }
+
+    if !keyed && event.content.len() > MAX_EVENT_CONTENT_BYTES {
+        return Err(IngestError::Rejected(format!(
+            "invalid: content exceeds maximum size of {} bytes (got {})",
+            MAX_EVENT_CONTENT_BYTES,
+            event.content.len()
+        )));
+    }
+    if bind_author {
+        bind_authenticated_event_author(&event, auth, kind_u32)?;
+    }
+
+    let required = match required_scope_for_kind(kind_u32, &event) {
+        Ok(scope) => scope,
+        Err(msg) => return Err(IngestError::Rejected(msg.into())),
+    };
+    // NIP-43: relay admin commands are global — channel-scoped tokens cannot
+    // issue them even if the event has no `h` tag (is_global_only_kind strips
+    // channel_id, but we still need to reject the token itself).
+    if is_relay_admin_kind(kind_u32) && auth.channel_ids().is_some() {
+        return Err(IngestError::AuthFailed(
+            "restricted: relay admin commands require a global token, not a channel-scoped token"
+                .into(),
+        ));
+    }
+    // NIP-43: leave requests are also global — channel-scoped tokens cannot
+    // issue them.
+    if kind_u32 == KIND_NIP43_LEAVE_REQUEST && auth.channel_ids().is_some() {
+        return Err(IngestError::AuthFailed(
+            "restricted: leave requests require a global token".into(),
+        ));
+    }
+    if !auth.scopes().contains(&required) {
+        return Err(IngestError::AuthFailed(format!(
+            "restricted: insufficient scope (need {})",
+            required
+        )));
+    }
+
+    if keyed && !buzz_core::idempotency::supports_keyed_kind(kind_u32) {
+        return Err(IngestError::Rejected(
+            "invalid: Idempotency-Key is not supported for this event kind".into(),
+        ));
+    }
+    if buzz_core::idempotency::keyed_p_tag_count(&event) > buzz_core::idempotency::KEYED_MAX_P_TAGS
+    {
+        if keyed {
+            return Err(IngestError::Rejected(
+                "invalid: too many p tags for keyed ingest".into(),
+            ));
+        }
+        return Err(IngestError::Rejected("invalid: too many p tags".into()));
+    }
+
+    Ok(event)
+}
+
+fn keyed_validate_signature_and_author(
+    event: Event,
+    auth: IngestAuth,
+) -> Result<KeyedHttpSignedEvent, IngestError> {
+    let kind_u32 = validate_ingest_pre_command_prefix(&event, &auth, true)?;
+    let event = keyed_verify_event_joined(event)?;
+    bind_authenticated_event_author(&event, &auth, kind_u32)?;
+    Ok(KeyedHttpSignedEvent {
+        event,
+        auth,
+        kind_u32,
+    })
+}
+
+fn keyed_finish_pre_command(
+    signed: KeyedHttpSignedEvent,
+) -> Result<KeyedHttpValidatedEvent, IngestError> {
+    let KeyedHttpSignedEvent {
+        event,
+        auth,
+        kind_u32,
+    } = signed;
+    let event = validate_ingest_pre_command_suffix(event, &auth, true, kind_u32, false)?;
+    Ok(KeyedHttpValidatedEvent { event, auth })
+}
+
+#[cfg(test)]
+fn keyed_validate_pre_command(
+    event: Event,
+    auth: IngestAuth,
+) -> Result<KeyedHttpValidatedEvent, IngestError> {
+    let signed = keyed_validate_signature_and_author(event, auth)?;
+    keyed_finish_pre_command(signed)
+}
+
+/// Pre-command ingest checks shared by WebSocket, unkeyed HTTP, and keyed HTTP.
+///
+/// Keyed HTTP runs this before charging `KeyedHttpFresh`. WebSocket and unkeyed
+/// HTTP keep calling it from [`ingest_event_inner`] after the serving-state DB
+/// fence. Includes the HTTP/keyed-relevant checks performed before
+/// command/business/DB work: forbidden AUTH / member-notification / HTTP-only /
+/// relay-only kinds, id/signature verification, timestamp window, content bound,
+/// authenticated-pubkey match, required/sufficient scope, the actual
+/// lowercase `"p"` tag cap for every externally accepted event kind (keyed
+/// and unkeyed), and when `keyed` the keyed-kind allowlist. WebSocket and
+/// HTTP share this function, so omitting `Idempotency-Key` cannot bypass
+/// the p-tag cap.
+async fn validate_ingest_pre_command(
+    event: Event,
+    auth: &IngestAuth,
+    keyed: bool,
+) -> Result<Event, IngestError> {
+    let kind_u32 = validate_ingest_pre_command_prefix(&event, auth, keyed)?;
+
+    let event = if keyed {
+        keyed_verify_event_joined(event)?
+    } else {
+        // Share the event with the verify task via Arc instead of deep-cloning it
+        // (tags + up to 256 KB of content). spawn_blocking only needs 'static, not
+        // ownership; once it completes its Arc is dropped, so try_unwrap returns
+        // the original event without ever having copied it.
+        let event = std::sync::Arc::new(event);
+        let event_for_verify = std::sync::Arc::clone(&event);
+        let verify_result =
+            tokio::task::spawn_blocking(move || verify_event(&event_for_verify)).await;
+        match verify_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(IngestError::Rejected(format!("invalid: {e}")));
+            }
+            Err(e) => return Err(ingest_verify_join_error(e)),
+        }
+        std::sync::Arc::try_unwrap(event).unwrap_or_else(|arc| (*arc).clone())
+    };
+
+    validate_ingest_pre_command_suffix(event, auth, keyed, kind_u32, true)
+}
+
+/// HTTP-only keyed ingest outcomes that must not enlarge [`IngestError`].
+#[derive(Debug)]
+pub(crate) enum KeyedHttpError {
+    /// Existing ingest failure.
+    Ingest(IngestError),
+    /// Same key, different semantic intent — HTTP 409.
+    Conflict,
+    /// Keyed writer busy — HTTP 503. `retry_after_secs` is the fleet window
+    /// reset when the aggregate denied the request, or the conservative
+    /// default for stripe/global/SQL timeout and limiter unavailability.
+    Busy {
+        /// Seconds advertised in `Retry-After`. Fleet quota denial uses the
+        /// limiter's `reset_in_secs`; stripe, SQL, and limiter unavailability
+        /// use the conservative five-second default.
+        retry_after_secs: u64,
+    },
+    /// Per-principal HTTP API quota — HTTP 429 / 503. Charged only for
+    /// genuinely new keyed work after atomic replay/conflict classification.
+    Principal(crate::admission::AdmissionError),
+}
+
+/// Closed terminal classification for [`ingest_event_inner`].
+///
+/// Ordinary success is `Ok(IngestResult)`. Every ordinary ingest error and
+/// every keyed-only HTTP terminal is a variant of this enum. The returned
+/// value is the sole authority for terminal classification — not mutable
+/// side state, sentinel `IngestError::Internal` prose, or stored-metric
+/// bookkeeping.
+#[derive(Debug)]
+enum IngestInnerOutcome {
+    Rejected(String),
+    AuthFailed(String),
+    Internal(String),
+    Conflict,
+    Busy { retry_after_secs: u64 },
+    Principal(crate::admission::AdmissionError),
+}
+
+impl From<IngestError> for IngestInnerOutcome {
+    fn from(error: IngestError) -> Self {
+        match error {
+            IngestError::Rejected(message) => Self::Rejected(message),
+            IngestError::AuthFailed(message) => Self::AuthFailed(message),
+            IngestError::Internal(message) => Self::Internal(message),
+        }
+    }
+}
+
+impl From<KeyedHttpError> for IngestInnerOutcome {
+    fn from(error: KeyedHttpError) -> Self {
+        match error {
+            KeyedHttpError::Ingest(error) => Self::from(error),
+            KeyedHttpError::Conflict => Self::Conflict,
+            KeyedHttpError::Busy { retry_after_secs } => Self::Busy { retry_after_secs },
+            KeyedHttpError::Principal(error) => Self::Principal(error),
+        }
+    }
+}
+
+fn keyed_http_error_from_inner(outcome: IngestInnerOutcome) -> KeyedHttpError {
+    match outcome {
+        IngestInnerOutcome::Rejected(message) => {
+            KeyedHttpError::Ingest(IngestError::Rejected(message))
+        }
+        IngestInnerOutcome::AuthFailed(message) => {
+            KeyedHttpError::Ingest(IngestError::AuthFailed(message))
+        }
+        IngestInnerOutcome::Internal(message) => {
+            KeyedHttpError::Ingest(IngestError::Internal(message))
+        }
+        IngestInnerOutcome::Conflict => KeyedHttpError::Conflict,
+        IngestInnerOutcome::Busy { retry_after_secs } => KeyedHttpError::Busy { retry_after_secs },
+        IngestInnerOutcome::Principal(error) => KeyedHttpError::Principal(error),
+    }
+}
+
+fn ingest_error_from_inner(outcome: IngestInnerOutcome) -> IngestError {
+    match outcome {
+        IngestInnerOutcome::Rejected(message) => IngestError::Rejected(message),
+        IngestInnerOutcome::AuthFailed(message) => IngestError::AuthFailed(message),
+        IngestInnerOutcome::Internal(message) => IngestError::Internal(message),
+        IngestInnerOutcome::Conflict
+        | IngestInnerOutcome::Busy { .. }
+        | IngestInnerOutcome::Principal(_) => {
+            IngestError::Internal("error: internal ingest error".into())
+        }
+    }
+}
+
+/// Explicit keyed persist signal for the HTTP stored-event metric seam.
+///
+/// Carried from the `KeyedStreamInsert` match to [`ingest_keyed_http_event`]
+/// so `buzz_events_stored_total` counts a physical insert only, never a
+/// Replay/BoundExisting HTTP-accepted duplicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyedStoredMetric {
+    Increment,
+    Skip,
+}
+
+fn keyed_inserted_stored_metric() -> KeyedStoredMetric {
+    KeyedStoredMetric::Increment
+}
+
+fn keyed_duplicate_stored_metric() -> KeyedStoredMetric {
+    KeyedStoredMetric::Skip
+}
+
+fn keyed_http_should_increment_stored(signal: Option<KeyedStoredMetric>) -> bool {
+    matches!(signal, Some(KeyedStoredMetric::Increment))
+}
+
+fn keyed_accepted_duplicate_result(original_event_id: impl AsRef<[u8]>) -> IngestResult {
+    IngestResult {
+        event_id: hex::encode(original_event_id),
+        accepted: true,
+        message: "duplicate:".into(),
+    }
+}
+
+/// Keyed stored-metric bookkeeping only. Terminal HTTP classification is
+/// [`IngestInnerOutcome`]; this signal cannot override the returned outcome.
+struct KeyedIngestSignals {
+    stored: Option<KeyedStoredMetric>,
+}
+
+/// Input-only keyed identity for [`ingest_event_inner`]. `keyed` stays a
+/// separate `&mut` so the inner signature stays at seven arguments.
+struct IngestInnerKeyedContext<'a> {
+    idempotency_key: Option<[u8; 32]>,
+    keyed_early: Option<&'a mut KeyedHttpEarlyContext>,
+}
+
+const KEYED_STRIPE_COUNT: usize = 1024;
+/// Hard cap on concurrent keyed writers. `try_acquire` fail-closes immediately
+/// when this many permits are held, so request memory cannot queue without bound.
+/// This is the post-admission persist gate. Hashed stripes are best-effort and
+/// must not fail closed on unrelated-key collisions; same-key serialization is
+/// the DB primary key. Open reservations are bounded separately by
+/// [`buzz_db::idempotency::KEYED_RESERVATION_CAPACITY`].
+pub(crate) const KEYED_WRITER_WAIT_MAX: usize = 8;
+const KEYED_GLOBAL_PERMITS: usize = KEYED_WRITER_WAIT_MAX;
+pub(crate) const KEYED_BUSY_RETRY_AFTER_SECS: u64 = 5;
+
+/// Process-global keyed HTTP handler ingress cap. Fail-fast; never queues.
+pub(crate) const KEYED_INGRESS_GLOBAL_MAX: usize = 32;
+/// Per-authenticated-community ingress cap. Strictly below global and at most
+/// half of global so one community cannot occupy every slot.
+pub(crate) const KEYED_INGRESS_COMMUNITY_MAX: usize = 16;
+pub(crate) const KEYED_EARLY_DEADLINE_SECS: u64 = 5;
+
+const _: () = {
+    assert!(KEYED_INGRESS_COMMUNITY_MAX > 0);
+    assert!(KEYED_INGRESS_COMMUNITY_MAX < KEYED_INGRESS_GLOBAL_MAX);
+    assert!(KEYED_INGRESS_COMMUNITY_MAX * 2 <= KEYED_INGRESS_GLOBAL_MAX);
+    assert!(KEYED_INGRESS_GLOBAL_MAX == 32);
+    assert!(KEYED_EARLY_DEADLINE_SECS == 5);
+};
+
+/// Caller-side wall-clock seconds for principal + paired Redis admission on a
+/// keyed persist miss. Runs before reservation capacity or a writer
+/// transaction is acquired. Independent of
+/// [`buzz_db::idempotency::KEYED_RESERVATION_IDLE_TIMEOUT_SECS`]: this must
+/// stay strictly shorter than the idle belt.
+pub(crate) const KEYED_RESERVATION_ADMISSION_BUDGET_SECS: u64 = 5;
+
+/// Wall-clock budget for principal + paired Redis admission on a keyed persist
+/// miss, before any reservation is opened. Timeout maps to keyed HTTP 503.
+/// PostgreSQL `idle_in_transaction_session_timeout` is a longer safety belt
+/// for an already-open reservation, not this mapping.
+pub(crate) const KEYED_RESERVATION_ADMISSION_BUDGET: Duration =
+    Duration::from_secs(KEYED_RESERVATION_ADMISSION_BUDGET_SECS);
+
+/// Caller-side bound for committed classify and begin/reserve.
+/// Classify does not hold a reservation; begin does. Complete is not
+/// wrapped in an external cancellation deadline: persist statements and
+/// post-COMMIT witness recovery are bounded internally. Independent of the
+/// idle belt; matches `SET LOCAL statement_timeout = '15s'`.
+pub(crate) const KEYED_RESERVATION_PERSIST_BUDGET_SECS: u64 = 15;
+pub(crate) const KEYED_RESERVATION_PERSIST_BUDGET: Duration =
+    Duration::from_secs(KEYED_RESERVATION_PERSIST_BUDGET_SECS);
+
+const _: () = {
+    assert!(
+        KEYED_RESERVATION_ADMISSION_BUDGET_SECS
+            < buzz_db::idempotency::KEYED_RESERVATION_IDLE_TIMEOUT_SECS
+    );
+    assert!(
+        buzz_db::idempotency::KEYED_RESERVATION_IDLE_TIMEOUT_SECS
+            <= KEYED_RESERVATION_PERSIST_BUDGET_SECS
+    );
+    assert!(
+        KEYED_RESERVATION_PERSIST_BUDGET_SECS
+            == buzz_db::idempotency::KEYED_RESERVATION_STATEMENT_TIMEOUT_SECS
+    );
+};
+
+/// Fleet-wide keyed POST /events aggregate. Below the reaper's 1,600/min
+/// sustainable delete rate with headroom, and above the documented 600,000/day
+/// (~417/min) supported average. One production ceiling, identical on every pod.
+pub(crate) const KEYED_EVENTS_FLEET_ADMISSION_PER_MIN: u64 = 1_200;
+pub(crate) const KEYED_EVENTS_FLEET_ADMISSION_WINDOW_SECS: u64 = 60;
+/// Typed 60-second shared window for persist identity+community+fleet admission.
+const KEYED_EVENTS_FLEET_ADMISSION_WINDOW: NonZeroU64 =
+    NonZeroU64::MIN.saturating_add(KEYED_EVENTS_FLEET_ADMISSION_WINDOW_SECS - 1);
+/// Per-community share of the fleet bucket. Strictly below the aggregate so
+/// one tenant cannot exhaust the sentinel and starve every other community.
+pub(crate) const KEYED_EVENTS_COMMUNITY_ADMISSION_PER_MIN: u64 = 600;
+
+/// Limited-broadcast IPv4 is never a TCP client source, so this Redis
+/// IP-admission bucket cannot collide with a reachable client identity.
+pub(crate) const KEYED_EVENTS_FLEET_ADMISSION_SENTINEL: IpAddr = IpAddr::V4(Ipv4Addr::BROADCAST);
+
+/// Tenant-prefixed hierarchical suffix for persist identity and community
+/// keys. Identity is the authenticated HTTP principal; community is the
+/// reserved persist principal. Fleet remains the operator-global sentinel.
+pub(crate) const KEYED_COMMUNITY_ADMISSION_LIMIT_TYPE: LimitType = LimitType::ApiCalls;
+
+/// Protocol-reserved principal for the per-community keyed-events bucket.
+/// Not an event author and not used as a real user identity.
+pub(crate) fn keyed_community_admission_principal() -> nostr::PublicKey {
+    const BYTES: [u8; 32] = {
+        let mut bytes = [0u8; 32];
+        bytes[31] = 1;
+        bytes
+    };
+    nostr::PublicKey::from_byte_array(BYTES)
+}
+
+fn keyed_busy_default() -> KeyedHttpError {
+    KeyedHttpError::Busy {
+        retry_after_secs: KEYED_BUSY_RETRY_AFTER_SECS,
+    }
+}
+
+pub(crate) fn keyed_http_error_from_fleet(
+    error: crate::admission::AdmissionError,
+) -> KeyedHttpError {
+    match error {
+        crate::admission::AdmissionError::Exceeded { reset_in_secs } => KeyedHttpError::Busy {
+            retry_after_secs: reset_in_secs,
+        },
+        crate::admission::AdmissionError::Unavailable => keyed_busy_default(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn enforce_keyed_events_fleet_admission<L: RateLimiter>(
+    limiter: &L,
+    tenant: &TenantContext,
+    principal: &nostr::PublicKey,
+    api_calls_per_min: u64,
+) -> Result<(), crate::admission::AdmissionError> {
+    match limiter
+        .check_hierarchical_admission_classified(HierarchicalAdmissionRequest::new(
+            tenant,
+            principal,
+            &keyed_community_admission_principal(),
+            KEYED_COMMUNITY_ADMISSION_LIMIT_TYPE,
+            KEYED_EVENTS_FLEET_ADMISSION_WINDOW,
+            HierarchicalAdmissionLimits::new(
+                api_calls_per_min,
+                KEYED_EVENTS_COMMUNITY_ADMISSION_PER_MIN,
+                KEYED_EVENTS_FLEET_ADMISSION_PER_MIN,
+            ),
+            &KEYED_EVENTS_FLEET_ADMISSION_SENTINEL,
+        ))
+        .await
+    {
+        Ok(HierarchicalAdmissionOutcome::Allowed { .. }) => Ok(()),
+        Ok(HierarchicalAdmissionOutcome::IdentityDenied(result)) => {
+            Err(crate::admission::AdmissionError::Exceeded {
+                reset_in_secs: result.reset_in_secs,
+            })
+        }
+        Ok(
+            HierarchicalAdmissionOutcome::CommunityDenied(result)
+            | HierarchicalAdmissionOutcome::FleetDenied(result),
+        ) => Err(crate::admission::AdmissionError::Exceeded {
+            reset_in_secs: result.reset_in_secs,
+        }),
+        Err(failure) => {
+            tracing::warn!(
+                class = failure.class().as_str(),
+                "shared keyed-event hierarchical persist admission unavailable"
+            );
+            Err(crate::admission::AdmissionError::Unavailable)
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) async fn maybe_enforce_keyed_events_fleet_admission<L: RateLimiter>(
+    limiter: &L,
+    tenant: &TenantContext,
+    principal: &nostr::PublicKey,
+    api_calls_per_min: u64,
+    keyed: bool,
+) -> Result<(), crate::admission::AdmissionError> {
+    if !keyed {
+        return Ok(());
+    }
+    enforce_keyed_events_fleet_admission(limiter, tenant, principal, api_calls_per_min).await
+}
+
+/// Absolute five-second early deadline started immediately after authentication.
+/// Remaining budget is applied to attempt, replay, validation, committed
+/// classification, fresh, and atomic persist. Never reset per await. Never wrap
+/// a blocking verification join or a durable DB commit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeyedEarlyDeadline {
+    start: Instant,
+    budget: Duration,
+    // Test-only: `expired()` is true while `remaining()` still covers replay
+    // I/O, so the pre-spawn verification guard is reachable after parse.
+    #[cfg(test)]
+    verification_expired: bool,
+}
+
+impl KeyedEarlyDeadline {
+    pub(crate) fn start() -> Self {
+        Self {
+            start: Instant::now(),
+            budget: Duration::from_secs(KEYED_EARLY_DEADLINE_SECS),
+            #[cfg(test)]
+            verification_expired: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_budget(budget: Duration) -> Self {
+        Self {
+            start: Instant::now(),
+            budget,
+            verification_expired: false,
+        }
+    }
+
+    /// Already-expired for the pre-spawn verification guard while replay still
+    /// observes a live remaining budget. Membership and owner selection run
+    /// only after signature verification and authenticated-author binding.
+    #[cfg(test)]
+    pub(crate) fn already_expired() -> Self {
+        Self {
+            start: Instant::now(),
+            budget: Duration::from_secs(KEYED_EARLY_DEADLINE_SECS),
+            verification_expired: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn same_absolute_clock(self, other: Self) -> bool {
+        self.start == other.start && self.budget == other.budget
+    }
+
+    pub(crate) fn remaining(self) -> Duration {
+        self.budget.saturating_sub(self.start.elapsed())
+    }
+
+    pub(crate) fn expired(self) -> bool {
+        #[cfg(test)]
+        if self.verification_expired {
+            return true;
+        }
+        self.remaining().is_zero()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run<T, E, F>(self, fut: F) -> Result<T, E>
+    where
+        F: Future<Output = Result<T, E>>,
+        E: From<KeyedHttpError>,
+    {
+        let remaining = self.remaining();
+        if remaining.is_zero() {
+            return Err(E::from(keyed_busy_default()));
+        }
+        match tokio::time::timeout(remaining, fut).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(E::from(keyed_busy_default())),
+        }
+    }
+}
+
+/// Apply the remaining absolute early deadline to a cancellation-safe I/O
+/// await. Unkeyed callers pass `None` and are unchanged. Timeout maps to the
+/// existing keyed busy/503 contract. The inner result is returned untouched
+/// so a DB/auth error is not rewritten as busy.
+async fn keyed_early_io<T, F>(
+    early: Option<&KeyedHttpEarlyContext>,
+    fut: F,
+) -> Result<T, KeyedHttpError>
+where
+    F: Future<Output = T>,
+{
+    match early {
+        None => Ok(fut.await),
+        Some(early) => {
+            let remaining = early.deadline.remaining();
+            if remaining.is_zero() {
+                return Err(keyed_busy_default());
+            }
+            match tokio::time::timeout(remaining, fut).await {
+                Ok(value) => Ok(value),
+                Err(_elapsed) => Err(keyed_busy_default()),
+            }
+        }
+    }
+}
+
+struct KeyedCommunityIngressEntry {
+    semaphore: Arc<Semaphore>,
+    live_handles: usize,
+}
+
+struct KeyedCommunityIngressHandle {
+    community: Uuid,
+    semaphore: Arc<Semaphore>,
+}
+
+impl fmt::Debug for KeyedCommunityIngressHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyedCommunityIngressHandle")
+            .field("community", &self.community)
+            .field("available_permits", &self.semaphore.available_permits())
+            .finish()
+    }
+}
+
+impl Drop for KeyedCommunityIngressHandle {
+    fn drop(&mut self) {
+        release_keyed_community_ingress_handle(self.community, &self.semaphore);
+    }
+}
+
+/// Fail-fast RAII global 32 + community 16 ingress permits. Dropping releases
+/// both permits and reclaims an idle community registry entry. Field-take Drop
+/// keeps release order independent of layout: community permit, global permit,
+/// then registry handle.
+pub(crate) struct KeyedIngressGuard {
+    community: Option<tokio::sync::OwnedSemaphorePermit>,
+    global: Option<SemaphorePermit<'static>>,
+    handle: Option<KeyedCommunityIngressHandle>,
+}
+
+impl fmt::Debug for KeyedIngressGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyedIngressGuard")
+            .field("community_held", &self.community.is_some())
+            .field("global_held", &self.global.is_some())
+            .field("handle", &self.handle)
+            .finish()
+    }
+}
+
+impl Drop for KeyedIngressGuard {
+    fn drop(&mut self) {
+        drop(self.community.take());
+        drop(self.global.take());
+        drop(self.handle.take());
+    }
+}
+
+fn keyed_ingress_global() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| Semaphore::new(KEYED_INGRESS_GLOBAL_MAX))
+}
+
+fn keyed_community_ingress_registry() -> &'static Mutex<HashMap<Uuid, KeyedCommunityIngressEntry>> {
+    static REG: OnceLock<Mutex<HashMap<Uuid, KeyedCommunityIngressEntry>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_keyed_community_ingress_registry(
+) -> std::sync::MutexGuard<'static, HashMap<Uuid, KeyedCommunityIngressEntry>> {
+    keyed_community_ingress_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn checkout_keyed_community_ingress_handle(
+    community: Uuid,
+) -> Result<KeyedCommunityIngressHandle, KeyedHttpError> {
+    let mut tenants = lock_keyed_community_ingress_registry();
+    let entry = tenants
+        .entry(community)
+        .or_insert_with(|| KeyedCommunityIngressEntry {
+            semaphore: Arc::new(Semaphore::new(KEYED_INGRESS_COMMUNITY_MAX)),
+            live_handles: 0,
+        });
+    entry.live_handles = entry
+        .live_handles
+        .checked_add(1)
+        .ok_or_else(keyed_busy_default)?;
+    Ok(KeyedCommunityIngressHandle {
+        community,
+        semaphore: Arc::clone(&entry.semaphore),
+    })
+}
+
+fn release_keyed_community_ingress_handle(community: Uuid, expected: &Arc<Semaphore>) {
+    let mut tenants = lock_keyed_community_ingress_registry();
+    let Some(entry) = tenants.get_mut(&community) else {
+        return;
+    };
+    if !Arc::ptr_eq(&entry.semaphore, expected) {
+        return;
+    }
+    let Some(live_handles) = entry.live_handles.checked_sub(1) else {
+        return;
+    };
+    entry.live_handles = live_handles;
+    if entry.live_handles != 0 {
+        return;
+    }
+    if expected.available_permits() < KEYED_INGRESS_COMMUNITY_MAX {
+        return;
+    }
+    tenants.remove(&community);
+}
+
+/// Acquire fail-fast global and community ingress. Never queues waiters.
+pub(crate) fn try_acquire_keyed_ingress(
+    community: Uuid,
+) -> Result<KeyedIngressGuard, KeyedHttpError> {
+    let handle = checkout_keyed_community_ingress_handle(community)?;
+    let community_permit = match Arc::clone(&handle.semaphore).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return Err(keyed_busy_default()),
+    };
+    match keyed_ingress_global().try_acquire() {
+        Ok(global) => Ok(KeyedIngressGuard {
+            community: Some(community_permit),
+            global: Some(global),
+            handle: Some(handle),
+        }),
+        Err(_) => Err(keyed_busy_default()),
+    }
+}
+
+pub(crate) struct KeyedHttpEarlyContext {
+    pub ingress: Option<KeyedIngressGuard>,
+    pub deadline: KeyedEarlyDeadline,
+    pub verified_owner: Option<nostr::PublicKey>,
+}
+
+impl KeyedHttpEarlyContext {
+    fn release_ingress(&mut self) {
+        drop(self.ingress.take());
+    }
+}
+
+#[cfg(test)]
+fn keyed_ingress_global_available() -> usize {
+    keyed_ingress_global().available_permits()
+}
+
+#[cfg(test)]
+fn keyed_ingress_registry_len() -> usize {
+    lock_keyed_community_ingress_registry().len()
+}
+
+#[cfg(test)]
+fn keyed_ingress_registry_contains(community: Uuid) -> bool {
+    lock_keyed_community_ingress_registry().contains_key(&community)
+}
+
+#[cfg(test)]
+fn keyed_ingress_live_handles(community: Uuid) -> Option<usize> {
+    lock_keyed_community_ingress_registry()
+        .get(&community)
+        .map(|entry| entry.live_handles)
+}
+
+#[cfg(test)]
+fn keyed_ingress_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+pub(crate) fn lock_keyed_ingress_tests() -> tokio::sync::MutexGuard<'static, ()> {
+    keyed_ingress_test_lock().blocking_lock()
+}
+
+#[cfg(test)]
+pub(crate) async fn lock_keyed_ingress_tests_async() -> tokio::sync::MutexGuard<'static, ()> {
+    keyed_ingress_test_lock().lock().await
+}
+
+#[cfg(test)]
+pub(crate) struct KeyedVerifyWatch {
+    event_id: nostr::EventId,
+    in_flight: std::sync::atomic::AtomicUsize,
+    release: std::sync::atomic::AtomicBool,
+    panic: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+fn keyed_verify_watcher() -> &'static Mutex<Option<Arc<KeyedVerifyWatch>>> {
+    static WATCH: OnceLock<Mutex<Option<Arc<KeyedVerifyWatch>>>> = OnceLock::new();
+    WATCH.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn snapshot_keyed_verify_watch(event_id: &nostr::EventId) -> Option<Arc<KeyedVerifyWatch>> {
+    let slot = keyed_verify_watcher()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.as_ref().and_then(|watch| {
+        if watch.event_id == *event_id {
+            Some(Arc::clone(watch))
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(test)]
+pub(crate) struct KeyedVerifyWatchGuard {
+    watch: Arc<KeyedVerifyWatch>,
+    join: Option<std::thread::JoinHandle<Result<Event, IngestError>>>,
+}
+
+#[cfg(test)]
+pub(crate) fn install_keyed_verify_watch(event_id: nostr::EventId) -> KeyedVerifyWatchGuard {
+    let watch = Arc::new(KeyedVerifyWatch {
+        event_id,
+        in_flight: std::sync::atomic::AtomicUsize::new(0),
+        release: std::sync::atomic::AtomicBool::new(true),
+        panic: std::sync::atomic::AtomicBool::new(false),
+    });
+    {
+        let mut slot = keyed_verify_watcher()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(Arc::clone(&watch));
+    }
+    KeyedVerifyWatchGuard { watch, join: None }
+}
+
+#[cfg(test)]
+impl KeyedVerifyWatchGuard {
+    pub(crate) fn hold(&self) {
+        self.watch
+            .release
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn release(&self) {
+        self.watch
+            .release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn arm_panic(&self) {
+        self.watch
+            .panic
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn in_flight(&self) -> usize {
+        self.watch
+            .in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn spawn_joined_verify(&mut self, event: Event) {
+        self.join = Some(std::thread::spawn(move || keyed_verify_event_joined(event)));
+    }
+
+    fn join_verify(&mut self) -> Result<Event, IngestError> {
+        self.join
+            .take()
+            .expect("joined worker")
+            .join()
+            .expect("verification thread")
+    }
+}
+
+#[cfg(test)]
+impl Drop for KeyedVerifyWatchGuard {
+    fn drop(&mut self) {
+        self.watch
+            .release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        let mut slot = keyed_verify_watcher()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.watch))
+        {
+            *slot = None;
+        }
+    }
+}
+
+fn keyed_verify_event_joined(event: Event) -> Result<Event, IngestError> {
+    #[cfg(test)]
+    let matched = snapshot_keyed_verify_watch(&event.id);
+    #[cfg(test)]
+    struct MatchedInFlight(Option<Arc<KeyedVerifyWatch>>);
+    #[cfg(test)]
+    impl Drop for MatchedInFlight {
+        fn drop(&mut self) {
+            if let Some(watch) = &self.0 {
+                watch
+                    .in_flight
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+    #[cfg(test)]
+    let _inflight = match &matched {
+        Some(watch) => {
+            watch
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            MatchedInFlight(Some(Arc::clone(watch)))
+        }
+        None => MatchedInFlight(None),
+    };
+    #[cfg(test)]
+    if let Some(watch) = &matched {
+        if watch.panic.load(std::sync::atomic::Ordering::SeqCst) {
+            panic!("keyed verify test panic");
+        }
+        while !watch.release.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+    match verify_event(&event) {
+        Ok(()) => Ok(event),
+        Err(e) => Err(IngestError::Rejected(format!("invalid: {e}"))),
+    }
+}
+
+fn keyed_stripes() -> &'static [Semaphore] {
+    static STRIPES: OnceLock<Vec<Semaphore>> = OnceLock::new();
+    STRIPES.get_or_init(|| (0..KEYED_STRIPE_COUNT).map(|_| Semaphore::new(1)).collect())
+}
+
+fn keyed_global() -> &'static Semaphore {
+    static GLOBAL: OnceLock<Semaphore> = OnceLock::new();
+    GLOBAL.get_or_init(|| Semaphore::new(KEYED_GLOBAL_PERMITS))
+}
+
+fn keyed_stripe_index(community: Uuid, author: &[u8; 32], key: &[u8; 32]) -> usize {
+    static HASHER: OnceLock<std::collections::hash_map::RandomState> = OnceLock::new();
+    let mut hasher = HASHER
+        .get_or_init(std::collections::hash_map::RandomState::new)
+        .build_hasher();
+    community.hash(&mut hasher);
+    author.hash(&mut hasher);
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % KEYED_STRIPE_COUNT
+}
+
+struct KeyedWriterPermits {
+    _stripe: Option<SemaphorePermit<'static>>,
+    _global: SemaphorePermit<'static>,
+}
+
+fn acquire_keyed_writer_permits(
+    community: Uuid,
+    author: &[u8; 32],
+    key: &[u8; 32],
+) -> Result<KeyedWriterPermits, KeyedHttpError> {
+    let index = keyed_stripe_index(community, author, key);
+    // Same-key serialization is the DB primary key. A hashed stripe is only a
+    // best-effort local hint: an unrelated-key collision must not abort a
+    // valid reservation or synthesize 503.
+    let stripe = keyed_stripes()[index].try_acquire().ok();
+    let global = keyed_global()
+        .try_acquire()
+        .map_err(|_| keyed_busy_default())?;
+    Ok(KeyedWriterPermits {
+        _stripe: stripe,
+        _global: global,
+    })
+}
+
+/// Test-only RAII guard that holds every keyed writer permit so a concurrent
+/// keyed persist fails closed as Busy. Permits are released on drop, including
+/// panic unwind. Compiles out of production.
+#[cfg(test)]
+pub(crate) struct KeyedWriterCapacityGuard {
+    _permits: Vec<SemaphorePermit<'static>>,
+}
+
+#[cfg(test)]
+impl KeyedWriterCapacityGuard {
+    #[must_use]
+    pub(crate) fn hold_all() -> Self {
+        let mut permits = Vec::with_capacity(KEYED_GLOBAL_PERMITS);
+        for _ in 0..KEYED_GLOBAL_PERMITS {
+            permits.push(
+                keyed_global()
+                    .try_acquire()
+                    .expect("test must fill the keyed writer gate"),
+            );
+        }
+        Self { _permits: permits }
+    }
+}
+
+/// Persist plus lost-COMMIT-ack recovery. Internally bounded by statement
+/// timeout and the witness-lookup timeout; never wrapped in an external
+/// cancellation deadline that can return 503 after a durable commit.
+async fn complete_keyed_reservation(
+    reservation: buzz_db::KeyedReservation,
+    prepared: &PreparedKeyedIntent,
+    event: &Event,
+    thread_meta: Option<buzz_db::event::ThreadMetadataParams<'_>>,
+) -> Result<buzz_db::KeyedStreamInsert, buzz_db::DbError> {
+    reservation.complete(prepared, event, thread_meta).await
+}
+
+#[cfg(test)]
+async fn keyed_await_admission_for<T, F>(budget: Duration, fut: F) -> Result<T, KeyedHttpError>
+where
+    F: Future<Output = Result<T, KeyedHttpError>>,
+{
+    match tokio::time::timeout(budget, fut).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(keyed_busy_default()),
+    }
+}
+
+/// Atomic persist identity+community+fleet admission for a keyed persist miss.
+/// Must not run while a PostgreSQL transaction, writer-pool connection, or
+/// reservation capacity permit is held. Identity denial maps to the established
+/// 429 principal contract; community/fleet denial and backend unavailability
+/// map to keyed 503. The caller applies the remaining early deadline.
+async fn admit_keyed_persist_miss<L: RateLimiter>(
+    limiter: &L,
+    tenant: &TenantContext,
+    principal: &nostr::PublicKey,
+    api_calls_per_min: u64,
+) -> Result<(), KeyedHttpError> {
+    match limiter
+        .check_hierarchical_admission_classified(HierarchicalAdmissionRequest::new(
+            tenant,
+            principal,
+            &keyed_community_admission_principal(),
+            KEYED_COMMUNITY_ADMISSION_LIMIT_TYPE,
+            KEYED_EVENTS_FLEET_ADMISSION_WINDOW,
+            HierarchicalAdmissionLimits::new(
+                api_calls_per_min,
+                KEYED_EVENTS_COMMUNITY_ADMISSION_PER_MIN,
+                KEYED_EVENTS_FLEET_ADMISSION_PER_MIN,
+            ),
+            &KEYED_EVENTS_FLEET_ADMISSION_SENTINEL,
+        ))
+        .await
+    {
+        Ok(HierarchicalAdmissionOutcome::Allowed { .. }) => Ok(()),
+        Ok(HierarchicalAdmissionOutcome::IdentityDenied(result)) => Err(KeyedHttpError::Principal(
+            crate::admission::AdmissionError::Exceeded {
+                reset_in_secs: result.reset_in_secs,
+            },
+        )),
+        Ok(
+            HierarchicalAdmissionOutcome::CommunityDenied(result)
+            | HierarchicalAdmissionOutcome::FleetDenied(result),
+        ) => Err(keyed_http_error_from_fleet(
+            crate::admission::AdmissionError::Exceeded {
+                reset_in_secs: result.reset_in_secs,
+            },
+        )),
+        Err(failure) => {
+            tracing::warn!(
+                class = failure.class().as_str(),
+                "shared keyed-event hierarchical persist admission unavailable"
+            );
+            Err(keyed_http_error_from_fleet(
+                crate::admission::AdmissionError::Unavailable,
+            ))
+        }
+    }
+}
+
+/// Committed replay/conflict skip fresh and persist admission. A committed miss
+/// runs fresh then [`admit_keyed_persist_miss`] and returns `Ok(None)` so the
+/// caller can open the authoritative reservation afterward.
+async fn finish_keyed_committed_classify<L: RateLimiter>(
+    committed: Option<buzz_db::idempotency::KeyedCommittedOutcome>,
+    limiter: &L,
+    tenant: &TenantContext,
+    principal: &nostr::PublicKey,
+    api_calls_per_min: u64,
+) -> Result<Option<buzz_db::idempotency::KeyedCommittedOutcome>, KeyedHttpError> {
+    match committed {
+        Some(hit) => Ok(Some(hit)),
+        None => {
+            crate::admission::check_keyed_http_fresh_admission(limiter, tenant, principal)
+                .await
+                .map_err(keyed_http_error_from_fleet)?;
+            admit_keyed_persist_miss(limiter, tenant, principal, api_calls_per_min).await?;
+            Ok(None)
+        }
+    }
+}
+
+const KEYED_RESERVATION_ABORT_FAILURES_TOTAL: &str = "buzz_keyed_reservation_abort_failures_total";
+
+fn classify_keyed_reservation_abort_sqlstate(code: Option<&str>) -> &'static str {
+    match code {
+        Some("55P03") => "lock_not_available",
+        Some("57014") => "statement_canceled",
+        Some("25P03") => "idle_in_transaction_timeout",
+        _ => "sqlx_other",
+    }
+}
+
+fn classify_keyed_reservation_abort_db_error(error: &buzz_db::DbError) -> &'static str {
+    if error.is_idempotency_unavailable() {
+        return "idempotency_unavailable";
+    }
+    match error {
+        buzz_db::DbError::Sqlx(sqlx::Error::PoolTimedOut) => "pool_timeout",
+        buzz_db::DbError::Sqlx(sqlx::Error::Database(database)) => {
+            classify_keyed_reservation_abort_sqlstate(database.code().as_deref())
+        }
+        buzz_db::DbError::Sqlx(_) => "sqlx_other",
+        _ => "database_other",
+    }
+}
+
+fn record_keyed_reservation_abort_failure(class: &'static str) {
+    warn!(class, "keyed reservation abort failed");
+    metrics::counter!(KEYED_RESERVATION_ABORT_FAILURES_TOTAL, "class" => class).increment(1);
+}
+
+fn finish_keyed_reservation_abort<T, TE>(
+    outcome: Result<Result<(), buzz_db::DbError>, TE>,
+    passthrough: T,
+) -> T {
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            record_keyed_reservation_abort_failure(classify_keyed_reservation_abort_db_error(
+                &error,
+            ));
+        }
+        Err(_) => record_keyed_reservation_abort_failure("deadline_timeout"),
+    }
+    passthrough
+}
+
+async fn abort_keyed_reservation(reservation: buzz_db::KeyedReservation) {
+    let outcome = tokio::time::timeout(KEYED_RESERVATION_PERSIST_BUDGET, reservation.abort()).await;
+    finish_keyed_reservation_abort(outcome, ());
 }
 
 /// Map the durable community write-fence lookup onto the ingest error taxonomy.
@@ -2128,7 +3433,22 @@ pub async fn ingest_event(
         "ingest_event_exited_without_trace",
     );
 
-    let result = ingest_event_inner(state, &tracer, tenant, event, auth).await;
+    let mut keyed = KeyedIngestSignals { stored: None };
+    let result = ingest_event_inner(
+        state,
+        &tracer,
+        tenant,
+        IngestSource::Raw { event },
+        auth,
+        IngestInnerKeyedContext {
+            idempotency_key: None,
+            keyed_early: None,
+        },
+        &mut keyed,
+    )
+    .await
+    .map_err(ingest_error_from_inner);
+    debug_assert!(keyed.stored.is_none());
 
     // Fleet-wide stored counter: kind + author_type only, no community tag
     // (see the cardinality rationale on buzz_events_received_total —
@@ -2167,15 +3487,102 @@ pub async fn ingest_event(
     result
 }
 
+/// HTTP-only keyed ingest. WebSocket continues to call [`ingest_event`].
+///
+/// Requires [`KeyedHttpValidatedEvent`] so signature verification and the other
+/// pre-command checks are not repeated, the exact validating [`IngestAuth`] is
+/// bound to the event, and an unvalidated event cannot select this skip path.
+pub(crate) async fn ingest_keyed_http_event(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    validated: KeyedHttpValidatedEvent,
+    key: [u8; 32],
+    mut early: KeyedHttpEarlyContext,
+) -> Result<IngestResult, KeyedHttpError> {
+    let kind_label = super::event::bounded_kind_label(event_kind_u32(validated.event()));
+    let (event, auth) = validated.into_event_and_auth();
+    let author_pubkey_bytes = auth.principal_pubkey_bytes();
+    let verified_owner = early.verified_owner;
+    let agent = *auth.pubkey();
+    let abstract_state = state_for_request(tenant, auth.pubkey());
+    let (_guard, tracer) = EmitGuard::arm(
+        state.tracer.clone(),
+        abstract_state.clone(),
+        "ingest_event_exited_without_trace",
+    );
+    let mut keyed = KeyedIngestSignals { stored: None };
+    let result = ingest_event_inner(
+        state,
+        &tracer,
+        tenant,
+        IngestSource::KeyedValidated(event),
+        auth,
+        IngestInnerKeyedContext {
+            idempotency_key: Some(key),
+            keyed_early: Some(&mut early),
+        },
+        &mut keyed,
+    )
+    .await;
+    early.release_ingress();
+    match result {
+        Ok(ingest_result) => {
+            if ingest_result.accepted {
+                if let Some(owner) = verified_owner {
+                    crate::api::relay_members::materialize_nip_oa_owner(
+                        state, tenant, &agent, &owner,
+                    )
+                    .await;
+                }
+            }
+            if keyed_http_should_increment_stored(keyed.stored) {
+                let author_type = author_type_label(state, tenant, author_pubkey_bytes).await;
+                metrics::counter!(
+                    "buzz_events_stored_total",
+                    "kind" => kind_label,
+                    "author_type" => author_type
+                )
+                .increment(1);
+            }
+            Ok(ingest_result)
+        }
+        Err(outcome) => {
+            let error = keyed_http_error_from_inner(outcome);
+            let reason = match &error {
+                KeyedHttpError::Conflict => SanitizedReason::Invalid,
+                KeyedHttpError::Busy { .. } => SanitizedReason::ServerError,
+                KeyedHttpError::Principal(_) => SanitizedReason::ServerError,
+                KeyedHttpError::Ingest(err) => conf::sanitized_reason_for(err),
+            };
+            emit(
+                &tracer,
+                TraceAction::SanitizedError { reason },
+                abstract_state,
+            );
+            Err(error)
+        }
+    }
+}
+
 async fn ingest_event_inner(
     state: &Arc<AppState>,
     tracer: &Arc<dyn buzz_conformance::Tracer>,
     tenant: &TenantContext,
-    event: Event,
+    source: IngestSource,
     auth: IngestAuth,
-) -> Result<IngestResult, IngestError> {
-    let event_id_hex = event.id.to_hex();
-    let kind_u32 = event_kind_u32(&event);
+    keyed_context: IngestInnerKeyedContext<'_>,
+    keyed: &mut KeyedIngestSignals,
+) -> Result<IngestResult, IngestInnerOutcome> {
+    let IngestInnerKeyedContext {
+        idempotency_key,
+        mut keyed_early,
+    } = keyed_context;
+    let preview = match &source {
+        IngestSource::Raw { event } => event,
+        IngestSource::KeyedValidated(event) => event,
+    };
+    let event_id_hex = preview.id.to_hex();
+    let kind_u32 = event_kind_u32(preview);
     debug!(event_id = %event_id_hex, kind = kind_u32, "ingest_event");
 
     // Durable community write fence: persistent ingest is a DB write the
@@ -2183,110 +3590,35 @@ async fn ingest_event_inner(
     // external side effects only), so the shared WS/HTTP seam must refuse
     // writes once the community leaves the active lifecycle state. Row churn
     // inside the remaining race window is swept by the destructive DB stage.
+    // Kept ahead of keyed fresh-admission only on the unkeyed/WS path; keyed
+    // HTTP already ran the cheap pre-command checks before charging fresh.
+    // Keyed early I/O still consumes the remaining absolute five-second
+    // deadline so a stalled serving-fence lookup cannot run unbounded.
     map_serving_fence_state(
-        buzz_deletion::store(&state.db)
-            .is_serving_active(tenant.community())
-            .await,
+        keyed_early_io(
+            keyed_early.as_deref(),
+            buzz_deletion::store(&state.db).is_serving_active(tenant.community()),
+        )
+        .await
+        .map_err(IngestInnerOutcome::from)?,
     )?;
 
-    if kind_u32 == KIND_AUTH {
-        return Err(IngestError::Rejected(
-            "invalid: AUTH events cannot be submitted".into(),
-        ));
-    }
-    if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION || kind_u32 == KIND_MEMBER_REMOVED_NOTIFICATION {
-        return Err(IngestError::Rejected(
-            "invalid: membership notifications are relay-signed only".into(),
-        ));
-    }
-
-    if auth.is_http() && (kind_u32 == KIND_GIFT_WRAP || kind_u32 == KIND_PRESENCE_UPDATE) {
-        return Err(IngestError::Rejected(format!(
-            "invalid: kind {kind_u32} is only accepted via WebSocket"
-        )));
-    }
-
-    if buzz_core::kind::is_relay_only_kind(kind_u32) {
-        return Err(IngestError::Rejected("restricted: relay-only kind".into()));
-    }
-
-    // Share the event with the verify task via Arc instead of deep-cloning it
-    // (tags + up to 256 KB of content). spawn_blocking only needs 'static, not
-    // ownership; once it completes its Arc is dropped, so try_unwrap returns
-    // the original event without ever having copied it.
-    let event = std::sync::Arc::new(event);
-    let event_for_verify = std::sync::Arc::clone(&event);
-    let verify_result = tokio::task::spawn_blocking(move || verify_event(&event_for_verify)).await;
-    match verify_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            return Err(IngestError::Rejected(format!("invalid: {e}")));
+    let event = match source {
+        IngestSource::KeyedValidated(event) => event,
+        IngestSource::Raw { event } => {
+            validate_ingest_pre_command(event, &auth, idempotency_key.is_some()).await?
         }
-        Err(e) => {
-            error!("spawn_blocking panicked: {e}");
-            return Err(IngestError::Internal(
-                "error: internal verification error".into(),
-            ));
-        }
-    }
-    let event = std::sync::Arc::try_unwrap(event).unwrap_or_else(|arc| (*arc).clone());
-
-    const MAX_TIMESTAMP_DRIFT_SECS: i64 = 900; // ±15 minutes
-    let now = chrono::Utc::now().timestamp();
-    let event_ts = event.created_at.as_secs() as i64;
-    if (event_ts - now).abs() > MAX_TIMESTAMP_DRIFT_SECS {
-        return Err(IngestError::Rejected(
-            "invalid: event timestamp too far from server time".into(),
-        ));
-    }
-
-    const MAX_EVENT_CONTENT_BYTES: usize = 256 * 1024; // 256 KB
-    if event.content.len() > MAX_EVENT_CONTENT_BYTES {
-        return Err(IngestError::Rejected(format!(
-            "invalid: content exceeds maximum size of {} bytes (got {})",
-            MAX_EVENT_CONTENT_BYTES,
-            event.content.len()
-        )));
-    }
-
-    let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
-    if event.pubkey != *auth.pubkey() && !is_gift_wrap {
-        return Err(IngestError::AuthFailed(
-            "invalid: event pubkey does not match authenticated identity".into(),
-        ));
-    }
-
-    let required = match required_scope_for_kind(kind_u32, &event) {
-        Ok(scope) => scope,
-        Err(msg) => return Err(IngestError::Rejected(msg.into())),
     };
-    // NIP-43: relay admin commands are global — channel-scoped tokens cannot
-    // issue them even if the event has no `h` tag (is_global_only_kind strips
-    // channel_id, but we still need to reject the token itself).
-    if is_relay_admin_kind(kind_u32) && auth.channel_ids().is_some() {
-        return Err(IngestError::AuthFailed(
-            "restricted: relay admin commands require a global token, not a channel-scoped token"
-                .into(),
-        ));
-    }
-    // NIP-43: leave requests are also global — channel-scoped tokens cannot
-    // issue them.
-    if kind_u32 == KIND_NIP43_LEAVE_REQUEST && auth.channel_ids().is_some() {
-        return Err(IngestError::AuthFailed(
-            "restricted: leave requests require a global token".into(),
-        ));
-    }
-    if !auth.scopes().contains(&required) {
-        return Err(IngestError::AuthFailed(format!(
-            "restricted: insufficient scope (need {})",
-            required
-        )));
-    }
+    let kind_u32 = event_kind_u32(&event);
+    let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
+    let now = chrono::Utc::now().timestamp();
 
     // Command kinds are routed AFTER signature verification, timestamp check,
     // pubkey/auth match, and scope validation — never before.
     if buzz_core::kind::is_command_kind(kind_u32) {
-        return super::command_executor::handle_command(tenant, state, event, auth).await;
+        return super::command_executor::handle_command(tenant, state, event, auth)
+            .await
+            .map_err(IngestInnerOutcome::from);
     }
 
     // Product feedback is sidecarred directly into its private deployment table.
@@ -2368,23 +3700,29 @@ async fn ingest_event_inner(
     // the restriction-state cache (see should-fix), which can fold in owner
     // resolution without a per-write DB round-trip.
     if !buzz_core::kind::is_moderation_command_kind(kind_u32) && !is_relay_admin_kind(kind_u32) {
-        match state
-            .db
-            .moderation_restriction_state(tenant.community(), auth.pubkey().as_bytes())
-            .await
+        match keyed_early_io(
+            keyed_early.as_deref(),
+            state
+                .db
+                .moderation_restriction_state(tenant.community(), auth.pubkey().as_bytes()),
+        )
+        .await
+        .map_err(IngestInnerOutcome::from)?
         {
             Ok(r) => {
                 if r.banned {
                     return Err(IngestError::AuthFailed(
                         "blocked: you are banned from this community".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 if let Some(until) = r.muted_until {
                     if until > chrono::Utc::now() {
                         return Err(IngestError::AuthFailed(format!(
                             "restricted: you are timed out until {}",
                             until.timestamp()
-                        )));
+                        ))
+                        .into());
                     }
                 }
             }
@@ -2393,29 +3731,39 @@ async fn ingest_event_inner(
                 // write.
                 return Err(IngestError::Internal(format!(
                     "error: internal error checking restriction state: {e}"
-                )));
+                ))
+                .into());
             }
         }
     }
 
     let mut channel_id = if kind_u32 == KIND_REACTION {
-        match derive_reaction_channel(tenant.community(), &state.db, &event).await {
+        match keyed_early_io(
+            keyed_early.as_deref(),
+            derive_reaction_channel(tenant.community(), &state.db, &event),
+        )
+        .await
+        .map_err(IngestInnerOutcome::from)?
+        {
             ReactionChannelResult::Channel(ch_id) => Some(ch_id),
             ReactionChannelResult::NoChannel => None,
             ReactionChannelResult::NotFound => {
                 return Err(IngestError::Rejected(
                     "invalid: reaction target event not found".into(),
-                ));
+                )
+                .into());
             }
             ReactionChannelResult::NoTarget => {
                 return Err(IngestError::Rejected(
                     "invalid: reaction must reference a target event via e tag".into(),
-                ));
+                )
+                .into());
             }
             ReactionChannelResult::DbError(e) => {
                 return Err(IngestError::Internal(format!(
                     "error: internal error looking up reaction target: {e}"
-                )));
+                ))
+                .into());
             }
         }
     } else if is_gift_wrap {
@@ -2443,17 +3791,22 @@ async fn ingest_event_inner(
                 let target_bytes = hex::decode(&hex).map_err(|_| {
                     IngestError::Rejected("invalid: malformed deletion target id".into())
                 })?;
-                match state
-                    .db
-                    .get_event_by_id_for_event_write(tenant.community(), &target_bytes)
-                    .await
+                match keyed_early_io(
+                    keyed_early.as_deref(),
+                    state
+                        .db
+                        .get_event_by_id_for_event_write(tenant.community(), &target_bytes),
+                )
+                .await
+                .map_err(IngestInnerOutcome::from)?
                 {
                     Ok(Some(target)) => target.channel_id,
                     Ok(None) => None, // target not found — validate_standard_deletion will catch this
                     Err(e) => {
                         return Err(IngestError::Internal(format!(
                             "error: looking up deletion target: {e}"
-                        )));
+                        ))
+                        .into());
                     }
                 }
             }
@@ -2470,7 +3823,8 @@ async fn ingest_event_inner(
     if requires_h_channel_scope(kind_u32) && channel_id.is_none() {
         return Err(IngestError::Rejected(
             "invalid: channel-scoped events must include an h tag".into(),
-        ));
+        )
+        .into());
     }
 
     if let Some(ch_id) = channel_id {
@@ -2482,7 +3836,8 @@ async fn ingest_event_inner(
         // without an h-tag, which would auto-assign a server UUID).
         return Err(IngestError::AuthFailed(
             "restricted: channel-scoped tokens cannot publish global events".into(),
-        ));
+        )
+        .into());
     }
 
     let pubkey_bytes = auth.pubkey().to_bytes().to_vec();
@@ -2493,11 +3848,15 @@ async fn ingest_event_inner(
     // it later in this request); each gate keeps its existing missing-row
     // behavior.
     let channel_row = match channel_id {
-        Some(ch_id) => state
-            .db
-            .get_channel_for_event_write(tenant.community(), ch_id)
-            .await
-            .ok(),
+        Some(ch_id) => keyed_early_io(
+            keyed_early.as_deref(),
+            state
+                .db
+                .get_channel_for_event_write(tenant.community(), ch_id),
+        )
+        .await
+        .map_err(IngestInnerOutcome::from)?
+        .ok(),
         None => None,
     };
     // E1 phase-2 (§4.8 phase-2 addendum): resolve the fan-out visibility once,
@@ -2509,15 +3868,18 @@ async fn ingest_event_inner(
     // fan-out performs its own fresh fail-closed lookup — `None` is never
     // "assume open" (fence 1).
     let threaded_visibility = match (channel_id, &channel_row) {
-        (Some(ch_id), Some(row)) => state
-            .channel_visibility_cached(tenant.community(), ch_id, Some(row))
-            .await
-            .ok()
-            .map(|visibility| crate::state::ThreadedChannelVisibility {
-                community_id: tenant.community(),
-                channel_id: ch_id,
-                visibility,
-            }),
+        (Some(ch_id), Some(row)) => keyed_early_io(
+            keyed_early.as_deref(),
+            state.channel_visibility_cached(tenant.community(), ch_id, Some(row)),
+        )
+        .await
+        .map_err(IngestInnerOutcome::from)?
+        .ok()
+        .map(|visibility| crate::state::ThreadedChannelVisibility {
+            community_id: tenant.community(),
+            channel_id: ch_id,
+            visibility,
+        }),
         _ => None,
     };
     if let Some(ch_id) = channel_id {
@@ -2543,9 +3905,12 @@ async fn ingest_event_inner(
             // at `check_channel_membership`'s `is_member_cached(tenant
             // .community(), …)` call (see crates/buzz-relay/src/handlers
             // /ingest.rs:424).
-            let auth_result =
-                check_channel_membership(tenant, state, ch_id, &pubkey_bytes, channel_row.as_ref())
-                    .await;
+            let auth_result = keyed_early_io(
+                keyed_early.as_deref(),
+                check_channel_membership(tenant, state, ch_id, &pubkey_bytes, channel_row.as_ref()),
+            )
+            .await
+            .map_err(IngestInnerOutcome::from)?;
             let claimed = claimed_community_from_event(&event);
             let verdict = if auth_result.is_ok() {
                 Verdict::Allow
@@ -2583,9 +3948,9 @@ async fn ingest_event_inner(
     // Handled directly — removes the sender from relay_members. NOT stored.
     if kind_u32 == KIND_NIP43_LEAVE_REQUEST {
         if !state.config.require_relay_membership {
-            return Err(IngestError::Rejected(
-                "invalid: relay membership is not enabled".into(),
-            ));
+            return Err(
+                IngestError::Rejected("invalid: relay membership is not enabled".into()).into(),
+            );
         }
 
         // Freshness check: reject events outside ±120s of now (same as admin commands).
@@ -2599,7 +3964,8 @@ async fn ingest_event_inner(
                 return Err(IngestError::Rejected(format!(
                     "invalid: leave request timestamp out of range (delta={}s, max ±120s)",
                     event_ts - now
-                )));
+                ))
+                .into());
             }
         }
 
@@ -2611,7 +3977,8 @@ async fn ingest_event_inner(
         if !has_protected_tag {
             return Err(IngestError::Rejected(
                 "invalid: leave request must include NIP-70 protected event tag [\"-\"]".into(),
-            ));
+            )
+            .into());
         }
 
         let sender_hex = event.pubkey.to_hex();
@@ -2626,21 +3993,22 @@ async fn ingest_event_inner(
         match remove_result {
             buzz_db::relay_members::RemoveResult::Removed => {}
             buzz_db::relay_members::RemoveResult::NotFound => {
-                return Err(IngestError::Rejected(
-                    "invalid: you are not a relay member".into(),
-                ));
+                return Err(
+                    IngestError::Rejected("invalid: you are not a relay member".into()).into(),
+                );
             }
             buzz_db::relay_members::RemoveResult::IsOwner => {
-                return Err(IngestError::Rejected(
-                    "invalid: relay owner cannot leave".into(),
-                ));
+                return Err(
+                    IngestError::Rejected("invalid: relay owner cannot leave".into()).into(),
+                );
             }
             buzz_db::relay_members::RemoveResult::RoleMismatch => {
                 // remove_relay_member (no role filter) never returns RoleMismatch —
                 // this arm is unreachable but exhaustiveness requires it.
                 return Err(IngestError::Internal(
                     "unexpected RoleMismatch from remove_relay_member".into(),
-                ));
+                )
+                .into());
             }
         }
 
@@ -2666,12 +4034,21 @@ async fn ingest_event_inner(
         });
     }
 
-    validate_huddle_lifecycle_event(tenant, state, &event, kind_u32).await?;
+    keyed_early_io(
+        keyed_early.as_deref(),
+        validate_huddle_lifecycle_event(tenant, state, &event, kind_u32),
+    )
+    .await
+    .map_err(IngestInnerOutcome::from)??;
 
     if crate::handlers::side_effects::is_admin_kind(kind_u32) {
-        crate::handlers::side_effects::validate_admin_event(tenant, kind_u32, &event, state)
-            .await
-            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        keyed_early_io(
+            keyed_early.as_deref(),
+            crate::handlers::side_effects::validate_admin_event(tenant, kind_u32, &event, state),
+        )
+        .await
+        .map_err(IngestInnerOutcome::from)?
+        .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
     // Processed here (verify consent, mutate archived_identities, emit the
@@ -2685,9 +4062,13 @@ async fn ingest_event_inner(
     }
 
     if kind_u32 == KIND_DELETION {
-        crate::handlers::side_effects::validate_standard_deletion_event(tenant, &event, state)
-            .await
-            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        keyed_early_io(
+            keyed_early.as_deref(),
+            crate::handlers::side_effects::validate_standard_deletion_event(tenant, &event, state),
+        )
+        .await
+        .map_err(IngestInnerOutcome::from)?
+        .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
     if channel_id.is_some() {
@@ -2701,7 +4082,7 @@ async fn ingest_event_inner(
         if !is_unarchive {
             if let Some(channel) = &channel_row {
                 if channel.archived_at.is_some() {
-                    return Err(IngestError::Rejected("invalid: channel is archived".into()));
+                    return Err(IngestError::Rejected("invalid: channel is archived".into()).into());
                 }
             }
         }
@@ -2719,20 +4100,29 @@ async fn ingest_event_inner(
         if (e_count + a_count) != 1 {
             return Err(IngestError::Rejected(format!(
                 "invalid: deletion events must reference exactly one target via e or a tag (got e={e_count}, a={a_count})"
-            )));
+            ))
+            .into());
         }
     }
 
     if kind_u32 == KIND_STREAM_MESSAGE_EDIT {
-        validate_edit_ownership(tenant.community(), &event, state)
-            .await
-            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        keyed_early_io(
+            keyed_early.as_deref(),
+            validate_edit_ownership(tenant.community(), &event, state),
+        )
+        .await
+        .map_err(IngestInnerOutcome::from)?
+        .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
     if kind_u32 == KIND_FORUM_VOTE {
-        validate_forum_vote_target(tenant.community(), &event, state)
-            .await
-            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        keyed_early_io(
+            keyed_early.as_deref(),
+            validate_forum_vote_target(tenant.community(), &event, state),
+        )
+        .await
+        .map_err(IngestInnerOutcome::from)?
+        .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
     if kind_u32 == KIND_STREAM_MESSAGE_DIFF {
@@ -2764,20 +4154,25 @@ async fn ingest_event_inner(
             .expect("p tag present (validated above)");
         let agent_bytes = event.pubkey.to_bytes().to_vec();
         let owner_bytes = hex::decode(owner_hex).expect("hex validated above");
-        let is_owner = state
-            .db
-            .is_agent_owner(tenant.community(), &agent_bytes, &owner_bytes)
-            .await
-            .map_err(|e| {
-                IngestError::Internal(format!(
-                    "error: db error checking agent-turn-metric ownership: {e}"
-                ))
-            })?;
+        let is_owner = keyed_early_io(
+            keyed_early.as_deref(),
+            state
+                .db
+                .is_agent_owner(tenant.community(), &agent_bytes, &owner_bytes),
+        )
+        .await
+        .map_err(IngestInnerOutcome::from)?
+        .map_err(|e| {
+            IngestError::Internal(format!(
+                "error: db error checking agent-turn-metric ownership: {e}"
+            ))
+        })?;
         if !is_owner {
             return Err(IngestError::AuthFailed(
                 "restricted: agent-turn-metric `p` tag must be the registered owner of this agent"
                     .into(),
-            ));
+            )
+            .into());
         }
     }
 
@@ -2822,9 +4217,7 @@ async fn ingest_event_inner(
             })
             .unwrap_or(true)
         {
-            return Err(IngestError::Rejected(
-                "invalid: channel name is required".into(),
-            ));
+            return Err(IngestError::Rejected("invalid: channel name is required".into()).into());
         }
 
         // Validate visibility/channel_type for ALL kind:9007 events (with or without h-tag).
@@ -2912,17 +4305,18 @@ async fn ingest_event_inner(
         if channel_id.is_none() {
             return Err(IngestError::Rejected(
                 "invalid: join request must include an h tag".into(),
-            ));
+            )
+            .into());
         }
         if channel_id.is_some() {
             match &channel_row {
                 Some(ch) if ch.visibility == "private" => {
-                    return Err(IngestError::Rejected(
-                        "restricted: channel is private".into(),
-                    ));
+                    return Err(
+                        IngestError::Rejected("restricted: channel is private".into()).into(),
+                    );
                 }
                 None => {
-                    return Err(IngestError::Rejected("invalid: channel not found".into()));
+                    return Err(IngestError::Rejected("invalid: channel not found".into()).into());
                 }
                 _ => {} // open — OK
             }
@@ -2936,30 +4330,26 @@ async fn ingest_event_inner(
         match outcome {
             buzz_db::push::AcceptLeaseOutcome::Accepted => {}
             buzz_db::push::AcceptLeaseOutcome::StaleEvent => {
-                return Err(IngestError::Rejected("invalid: stale replacement".into()));
+                return Err(IngestError::Rejected("invalid: stale replacement".into()).into());
             }
             buzz_db::push::AcceptLeaseOutcome::StaleGeneration => {
-                return Err(IngestError::Rejected("invalid: stale generation".into()));
+                return Err(IngestError::Rejected("invalid: stale generation".into()).into());
             }
             buzz_db::push::AcceptLeaseOutcome::EndpointAlreadyLeased => {
-                return Err(IngestError::Rejected(
-                    "invalid: endpoint already leased".into(),
-                ));
+                return Err(
+                    IngestError::Rejected("invalid: endpoint already leased".into()).into(),
+                );
             }
             buzz_db::push::AcceptLeaseOutcome::LeaseQuotaExceeded => {
-                return Err(IngestError::Rejected(
-                    "invalid: lease quota exceeded".into(),
-                ));
+                return Err(IngestError::Rejected("invalid: lease quota exceeded".into()).into());
             }
             buzz_db::push::AcceptLeaseOutcome::SourceEventCollision => {
-                return Err(IngestError::Rejected(
-                    "invalid: source event collision".into(),
-                ));
+                return Err(IngestError::Rejected("invalid: source event collision".into()).into());
             }
             buzz_db::push::AcceptLeaseOutcome::ConstraintViolation => {
-                return Err(IngestError::Rejected(
-                    "invalid: lease constraint violation".into(),
-                ));
+                return Err(
+                    IngestError::Rejected("invalid: lease constraint violation".into()).into(),
+                );
             }
         };
         emit(
@@ -2993,16 +4383,24 @@ async fn ingest_event_inner(
     if !imeta_tags.is_empty() {
         crate::api::validate_imeta_tags(&imeta_tags, &tenant_media_base)
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
-        crate::api::verify_imeta_blobs(tenant, &imeta_tags, &state.media_storage)
-            .await
-            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        keyed_early_io(
+            keyed_early.as_deref(),
+            crate::api::verify_imeta_blobs(tenant, &imeta_tags, &state.media_storage),
+        )
+        .await
+        .map_err(IngestInnerOutcome::from)?
+        .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
     let thread_meta = if requires_h_channel_scope(kind_u32) {
         if let Some(ch_id) = channel_id {
-            resolve_nip10_thread_meta(tenant.community(), &event, ch_id, state)
-                .await
-                .map_err(|msg| IngestError::Rejected(format!("invalid: {msg}")))?
+            keyed_early_io(
+                keyed_early.as_deref(),
+                resolve_nip10_thread_meta(tenant.community(), &event, ch_id, state),
+            )
+            .await
+            .map_err(IngestInnerOutcome::from)?
+            .map_err(|msg| IngestError::Rejected(format!("invalid: {msg}")))?
         } else {
             None
         }
@@ -3015,9 +4413,9 @@ async fn ingest_event_inner(
     if kind_u32 == KIND_PROFILE
         && serde_json::from_str::<serde_json::Value>(&event.content).is_err()
     {
-        return Err(IngestError::Rejected(
-            "invalid: kind:0 content must be valid JSON".into(),
-        ));
+        return Err(
+            IngestError::Rejected("invalid: kind:0 content must be valid JSON".into()).into(),
+        );
     }
 
     if kind_u32 == KIND_EMOJI_SET || kind_u32 == KIND_EMOJI_LIST {
@@ -3085,7 +4483,8 @@ async fn ingest_event_inner(
             buzz_db::ReactionEventInsertOutcome::TargetMissing => {
                 return Err(IngestError::Rejected(
                     "invalid: reaction target event not found".into(),
-                ));
+                )
+                .into());
             }
             buzz_db::ReactionEventInsertOutcome::Duplicate => {
                 return Ok(IngestResult {
@@ -3160,7 +4559,8 @@ async fn ingest_event_inner(
                 "invalid: d tag too long ({} bytes, max {})",
                 d_tag.len(),
                 buzz_db::event::D_TAG_MAX_LEN,
-            )));
+            ))
+            .into());
         }
         state
             .db
@@ -3169,36 +4569,325 @@ async fn ingest_event_inner(
             .map_err(|e| IngestError::Internal(format!("error: {e}")))?
     } else {
         let thread_params = thread_meta.as_ref().map(|m| m.as_params());
-        match state
-            .db
-            .insert_event_with_thread_metadata(
-                tenant.community(),
-                &event,
-                channel_id,
-                thread_params,
+        if let Some(key) = idempotency_key {
+            let author = event.pubkey.to_bytes();
+            let prepared = match buzz_db::Db::prepare_keyed_stream_intent(key, &event) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return Err(
+                        IngestError::Internal(format!("error: database error: {error}")).into(),
+                    );
+                }
+            };
+            let classify_budget = keyed_early
+                .as_ref()
+                .map(|early| early.deadline.remaining())
+                .filter(|remaining| !remaining.is_zero())
+                .unwrap_or(if keyed_early.is_some() {
+                    Duration::from_secs(0)
+                } else {
+                    KEYED_RESERVATION_PERSIST_BUDGET
+                });
+            if keyed_early.is_some() && classify_budget.is_zero() {
+                return Err(IngestInnerOutcome::from(keyed_busy_default()));
+            }
+            let committed = match tokio::time::timeout(
+                classify_budget,
+                state.db.classify_keyed_stream_before_admission(
+                    tenant.community(),
+                    &prepared,
+                    &event,
+                    channel_id,
+                    thread_params.as_ref(),
+                ),
             )
             .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                // Compensate: if we pre-created a channel for kind:9007,
-                // soft-delete it so no orphaned channel row remains.
-                if let Some(ch_id) = pre_created_channel {
-                    if let Err(re) = state
-                        .db
-                        .soft_delete_channel(tenant.community(), ch_id)
-                        .await
-                    {
-                        warn!(event_id = %event_id_hex, "channel compensation failed: {re}");
-                    }
-                    state.invalidate_channel_deleted(tenant);
+            {
+                Err(_elapsed) => {
+                    return Err(IngestInnerOutcome::from(keyed_busy_default()));
                 }
-                return Err(match e {
-                    buzz_db::DbError::AuthEventRejected => {
-                        IngestError::Rejected("invalid: AUTH events cannot be stored".into())
+                Ok(Ok(committed)) => committed,
+                Ok(Err(error)) if error.is_idempotency_unavailable() => {
+                    return Err(IngestInnerOutcome::from(keyed_busy_default()));
+                }
+                Ok(Err(error)) if error.is_idempotency_unsupported_kind() => {
+                    return Err(IngestError::Rejected(
+                        "invalid: Idempotency-Key is not supported for this event kind".into(),
+                    )
+                    .into());
+                }
+                Ok(Err(error)) if error.is_idempotency_too_many_mentions() => {
+                    return Err(IngestError::Rejected(
+                        "invalid: too many p tags for keyed ingest".into(),
+                    )
+                    .into());
+                }
+                Ok(Err(e)) => {
+                    if let Some(ch_id) = pre_created_channel {
+                        if let Err(re) = state
+                            .db
+                            .soft_delete_channel(tenant.community(), ch_id)
+                            .await
+                        {
+                            warn!(event_id = %event_id_hex, "channel compensation failed: {re}");
+                        }
+                        state.invalidate_channel_deleted(tenant);
                     }
-                    other => IngestError::Internal(format!("error: database error: {other}")),
+                    return Err(IngestInnerOutcome::from(match e {
+                        buzz_db::DbError::AuthEventRejected => {
+                            IngestError::Rejected("invalid: AUTH events cannot be stored".into())
+                        }
+                        other => IngestError::Internal(format!("error: database error: {other}")),
+                    }));
+                }
+            };
+            let admit_budget = keyed_early
+                .as_ref()
+                .map(|early| early.deadline.remaining())
+                .filter(|remaining| !remaining.is_zero())
+                .unwrap_or(if keyed_early.is_some() {
+                    Duration::from_secs(0)
+                } else {
+                    KEYED_RESERVATION_ADMISSION_BUDGET
                 });
+            if keyed_early.is_some() && admit_budget.is_zero() {
+                return Err(IngestInnerOutcome::from(keyed_busy_default()));
+            }
+            match tokio::time::timeout(
+                admit_budget,
+                finish_keyed_committed_classify(
+                    committed,
+                    state.admission_rate_limiter.as_ref(),
+                    tenant,
+                    auth.pubkey(),
+                    state.auth.config().rate_limits.human_api_calls_per_min,
+                ),
+            )
+            .await
+            {
+                Err(_elapsed) => {
+                    return Err(IngestInnerOutcome::from(keyed_busy_default()));
+                }
+                Ok(classified) => match classified {
+                    Ok(Some(buzz_db::idempotency::KeyedCommittedOutcome::Replay {
+                        original_event_id,
+                    })) => {
+                        keyed.stored = Some(keyed_duplicate_stored_metric());
+                        let claimed = claimed_community_from_event(&event);
+                        let action = match channel_id {
+                            Some(ch) => TraceAction::WriteDuplicate {
+                                msg_id: msg_id_label(&original_event_id),
+                                channel: channel_label(ch),
+                                claimed_community: claimed,
+                            },
+                            None => TraceAction::WriteInsertGlobal {
+                                msg_id: msg_id_label(&original_event_id),
+                                claimed_community: claimed,
+                            },
+                        };
+                        emit(tracer, action, state_for_request(tenant, auth.pubkey()));
+                        return Ok(keyed_accepted_duplicate_result(original_event_id));
+                    }
+                    Ok(Some(buzz_db::idempotency::KeyedCommittedOutcome::Conflict { .. })) => {
+                        return Err(IngestInnerOutcome::Conflict);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return Err(IngestInnerOutcome::from(error));
+                    }
+                },
+            }
+            if let Some(early) = keyed_early.as_mut() {
+                early.release_ingress();
+            }
+            let reservation = match tokio::time::timeout(
+                KEYED_RESERVATION_PERSIST_BUDGET,
+                state.db.begin_keyed_stream_reservation(
+                    tenant.community(),
+                    &prepared,
+                    &event,
+                    channel_id,
+                    thread_params.as_ref(),
+                ),
+            )
+            .await
+            {
+                Err(_elapsed) => {
+                    return Err(IngestInnerOutcome::from(keyed_busy_default()));
+                }
+                Ok(Ok(buzz_db::idempotency::KeyedReserveOutcome::Replay { original_event_id })) => {
+                    keyed.stored = Some(keyed_duplicate_stored_metric());
+                    let claimed = claimed_community_from_event(&event);
+                    let action = match channel_id {
+                        Some(ch) => TraceAction::WriteDuplicate {
+                            msg_id: msg_id_label(&original_event_id),
+                            channel: channel_label(ch),
+                            claimed_community: claimed,
+                        },
+                        None => TraceAction::WriteInsertGlobal {
+                            msg_id: msg_id_label(&original_event_id),
+                            claimed_community: claimed,
+                        },
+                    };
+                    emit(tracer, action, state_for_request(tenant, auth.pubkey()));
+                    return Ok(keyed_accepted_duplicate_result(original_event_id));
+                }
+                Ok(Ok(buzz_db::idempotency::KeyedReserveOutcome::Conflict { .. })) => {
+                    return Err(IngestInnerOutcome::Conflict);
+                }
+                Ok(Ok(buzz_db::idempotency::KeyedReserveOutcome::Reserved(reservation))) => {
+                    *reservation
+                }
+                Ok(Err(error)) if error.is_idempotency_unavailable() => {
+                    return Err(IngestInnerOutcome::from(keyed_busy_default()));
+                }
+                Ok(Err(error)) if error.is_idempotency_unsupported_kind() => {
+                    return Err(IngestError::Rejected(
+                        "invalid: Idempotency-Key is not supported for this event kind".into(),
+                    )
+                    .into());
+                }
+                Ok(Err(error)) if error.is_idempotency_too_many_mentions() => {
+                    return Err(IngestError::Rejected(
+                        "invalid: too many p tags for keyed ingest".into(),
+                    )
+                    .into());
+                }
+                Ok(Err(e)) => {
+                    if let Some(ch_id) = pre_created_channel {
+                        if let Err(re) = state
+                            .db
+                            .soft_delete_channel(tenant.community(), ch_id)
+                            .await
+                        {
+                            warn!(event_id = %event_id_hex, "channel compensation failed: {re}");
+                        }
+                        state.invalidate_channel_deleted(tenant);
+                    }
+                    return Err(IngestInnerOutcome::from(match e {
+                        buzz_db::DbError::AuthEventRejected => {
+                            IngestError::Rejected("invalid: AUTH events cannot be stored".into())
+                        }
+                        other => IngestError::Internal(format!("error: database error: {other}")),
+                    }));
+                }
+            };
+            let permits =
+                match acquire_keyed_writer_permits(*tenant.community().as_uuid(), &author, &key) {
+                    Ok(permits) => permits,
+                    Err(busy) => {
+                        abort_keyed_reservation(reservation).await;
+                        return Err(IngestInnerOutcome::from(busy));
+                    }
+                };
+            let outcome =
+                complete_keyed_reservation(reservation, &prepared, &event, thread_params).await;
+            drop(permits);
+            match outcome {
+                Ok(insert) => match insert.into_fresh_stored_event() {
+                    Ok(stored_event) => {
+                        keyed.stored = Some(keyed_inserted_stored_metric());
+                        (*stored_event, true)
+                    }
+                    Err(buzz_db::KeyedStreamInsert::BoundExisting { event_id })
+                    | Err(buzz_db::KeyedStreamInsert::Replay {
+                        original_event_id: event_id,
+                    }) => {
+                        keyed.stored = Some(keyed_duplicate_stored_metric());
+                        let claimed = claimed_community_from_event(&event);
+                        let action = match channel_id {
+                            Some(ch) => TraceAction::WriteDuplicate {
+                                msg_id: msg_id_label(&event_id),
+                                channel: channel_label(ch),
+                                claimed_community: claimed,
+                            },
+                            None => TraceAction::WriteInsertGlobal {
+                                msg_id: msg_id_label(&event_id),
+                                claimed_community: claimed,
+                            },
+                        };
+                        emit(tracer, action, state_for_request(tenant, auth.pubkey()));
+                        return Ok(keyed_accepted_duplicate_result(event_id));
+                    }
+                    Err(buzz_db::KeyedStreamInsert::Conflict { .. }) => {
+                        return Err(IngestInnerOutcome::Conflict);
+                    }
+                    Err(
+                        buzz_db::KeyedStreamInsert::Inserted { .. }
+                        | buzz_db::KeyedStreamInsert::RecoveredFresh { .. },
+                    ) => {
+                        return Err(IngestError::Internal(
+                            "error: keyed persist classification".into(),
+                        )
+                        .into());
+                    }
+                },
+                Err(error) if error.is_idempotency_unavailable() => {
+                    return Err(IngestInnerOutcome::from(keyed_busy_default()));
+                }
+                Err(error) if error.is_idempotency_unsupported_kind() => {
+                    return Err(IngestError::Rejected(
+                        "invalid: Idempotency-Key is not supported for this event kind".into(),
+                    )
+                    .into());
+                }
+                Err(error) if error.is_idempotency_too_many_mentions() => {
+                    return Err(IngestError::Rejected(
+                        "invalid: too many p tags for keyed ingest".into(),
+                    )
+                    .into());
+                }
+                Err(e) => {
+                    if let Some(ch_id) = pre_created_channel {
+                        if let Err(re) = state
+                            .db
+                            .soft_delete_channel(tenant.community(), ch_id)
+                            .await
+                        {
+                            warn!(event_id = %event_id_hex, "channel compensation failed: {re}");
+                        }
+                        state.invalidate_channel_deleted(tenant);
+                    }
+                    return Err(IngestInnerOutcome::from(match e {
+                        buzz_db::DbError::AuthEventRejected => {
+                            IngestError::Rejected("invalid: AUTH events cannot be stored".into())
+                        }
+                        other => IngestError::Internal(format!("error: database error: {other}")),
+                    }));
+                }
+            }
+        } else {
+            match state
+                .db
+                .insert_event_with_thread_metadata(
+                    tenant.community(),
+                    &event,
+                    channel_id,
+                    thread_params,
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    // Compensate: if we pre-created a channel for kind:9007,
+                    // soft-delete it so no orphaned channel row remains.
+                    if let Some(ch_id) = pre_created_channel {
+                        if let Err(re) = state
+                            .db
+                            .soft_delete_channel(tenant.community(), ch_id)
+                            .await
+                        {
+                            warn!(event_id = %event_id_hex, "channel compensation failed: {re}");
+                        }
+                        state.invalidate_channel_deleted(tenant);
+                    }
+                    return Err(IngestInnerOutcome::from(match e {
+                        buzz_db::DbError::AuthEventRejected => {
+                            IngestError::Rejected("invalid: AUTH events cannot be stored".into())
+                        }
+                        other => IngestError::Internal(format!("error: database error: {other}")),
+                    }));
+                }
             }
         }
     };
@@ -3289,17 +4978,20 @@ async fn ingest_event_inner(
 }
 
 #[cfg(test)]
-mod postgres_tests {
+mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use buzz_auth::rate_limit::{PairedAdmissionOutcome, PairedAdmissionRequest};
+    use buzz_auth::RateLimiter;
     use buzz_conformance::{TraceStep, Tracer};
     use buzz_core::kind::{
         KIND_CANVAS, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_LONG_FORM,
         KIND_MANAGED_AGENT, KIND_PERSONA, KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE,
         KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
     };
-    use nostr::{EventBuilder, Kind};
+    use buzz_core::{CommunityId, TenantContext};
+    use nostr::{EventBuilder, Kind, Tag, Timestamp};
 
     #[test]
     fn missing_huddle_backing_channel_is_a_client_rejection() {
@@ -3529,17 +5221,13 @@ mod postgres_tests {
     /// Production-path regression: the exact predicate `ingest_event_inner`
     /// consults must admit writes while a community is active and refuse them
     /// once the community deletion lifecycle fences it.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn ingest_write_fence_follows_community_deletion_lifecycle() {
+    pub(crate) async fn ingest_write_fence_follows_community_deletion_lifecycle() {
         use buzz_db::deletion::{
             FrozenInventory, KeyStreamDigest, PrefixManifest, StorageManifest,
             DEFAULT_LEASE_DURATION,
         };
 
-        let url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1
+        let url = crate::test_support::database_url();
         let pool = sqlx::PgPool::connect(&url).await.expect("connect test DB");
         let db = buzz_db::Db::from_pool(pool);
         if std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref() != Ok("desired") {
@@ -4087,6 +5775,2222 @@ mod postgres_tests {
             !ws_auth.is_http(),
             "Nip42 variant should return false for is_http()"
         );
+    }
+
+    #[test]
+    fn keyed_inserted_increments_stored_metric() {
+        assert!(keyed_http_should_increment_stored(Some(
+            keyed_inserted_stored_metric()
+        )));
+        assert_eq!(keyed_inserted_stored_metric(), KeyedStoredMetric::Increment);
+    }
+
+    #[test]
+    fn keyed_recovered_fresh_classification_reaches_the_same_fresh_branch() {
+        // Ingest persist classifies through `into_fresh_stored_event`: Ok is
+        // the fresh branch for both Inserted and RecoveredFresh (dispatch,
+        // side effects, WriteInsert, stored metric, accepted). Replay and
+        // BoundExisting stay duplicate; Conflict stays failure.
+        let replay = buzz_db::KeyedStreamInsert::Replay {
+            original_event_id: [0x11; 32],
+        };
+        let bound = buzz_db::KeyedStreamInsert::BoundExisting {
+            event_id: [0x22; 32],
+        };
+        let conflict = buzz_db::KeyedStreamInsert::Conflict {
+            existing_event_id: [0x33; 32],
+        };
+        assert!(!replay.should_dispatch());
+        assert!(!bound.should_dispatch());
+        assert!(!conflict.should_dispatch());
+
+        let replay = replay
+            .into_fresh_stored_event()
+            .expect_err("replay is not fresh");
+        let bound = bound
+            .into_fresh_stored_event()
+            .expect_err("bound-existing is not fresh");
+        let conflict = conflict
+            .into_fresh_stored_event()
+            .expect_err("conflict is not fresh");
+        assert!(matches!(
+            replay,
+            buzz_db::KeyedStreamInsert::Replay {
+                original_event_id
+            } if original_event_id == [0x11; 32]
+        ));
+        assert!(matches!(
+            bound,
+            buzz_db::KeyedStreamInsert::BoundExisting { event_id }
+                if event_id == [0x22; 32]
+        ));
+        assert!(matches!(
+            conflict,
+            buzz_db::KeyedStreamInsert::Conflict { .. }
+        ));
+        assert!(!replay.should_dispatch());
+        assert!(!bound.should_dispatch());
+        assert!(!conflict.should_dispatch());
+        assert!(keyed_http_should_increment_stored(Some(
+            keyed_inserted_stored_metric()
+        )));
+        assert!(!keyed_http_should_increment_stored(Some(
+            keyed_duplicate_stored_metric()
+        )));
+    }
+
+    #[test]
+    fn keyed_replay_and_bound_existing_do_not_increment_stored_metric() {
+        let skip = keyed_duplicate_stored_metric();
+        assert_eq!(skip, KeyedStoredMetric::Skip);
+        assert!(!keyed_http_should_increment_stored(Some(skip)));
+        assert!(!keyed_http_should_increment_stored(None));
+    }
+
+    #[test]
+    fn keyed_duplicate_response_stays_accepted_with_original_event_id() {
+        let original = [0xab; 32];
+        let result = keyed_accepted_duplicate_result(original);
+        assert!(result.accepted);
+        assert_eq!(result.event_id, hex::encode(original));
+        assert_eq!(result.message, "duplicate:");
+        assert!(!keyed_http_should_increment_stored(Some(
+            keyed_duplicate_stored_metric()
+        )));
+    }
+
+    #[test]
+    fn keyed_kind_and_p_tag_gates_reject_before_fleet_persist() {
+        assert!(
+            !buzz_core::idempotency::supports_keyed_kind(1),
+            "unsupported kinds fail before the keyed persist/fleet branch"
+        );
+        assert!(buzz_core::idempotency::supports_keyed_kind(
+            KIND_STREAM_MESSAGE
+        ));
+        assert_eq!(buzz_core::idempotency::KEYED_MAX_P_TAGS, 64);
+    }
+
+    fn keyed_http_auth(pubkey: nostr::PublicKey) -> IngestAuth {
+        IngestAuth::Http {
+            pubkey,
+            scopes: Scope::all_known(),
+            auth_method: HttpAuthMethod::Nip98,
+        }
+    }
+
+    fn signed_kind9(keys: &nostr::Keys, content: &str, extra_tags: Vec<Tag>) -> Event {
+        let expected_tag_count = extra_tags.len();
+        let event = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), content)
+            .tags(extra_tags)
+            .allow_self_tagging()
+            .sign_with_keys(keys)
+            .expect("sign kind 9");
+        assert_eq!(event.tags.len(), expected_tag_count);
+        event
+    }
+
+    fn repeated_p_tags(count: usize, value: &str) -> Vec<Tag> {
+        (0..count)
+            .map(|_| Tag::parse(["p", value]).expect("p tag"))
+            .collect()
+    }
+
+    fn assert_too_many_keyed_p_tags(err: IngestError) {
+        assert!(
+            matches!(
+                err,
+                IngestError::Rejected(ref msg)
+                    if msg == "invalid: too many p tags for keyed ingest"
+            ),
+            "expected keyed p-tag cap rejection, got {err:?}"
+        );
+    }
+
+    fn assert_too_many_unkeyed_p_tags(err: IngestError) {
+        assert!(
+            matches!(
+                err,
+                IngestError::Rejected(ref msg) if msg == "invalid: too many p tags"
+            ),
+            "expected unkeyed p-tag cap rejection, got {err:?}"
+        );
+    }
+
+    fn signed_kind1(keys: &nostr::Keys, content: &str, extra_tags: Vec<Tag>) -> Event {
+        let expected_tag_count = extra_tags.len();
+        let event = EventBuilder::new(Kind::TextNote, content)
+            .tags(extra_tags)
+            .allow_self_tagging()
+            .sign_with_keys(keys)
+            .expect("sign kind 1");
+        assert_eq!(event.tags.len(), expected_tag_count);
+        event
+    }
+
+    fn http_auth_for(keys: &nostr::Keys) -> IngestAuth {
+        keyed_http_auth(keys.public_key())
+    }
+
+    #[tokio::test]
+    async fn keyed_pre_command_validation_rejects_unsupported_kind() {
+        let keys = nostr::Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "fresh")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let err = KeyedHttpValidatedEvent::validate(event, http_auth_for(&keys))
+            .await
+            .expect_err("kind 1 is not keyed");
+        assert!(matches!(
+            err,
+            IngestError::Rejected(ref msg)
+                if msg == "invalid: Idempotency-Key is not supported for this event kind"
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyed_pre_command_validation_rejects_invalid_id_and_signature() {
+        let keys = nostr::Keys::generate();
+        let event = signed_kind9(&keys, "fresh", Vec::new());
+        let mut value = serde_json::to_value(&event).expect("json");
+        let sig = value
+            .get("sig")
+            .and_then(|v| v.as_str())
+            .expect("sig")
+            .to_owned();
+        let flipped = format!(
+            "{}{}",
+            if sig.as_bytes()[0] == b'0' { '1' } else { '0' },
+            &sig[1..]
+        );
+        value["sig"] = serde_json::Value::String(flipped);
+        let forged: Event = serde_json::from_value(value).expect("forged event");
+        let err = KeyedHttpValidatedEvent::validate(forged, http_auth_for(&keys))
+            .await
+            .expect_err("forged sig");
+        assert!(matches!(err, IngestError::Rejected(ref msg) if msg.starts_with("invalid:")));
+    }
+
+    #[tokio::test]
+    async fn keyed_pre_command_validation_rejects_stale_timestamp() {
+        let keys = nostr::Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "fresh")
+            .custom_created_at(Timestamp::from(1u64))
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let err = KeyedHttpValidatedEvent::validate(event, http_auth_for(&keys))
+            .await
+            .expect_err("stale");
+        assert!(matches!(
+            err,
+            IngestError::Rejected(ref msg)
+                if msg == "invalid: event timestamp too far from server time"
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyed_pre_command_validation_rejects_oversized_content() {
+        let keys = nostr::Keys::generate();
+        let content = "x".repeat(MAX_EVENT_CONTENT_BYTES + 1);
+        let event = signed_kind9(&keys, &content, Vec::new());
+        let err = KeyedHttpValidatedEvent::validate(event, http_auth_for(&keys))
+            .await
+            .expect_err("oversized");
+        assert!(matches!(
+            err,
+            IngestError::Rejected(ref msg)
+                if msg.starts_with("invalid: content exceeds maximum size of")
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyed_pre_command_validation_rejects_pubkey_mismatch() {
+        let author = nostr::Keys::generate();
+        let caller = nostr::Keys::generate();
+        let event = signed_kind9(&author, "fresh", Vec::new());
+        let err = KeyedHttpValidatedEvent::validate(event, http_auth_for(&caller))
+            .await
+            .expect_err("mismatch");
+        assert!(matches!(
+            err,
+            IngestError::AuthFailed(ref msg)
+                if msg == "invalid: event pubkey does not match authenticated identity"
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyed_pre_command_validation_rejects_excessive_p_tags() {
+        let keys = nostr::Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let tags: Vec<Tag> = (0..=buzz_core::idempotency::KEYED_MAX_P_TAGS)
+            .map(|_| Tag::parse(["p", &hex]).expect("p tag"))
+            .collect();
+        let event = signed_kind9(&keys, "fresh", tags);
+        let err = KeyedHttpValidatedEvent::validate(event, http_auth_for(&keys))
+            .await
+            .expect_err("p-tag bound");
+        assert!(matches!(
+            err,
+            IngestError::Rejected(ref msg) if msg == "invalid: too many p tags for keyed ingest"
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyed_pre_command_validation_accepts_supported_kind9() {
+        let keys = nostr::Keys::generate();
+        let event = signed_kind9(&keys, "fresh", Vec::new());
+        let validated = KeyedHttpValidatedEvent::validate(event, http_auth_for(&keys))
+            .await
+            .expect("kind 9 must pass pre-command checks");
+        assert_eq!(validated.event().pubkey, keys.public_key());
+        assert_eq!(event_kind_u32(validated.event()), KIND_STREAM_MESSAGE);
+    }
+
+    #[test]
+    fn keyed_timestamp_drift_accepts_inclusive_900_rejects_901_and_extreme_u64() {
+        let fixed_now: i64 = 1_700_000_000;
+        let plus_900 = (fixed_now + MAX_TIMESTAMP_DRIFT_SECS) as u64;
+        let minus_900 = (fixed_now - MAX_TIMESTAMP_DRIFT_SECS) as u64;
+        let plus_901 = (fixed_now + MAX_TIMESTAMP_DRIFT_SECS + 1) as u64;
+        let minus_901 = (fixed_now - MAX_TIMESTAMP_DRIFT_SECS - 1) as u64;
+        let extreme = (fixed_now as u64).wrapping_add(1u64 << 63);
+
+        assert!(!timestamp_drift_exceeds_max(plus_900, fixed_now));
+        assert!(!timestamp_drift_exceeds_max(minus_900, fixed_now));
+        assert!(timestamp_drift_exceeds_max(plus_901, fixed_now));
+        assert!(timestamp_drift_exceeds_max(minus_901, fixed_now));
+        assert!(timestamp_drift_exceeds_max(extreme, fixed_now));
+        assert!(timestamp_drift_exceeds_max(u64::MAX, fixed_now));
+    }
+
+    #[tokio::test]
+    async fn keyed_pre_command_validation_rejects_extreme_signed_timestamp() {
+        let keys = nostr::Keys::generate();
+        let fixed_now: i64 = 1_700_000_000;
+        let extreme = (fixed_now as u64).wrapping_add(1u64 << 63);
+        let event = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "fresh")
+            .custom_created_at(Timestamp::from(extreme))
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let err = KeyedHttpValidatedEvent::validate(event, http_auth_for(&keys))
+            .await
+            .expect_err("extreme timestamp");
+        assert!(matches!(
+            err,
+            IngestError::Rejected(ref msg)
+                if msg == "invalid: event timestamp too far from server time"
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyed_validated_event_retains_exact_auth_variant_and_scopes() {
+        let keys = nostr::Keys::generate();
+        let event = signed_kind9(&keys, "fresh", Vec::new());
+
+        let http_auth = IngestAuth::Http {
+            pubkey: keys.public_key(),
+            scopes: vec![Scope::MessagesWrite],
+            auth_method: HttpAuthMethod::DevPubkey,
+        };
+        let http_proof = KeyedHttpValidatedEvent::validate(event.clone(), http_auth)
+            .await
+            .expect("http MessagesWrite");
+        assert!(matches!(
+            http_proof.auth(),
+            IngestAuth::Http {
+                pubkey,
+                scopes,
+                auth_method: HttpAuthMethod::DevPubkey,
+            } if *pubkey == keys.public_key()
+                && scopes.as_slice() == [Scope::MessagesWrite].as_slice()
+        ));
+
+        let channel_ids = vec![Uuid::from_u128(7)];
+        let conn_id = Uuid::from_u128(11);
+        let ws_auth = IngestAuth::Nip42 {
+            pubkey: keys.public_key(),
+            scopes: vec![Scope::MessagesWrite],
+            channel_ids: Some(channel_ids.clone()),
+            conn_id,
+        };
+        let ws_proof = KeyedHttpValidatedEvent::validate(event, ws_auth)
+            .await
+            .expect("nip42 MessagesWrite");
+        assert!(matches!(
+            ws_proof.auth(),
+            IngestAuth::Nip42 {
+                pubkey,
+                scopes,
+                channel_ids: Some(ids),
+                conn_id: retained_conn,
+            } if *pubkey == keys.public_key()
+                && scopes.as_slice() == [Scope::MessagesWrite].as_slice()
+                && ids.as_slice() == channel_ids.as_slice()
+                && *retained_conn == conn_id
+        ));
+        assert_eq!(ws_proof.auth().channel_ids(), Some(channel_ids.as_slice()));
+        assert!(!ws_proof.auth().is_http());
+    }
+
+    #[tokio::test]
+    async fn keyed_unsupported_kind_rejection_precedes_p_tag_cap() {
+        let keys = nostr::Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let tags = repeated_p_tags(buzz_core::idempotency::KEYED_MAX_P_TAGS + 1, &hex);
+        let event = signed_kind1(&keys, "fresh", tags);
+        let err = KeyedHttpValidatedEvent::validate(event, http_auth_for(&keys))
+            .await
+            .expect_err("kind 1 is not keyed");
+        assert!(matches!(
+            err,
+            IngestError::Rejected(ref msg)
+                if msg == "invalid: Idempotency-Key is not supported for this event kind"
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyed_refactor_preserves_unkeyed_kind1_without_p_tag_cap_bypass() {
+        let keys = nostr::Keys::generate();
+        let http_auth = http_auth_for(&keys);
+        let ws_auth = IngestAuth::Nip42 {
+            pubkey: keys.public_key(),
+            scopes: Scope::all_known(),
+            channel_ids: None,
+            conn_id: Uuid::new_v4(),
+        };
+        let kind1 = EventBuilder::new(Kind::TextNote, "fresh")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        validate_ingest_pre_command(kind1.clone(), &http_auth, false)
+            .await
+            .expect("unkeyed HTTP kind 1 remains valid");
+        validate_ingest_pre_command(kind1, &ws_auth, false)
+            .await
+            .expect("WebSocket kind 1 remains valid");
+    }
+
+    #[tokio::test]
+    async fn unkeyed_kind1_pre_command_accepts_sixty_four_actual_p_tags() {
+        let keys = nostr::Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let tags = repeated_p_tags(buzz_core::idempotency::KEYED_MAX_P_TAGS, &hex);
+        let event = signed_kind1(&keys, "fresh", tags);
+        assert_eq!(
+            buzz_core::idempotency::keyed_p_tag_count(&event),
+            buzz_core::idempotency::KEYED_MAX_P_TAGS
+        );
+        let http_auth = http_auth_for(&keys);
+        let ws_auth = IngestAuth::Nip42 {
+            pubkey: keys.public_key(),
+            scopes: Scope::all_known(),
+            channel_ids: None,
+            conn_id: Uuid::new_v4(),
+        };
+        validate_ingest_pre_command(event.clone(), &http_auth, false)
+            .await
+            .expect("unkeyed HTTP kind 1 with 64 p tags");
+        validate_ingest_pre_command(event, &ws_auth, false)
+            .await
+            .expect("unkeyed WebSocket kind 1 with 64 p tags");
+    }
+
+    #[tokio::test]
+    async fn unkeyed_kind1_pre_command_rejects_sixty_five_actual_p_tags() {
+        let keys = nostr::Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let tags = repeated_p_tags(buzz_core::idempotency::KEYED_MAX_P_TAGS + 1, &hex);
+        let event = signed_kind1(&keys, "fresh", tags);
+        assert_eq!(
+            buzz_core::idempotency::keyed_p_tag_count(&event),
+            buzz_core::idempotency::KEYED_MAX_P_TAGS + 1
+        );
+        let http_auth = http_auth_for(&keys);
+        let ws_auth = IngestAuth::Nip42 {
+            pubkey: keys.public_key(),
+            scopes: Scope::all_known(),
+            channel_ids: None,
+            conn_id: Uuid::new_v4(),
+        };
+        assert_too_many_unkeyed_p_tags(
+            validate_ingest_pre_command(event.clone(), &http_auth, false)
+                .await
+                .expect_err("unkeyed HTTP kind 1 with 65 p tags"),
+        );
+        assert_too_many_unkeyed_p_tags(
+            validate_ingest_pre_command(event, &ws_auth, false)
+                .await
+                .expect_err("unkeyed WebSocket kind 1 with 65 p tags"),
+        );
+    }
+
+    #[tokio::test]
+    async fn unkeyed_kind9_pre_command_accepts_sixty_four_actual_p_tags() {
+        let keys = nostr::Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let tags = repeated_p_tags(buzz_core::idempotency::KEYED_MAX_P_TAGS, &hex);
+        let event = signed_kind9(&keys, "fresh", tags);
+        assert_eq!(
+            buzz_core::idempotency::keyed_p_tag_count(&event),
+            buzz_core::idempotency::KEYED_MAX_P_TAGS
+        );
+        let http_auth = http_auth_for(&keys);
+        let ws_auth = IngestAuth::Nip42 {
+            pubkey: keys.public_key(),
+            scopes: Scope::all_known(),
+            channel_ids: None,
+            conn_id: Uuid::new_v4(),
+        };
+        validate_ingest_pre_command(event.clone(), &http_auth, false)
+            .await
+            .expect("unkeyed HTTP kind 9 with 64 p tags");
+        validate_ingest_pre_command(event.clone(), &ws_auth, false)
+            .await
+            .expect("unkeyed WebSocket kind 9 with 64 p tags");
+        KeyedHttpValidatedEvent::validate(event, http_auth)
+            .await
+            .expect("keyed kind 9 with 64 p tags remains accepted");
+    }
+
+    #[tokio::test]
+    async fn unkeyed_kind9_pre_command_rejects_sixty_five_actual_p_tags() {
+        let keys = nostr::Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let tags = repeated_p_tags(buzz_core::idempotency::KEYED_MAX_P_TAGS + 1, &hex);
+        let event = signed_kind9(&keys, "fresh", tags);
+        assert_eq!(
+            buzz_core::idempotency::keyed_p_tag_count(&event),
+            buzz_core::idempotency::KEYED_MAX_P_TAGS + 1
+        );
+        let http_auth = http_auth_for(&keys);
+        let ws_auth = IngestAuth::Nip42 {
+            pubkey: keys.public_key(),
+            scopes: Scope::all_known(),
+            channel_ids: None,
+            conn_id: Uuid::new_v4(),
+        };
+        assert_too_many_unkeyed_p_tags(
+            validate_ingest_pre_command(event.clone(), &http_auth, false)
+                .await
+                .expect_err("unkeyed HTTP kind 9 with 65 p tags"),
+        );
+        assert_too_many_unkeyed_p_tags(
+            validate_ingest_pre_command(event.clone(), &ws_auth, false)
+                .await
+                .expect_err("unkeyed WebSocket kind 9 with 65 p tags"),
+        );
+        assert_too_many_keyed_p_tags(
+            KeyedHttpValidatedEvent::validate(event, http_auth)
+                .await
+                .expect_err("keyed kind 9 with 65 p tags stays rejected"),
+        );
+    }
+
+    #[tokio::test]
+    async fn unkeyed_kind9_pre_command_counts_malformed_and_duplicate_actual_p_tags() {
+        let keys = nostr::Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let mut tags = repeated_p_tags(buzz_core::idempotency::KEYED_MAX_P_TAGS, &hex);
+        tags.push(Tag::parse(["p", "not-a-hex-pubkey"]).expect("malformed p"));
+        let event = signed_kind9(&keys, "fresh", tags);
+        assert_eq!(
+            buzz_core::idempotency::keyed_p_tag_count(&event),
+            buzz_core::idempotency::KEYED_MAX_P_TAGS + 1
+        );
+        assert_too_many_unkeyed_p_tags(
+            validate_ingest_pre_command(event.clone(), &http_auth_for(&keys), false)
+                .await
+                .expect_err("malformed actual p tags count toward the cap"),
+        );
+        assert_too_many_keyed_p_tags(
+            KeyedHttpValidatedEvent::validate(event, http_auth_for(&keys))
+                .await
+                .expect_err("keyed malformed actual p tags count toward the cap"),
+        );
+    }
+
+    #[tokio::test]
+    async fn unkeyed_kind9_pre_command_ignores_uppercase_p_and_non_p_tags() {
+        let keys = nostr::Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let mut tags = repeated_p_tags(buzz_core::idempotency::KEYED_MAX_P_TAGS, &hex);
+        tags.extend(
+            (0..=buzz_core::idempotency::KEYED_MAX_P_TAGS)
+                .map(|_| Tag::parse(["P", &hex]).expect("uppercase P")),
+        );
+        tags.extend(
+            (0..=buzz_core::idempotency::KEYED_MAX_P_TAGS)
+                .map(|_| Tag::parse(["e", &hex]).expect("e tag")),
+        );
+        let event = signed_kind9(&keys, "fresh", tags);
+        assert_eq!(
+            buzz_core::idempotency::keyed_p_tag_count(&event),
+            buzz_core::idempotency::KEYED_MAX_P_TAGS
+        );
+        validate_ingest_pre_command(event.clone(), &http_auth_for(&keys), false)
+            .await
+            .expect("uppercase P and non-p tags must not count");
+        KeyedHttpValidatedEvent::validate(event, http_auth_for(&keys))
+            .await
+            .expect("keyed uppercase P and non-p tags must not count");
+    }
+
+    #[test]
+    fn fleet_exceeded_preserves_reset_other_than_five() {
+        match keyed_http_error_from_fleet(crate::admission::AdmissionError::Exceeded {
+            reset_in_secs: 59,
+        }) {
+            KeyedHttpError::Busy { retry_after_secs } => {
+                assert_eq!(retry_after_secs, 59);
+                assert_ne!(retry_after_secs, KEYED_BUSY_RETRY_AFTER_SECS);
+            }
+            other => panic!("Exceeded must not collapse to default Busy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fleet_unavailable_and_local_busy_use_explicit_default() {
+        match keyed_http_error_from_fleet(crate::admission::AdmissionError::Unavailable) {
+            KeyedHttpError::Busy { retry_after_secs } => {
+                assert_eq!(retry_after_secs, KEYED_BUSY_RETRY_AFTER_SECS);
+            }
+            other => panic!("Unavailable must map to default Busy, got {other:?}"),
+        }
+        match keyed_busy_default() {
+            KeyedHttpError::Busy { retry_after_secs } => {
+                assert_eq!(retry_after_secs, 5);
+            }
+            other => panic!("local/SQL busy must use the five-second default, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyed_terminals_are_typed_outcomes_not_internal_sentinels() {
+        match keyed_http_error_from_inner(IngestInnerOutcome::Conflict) {
+            KeyedHttpError::Conflict => {}
+            KeyedHttpError::Ingest(IngestError::Internal(message)) => {
+                panic!("conflict must not be an Internal sentinel, got {message}")
+            }
+            KeyedHttpError::Ingest(_)
+            | KeyedHttpError::Busy { .. }
+            | KeyedHttpError::Principal(_) => {
+                panic!("conflict must stay Conflict")
+            }
+        }
+        match keyed_http_error_from_inner(IngestInnerOutcome::Busy {
+            retry_after_secs: KEYED_BUSY_RETRY_AFTER_SECS,
+        }) {
+            KeyedHttpError::Busy { retry_after_secs } => {
+                assert_eq!(retry_after_secs, KEYED_BUSY_RETRY_AFTER_SECS);
+            }
+            KeyedHttpError::Ingest(IngestError::Internal(message)) => {
+                panic!("busy must not be an Internal sentinel, got {message}")
+            }
+            KeyedHttpError::Ingest(_) | KeyedHttpError::Conflict | KeyedHttpError::Principal(_) => {
+                panic!("busy must stay Busy")
+            }
+        }
+        match keyed_http_error_from_inner(IngestInnerOutcome::Principal(
+            crate::admission::AdmissionError::Exceeded { reset_in_secs: 11 },
+        )) {
+            KeyedHttpError::Principal(crate::admission::AdmissionError::Exceeded {
+                reset_in_secs: 11,
+            }) => {}
+            KeyedHttpError::Ingest(IngestError::Internal(message)) => {
+                panic!("principal must not be an Internal sentinel, got {message}")
+            }
+            KeyedHttpError::Ingest(_) | KeyedHttpError::Conflict | KeyedHttpError::Busy { .. } => {
+                panic!("principal must stay Principal")
+            }
+            KeyedHttpError::Principal(_) => panic!("principal Exceeded must keep reset_in_secs 11"),
+        }
+        match keyed_http_error_from_inner(IngestInnerOutcome::Rejected("invalid: x".into())) {
+            KeyedHttpError::Ingest(IngestError::Rejected(message)) => {
+                assert_eq!(message, "invalid: x");
+            }
+            KeyedHttpError::Ingest(_)
+            | KeyedHttpError::Conflict
+            | KeyedHttpError::Busy { .. }
+            | KeyedHttpError::Principal(_) => {
+                panic!("ordinary reject must stay Ingest(Rejected)")
+            }
+        }
+
+        let sentinel_conflict =
+            IngestInnerOutcome::from(IngestError::Internal("error: keyed conflict".into()));
+        match keyed_http_error_from_inner(sentinel_conflict) {
+            KeyedHttpError::Ingest(IngestError::Internal(message)) => {
+                assert_eq!(message, "error: keyed conflict");
+            }
+            KeyedHttpError::Conflict => {
+                panic!("Internal sentinel strings must not be reclassified as Conflict")
+            }
+            KeyedHttpError::Ingest(_)
+            | KeyedHttpError::Busy { .. }
+            | KeyedHttpError::Principal(_) => {
+                panic!("Internal(\"error: keyed conflict\") must stay Ingest(Internal)")
+            }
+        }
+        let sentinel_busy =
+            IngestInnerOutcome::from(IngestError::Internal("error: keyed writer busy".into()));
+        match keyed_http_error_from_inner(sentinel_busy) {
+            KeyedHttpError::Ingest(IngestError::Internal(message)) => {
+                assert_eq!(message, "error: keyed writer busy");
+            }
+            KeyedHttpError::Busy { .. } => {
+                panic!("Internal sentinel strings must not be reclassified as Busy")
+            }
+            KeyedHttpError::Ingest(_) | KeyedHttpError::Conflict | KeyedHttpError::Principal(_) => {
+                panic!("Internal(\"error: keyed writer busy\") must stay Ingest(Internal)")
+            }
+        }
+        let sentinel_principal = IngestInnerOutcome::from(IngestError::Internal(
+            "error: keyed principal admission".into(),
+        ));
+        match keyed_http_error_from_inner(sentinel_principal) {
+            KeyedHttpError::Ingest(IngestError::Internal(message)) => {
+                assert_eq!(message, "error: keyed principal admission");
+            }
+            KeyedHttpError::Principal(_) => {
+                panic!("Internal sentinel strings must not be reclassified as Principal")
+            }
+            KeyedHttpError::Ingest(_) | KeyedHttpError::Conflict | KeyedHttpError::Busy { .. } => {
+                panic!("Internal(\"error: keyed principal admission\") must stay Ingest(Internal)")
+            }
+        }
+    }
+
+    #[test]
+    fn stored_metric_cannot_override_typed_terminal() {
+        let stored = Some(keyed_inserted_stored_metric());
+        let outcome: Result<IngestResult, IngestInnerOutcome> = Err(IngestInnerOutcome::Conflict);
+        let classified = match outcome {
+            Ok(_) => "ok",
+            Err(IngestInnerOutcome::Rejected(_)) => "rejected",
+            Err(IngestInnerOutcome::AuthFailed(_)) => "auth",
+            Err(IngestInnerOutcome::Internal(_)) => "internal",
+            Err(IngestInnerOutcome::Conflict) => "conflict",
+            Err(IngestInnerOutcome::Busy { .. }) => "busy",
+            Err(IngestInnerOutcome::Principal(_)) => "principal",
+        };
+        assert_eq!(classified, "conflict");
+        assert!(
+            keyed_http_should_increment_stored(stored),
+            "stored bookkeeping may still say increment"
+        );
+        assert!(
+            !matches!(
+                keyed_http_error_from_inner(IngestInnerOutcome::Conflict),
+                KeyedHttpError::Ingest(_)
+            ),
+            "the HTTP wrapper classifies from the returned outcome, never from stored"
+        );
+    }
+
+    #[test]
+    fn miss_path_admission_keeps_principal_distinct_from_busy() {
+        let exceeded = IngestInnerOutcome::from(KeyedHttpError::Principal(
+            crate::admission::AdmissionError::Exceeded { reset_in_secs: 11 },
+        ));
+        match exceeded {
+            IngestInnerOutcome::Principal(crate::admission::AdmissionError::Exceeded {
+                reset_in_secs: 11,
+            }) => {}
+            IngestInnerOutcome::Rejected(_)
+            | IngestInnerOutcome::AuthFailed(_)
+            | IngestInnerOutcome::Internal(_)
+            | IngestInnerOutcome::Conflict
+            | IngestInnerOutcome::Busy { .. }
+            | IngestInnerOutcome::Principal(_) => {
+                panic!("principal Exceeded must stay Principal with reset 11")
+            }
+        }
+        let unavailable = IngestInnerOutcome::from(KeyedHttpError::Principal(
+            crate::admission::AdmissionError::Unavailable,
+        ));
+        match unavailable {
+            IngestInnerOutcome::Principal(crate::admission::AdmissionError::Unavailable) => {}
+            IngestInnerOutcome::Busy { .. } => {
+                panic!("principal Unavailable must not collapse into keyed Busy")
+            }
+            IngestInnerOutcome::Rejected(_)
+            | IngestInnerOutcome::AuthFailed(_)
+            | IngestInnerOutcome::Internal(_)
+            | IngestInnerOutcome::Conflict
+            | IngestInnerOutcome::Principal(_) => {
+                panic!("principal Unavailable must stay Principal")
+            }
+        }
+        let fleet_busy = IngestInnerOutcome::from(keyed_http_error_from_fleet(
+            crate::admission::AdmissionError::Unavailable,
+        ));
+        match fleet_busy {
+            IngestInnerOutcome::Busy { retry_after_secs } => {
+                assert_eq!(retry_after_secs, KEYED_BUSY_RETRY_AFTER_SECS);
+            }
+            IngestInnerOutcome::Principal(_) => {
+                panic!("fleet unavailability must stay keyed Busy, not Principal")
+            }
+            IngestInnerOutcome::Rejected(_)
+            | IngestInnerOutcome::AuthFailed(_)
+            | IngestInnerOutcome::Internal(_)
+            | IngestInnerOutcome::Conflict => {
+                panic!("fleet unavailability must stay keyed Busy")
+            }
+        }
+    }
+
+    struct ImmediateDenyLimiter;
+
+    impl RateLimiter for ImmediateDenyLimiter {
+        async fn check_and_increment(
+            &self,
+            _ctx: &TenantContext,
+            _pubkey: &nostr::PublicKey,
+            _limit_type: LimitType,
+            _window_secs: u64,
+            _limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            Ok(buzz_auth::RateLimitResult::denied(2, 1, 59))
+        }
+
+        async fn check_ip_connection(
+            &self,
+            _ip: &IpAddr,
+            _window_secs: u64,
+            _limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            Ok(buzz_auth::RateLimitResult::denied(2, 1, 59))
+        }
+
+        async fn check_paired_admission(
+            &self,
+            request: PairedAdmissionRequest<'_>,
+        ) -> Result<PairedAdmissionOutcome, buzz_auth::AuthError> {
+            Ok(PairedAdmissionOutcome::FleetDenied(
+                buzz_auth::RateLimitResult::denied(
+                    request.fleet_limit + 1,
+                    request.fleet_limit,
+                    59,
+                ),
+            ))
+        }
+
+        async fn check_hierarchical_admission(
+            &self,
+            request: HierarchicalAdmissionRequest<'_>,
+        ) -> Result<HierarchicalAdmissionOutcome, buzz_auth::AuthError> {
+            Ok(HierarchicalAdmissionOutcome::IdentityDenied(
+                buzz_auth::RateLimitResult::denied(
+                    request.limits.identity + 1,
+                    request.limits.identity,
+                    59,
+                ),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn held_writer_gate_denies_fleet_immediately_and_queue_stays_bounded() {
+        assert_eq!(KEYED_WRITER_WAIT_MAX, KEYED_GLOBAL_PERMITS);
+        assert_eq!(KEYED_WRITER_WAIT_MAX, 8);
+        let held = KeyedWriterCapacityGuard::hold_all();
+        assert_eq!(keyed_global().available_permits(), 0);
+
+        let tenant = TenantContext::resolved(
+            CommunityId::from_uuid(Uuid::from_u128(7)),
+            "keyed-writer-gate.test",
+        );
+        let started = std::time::Instant::now();
+        let denied = enforce_keyed_events_fleet_admission(
+            &ImmediateDenyLimiter,
+            &tenant,
+            &nostr::Keys::generate().public_key(),
+            120,
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "fleet denial must not wait on the local writer gate"
+        );
+        assert!(
+            matches!(
+                denied,
+                Err(crate::admission::AdmissionError::Exceeded { reset_in_secs: 59 })
+            ),
+            "got {denied:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let acquire = acquire_keyed_writer_permits(Uuid::from_u128(7), &[1u8; 32], &[2u8; 32]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(20),
+            "a full writer gate must fail closed immediately"
+        );
+        let busy = match acquire {
+            Err(error) => error,
+            Ok(_) => panic!("a full writer gate must fail closed immediately"),
+        };
+        match IngestInnerOutcome::from(busy) {
+            IngestInnerOutcome::Busy { retry_after_secs } => {
+                assert_eq!(retry_after_secs, KEYED_BUSY_RETRY_AFTER_SECS);
+            }
+            IngestInnerOutcome::Internal(message) => {
+                panic!("writer exhaustion must not be an Internal sentinel, got {message}")
+            }
+            IngestInnerOutcome::Rejected(_)
+            | IngestInnerOutcome::AuthFailed(_)
+            | IngestInnerOutcome::Conflict
+            | IngestInnerOutcome::Principal(_) => {
+                panic!("writer exhaustion must be typed Busy")
+            }
+        }
+        assert_eq!(
+            keyed_global().available_permits(),
+            0,
+            "try_acquire must not enqueue waiters past {KEYED_WRITER_WAIT_MAX}"
+        );
+        drop(held);
+        assert_eq!(keyed_global().available_permits(), KEYED_GLOBAL_PERMITS);
+        let recovered = acquire_keyed_writer_permits(Uuid::from_u128(7), &[1u8; 32], &[2u8; 32]);
+        assert!(
+            recovered.is_ok(),
+            "dropping the capacity guard must release every writer permit"
+        );
+    }
+
+    struct NeverResolvesLimiter;
+
+    impl RateLimiter for NeverResolvesLimiter {
+        async fn check_and_increment(
+            &self,
+            _ctx: &TenantContext,
+            _pubkey: &nostr::PublicKey,
+            _limit_type: LimitType,
+            _window_secs: u64,
+            _limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            std::future::pending::<Result<buzz_auth::RateLimitResult, buzz_auth::AuthError>>().await
+        }
+
+        async fn check_ip_connection(
+            &self,
+            _ip: &IpAddr,
+            _window_secs: u64,
+            _limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            std::future::pending::<Result<buzz_auth::RateLimitResult, buzz_auth::AuthError>>().await
+        }
+
+        async fn check_paired_admission(
+            &self,
+            _request: PairedAdmissionRequest<'_>,
+        ) -> Result<PairedAdmissionOutcome, buzz_auth::AuthError> {
+            std::future::pending::<Result<PairedAdmissionOutcome, buzz_auth::AuthError>>().await
+        }
+
+        async fn check_hierarchical_admission(
+            &self,
+            _request: HierarchicalAdmissionRequest<'_>,
+        ) -> Result<HierarchicalAdmissionOutcome, buzz_auth::AuthError> {
+            std::future::pending::<Result<HierarchicalAdmissionOutcome, buzz_auth::AuthError>>()
+                .await
+        }
+    }
+
+    #[test]
+    fn keyed_reservation_abort_classifies_failures_without_exposing_errors() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let (success, database, timeout) = metrics::with_local_recorder(&recorder, || {
+            (
+                finish_keyed_reservation_abort(
+                    Ok::<Result<(), buzz_db::DbError>, ()>(Ok(())),
+                    "ok-pass",
+                ),
+                finish_keyed_reservation_abort(
+                    Ok::<Result<(), buzz_db::DbError>, ()>(Err(buzz_db::DbError::InvalidData(
+                        "db".into(),
+                    ))),
+                    "db-pass",
+                ),
+                finish_keyed_reservation_abort(
+                    Err::<Result<(), buzz_db::DbError>, ()>(()),
+                    "to-pass",
+                ),
+            )
+        });
+        assert_eq!(success, "ok-pass");
+        assert_eq!(database, "db-pass");
+        assert_eq!(timeout, "to-pass");
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(snapshot.len(), 2);
+        let mut classes = Vec::new();
+        for (key, _unit, _desc, value) in snapshot {
+            let key = key.key();
+            assert_eq!(key.name(), KEYED_RESERVATION_ABORT_FAILURES_TOTAL);
+            let labels: Vec<_> = key.labels().collect();
+            assert_eq!(labels.len(), 1);
+            assert_eq!(labels[0].key(), "class");
+            classes.push(labels[0].value().to_string());
+            match value {
+                metrics_util::debugging::DebugValue::Counter(count) => assert_eq!(count, 1),
+                other => panic!("expected counter, got {other:?}"),
+            }
+        }
+        classes.sort();
+        assert_eq!(
+            classes,
+            ["database_other".to_string(), "deadline_timeout".to_string()]
+        );
+    }
+
+    #[test]
+    fn keyed_reservation_abort_sqlstate_classes_are_allowlisted() {
+        assert_eq!(
+            classify_keyed_reservation_abort_sqlstate(Some("55P03")),
+            "lock_not_available"
+        );
+        assert_eq!(
+            classify_keyed_reservation_abort_sqlstate(Some("57014")),
+            "statement_canceled"
+        );
+        assert_eq!(
+            classify_keyed_reservation_abort_sqlstate(Some("25P03")),
+            "idle_in_transaction_timeout"
+        );
+        assert_eq!(
+            classify_keyed_reservation_abort_sqlstate(Some("08006")),
+            "sqlx_other"
+        );
+        assert_eq!(
+            classify_keyed_reservation_abort_sqlstate(None),
+            "sqlx_other"
+        );
+    }
+
+    #[test]
+    fn keyed_reservation_abort_db_error_classes_are_finite() {
+        assert_eq!(
+            classify_keyed_reservation_abort_db_error(&buzz_db::DbError::Sqlx(
+                sqlx::Error::PoolTimedOut
+            )),
+            "pool_timeout"
+        );
+        assert_eq!(
+            classify_keyed_reservation_abort_db_error(&buzz_db::DbError::Sqlx(sqlx::Error::Io(
+                std::io::Error::other("database unavailable")
+            ))),
+            "sqlx_other"
+        );
+        assert_eq!(
+            classify_keyed_reservation_abort_db_error(&buzz_db::DbError::InvalidData("n".into())),
+            "database_other"
+        );
+        let unavailable = buzz_db::DbError::InvalidData("idempotency writer is busy".into());
+        assert!(unavailable.is_idempotency_unavailable());
+        assert_eq!(
+            classify_keyed_reservation_abort_db_error(&unavailable),
+            "idempotency_unavailable"
+        );
+    }
+
+    #[test]
+    fn keyed_reservation_abort_pool_timeout_increments_bounded_class() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let passthrough = metrics::with_local_recorder(&recorder, || {
+            finish_keyed_reservation_abort(
+                Ok::<Result<(), buzz_db::DbError>, ()>(Err(buzz_db::DbError::Sqlx(
+                    sqlx::Error::PoolTimedOut,
+                ))),
+                "pool-pass",
+            )
+        });
+        assert_eq!(passthrough, "pool-pass");
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(snapshot.len(), 1);
+        let (key, _unit, _desc, value) = &snapshot[0];
+        let key = key.key();
+        assert_eq!(key.name(), KEYED_RESERVATION_ABORT_FAILURES_TOTAL);
+        let labels: Vec<_> = key.labels().collect();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].key(), "class");
+        assert_eq!(labels[0].value(), "pool_timeout");
+        match value {
+            metrics_util::debugging::DebugValue::Counter(count) => assert_eq!(*count, 1),
+            other => panic!("expected counter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reservation_admission_and_persist_budgets_are_documented() {
+        const {
+            assert!(
+                KEYED_RESERVATION_ADMISSION_BUDGET_SECS
+                    < buzz_db::idempotency::KEYED_RESERVATION_IDLE_TIMEOUT_SECS
+            );
+            assert!(
+                buzz_db::idempotency::KEYED_RESERVATION_IDLE_TIMEOUT_SECS
+                    <= KEYED_RESERVATION_PERSIST_BUDGET_SECS
+            );
+            assert!(
+                KEYED_RESERVATION_PERSIST_BUDGET_SECS
+                    == buzz_db::idempotency::KEYED_RESERVATION_STATEMENT_TIMEOUT_SECS
+            );
+        }
+        assert_eq!(
+            buzz_db::idempotency::KEYED_RESERVATION_CAPACITY,
+            KEYED_WRITER_WAIT_MAX
+        );
+        assert_eq!(
+            KEYED_RESERVATION_ADMISSION_BUDGET_SECS,
+            KEYED_BUSY_RETRY_AFTER_SECS
+        );
+        assert_eq!(KEYED_RESERVATION_ADMISSION_BUDGET, Duration::from_secs(5));
+        assert_eq!(
+            buzz_db::idempotency::KEYED_RESERVATION_IDLE_TIMEOUT_SECS,
+            10
+        );
+        assert_eq!(KEYED_RESERVATION_PERSIST_BUDGET, Duration::from_secs(15));
+        assert!(
+            KEYED_RESERVATION_ADMISSION_BUDGET.as_secs()
+                < buzz_db::idempotency::KEYED_RESERVATION_IDLE_TIMEOUT_SECS
+        );
+        assert!(
+            buzz_db::idempotency::KEYED_RESERVATION_IDLE_TIMEOUT_SECS
+                <= KEYED_RESERVATION_PERSIST_BUDGET.as_secs()
+        );
+        assert_ne!(
+            KEYED_RESERVATION_ADMISSION_BUDGET_SECS,
+            buzz_db::idempotency::KEYED_RESERVATION_IDLE_TIMEOUT_SECS,
+            "admission budget must not be derived from or equal to the idle belt"
+        );
+    }
+
+    #[test]
+    fn old_complete_deadline_cannot_cancel_witness_recovery() {
+        const OLD_GUESSED_OUTER_SECS: u64 = 31;
+        const MIN_PERSIST_STATEMENTS: u64 = 2;
+        const {
+            assert!(
+                KEYED_RESERVATION_PERSIST_BUDGET_SECS
+                    == buzz_db::idempotency::KEYED_RESERVATION_STATEMENT_TIMEOUT_SECS
+            );
+            assert!(buzz_db::idempotency::KEYED_COMMIT_RECOVERY_LOOKUP_TIMEOUT_SECS > 0);
+        }
+        assert_eq!(
+            buzz_db::idempotency::KEYED_COMMIT_RECOVERY_LOOKUP_TIMEOUT_SECS,
+            15
+        );
+        assert_eq!(KEYED_RESERVATION_PERSIST_BUDGET, Duration::from_secs(15));
+        let phased = MIN_PERSIST_STATEMENTS * KEYED_RESERVATION_PERSIST_BUDGET_SECS
+            + buzz_db::idempotency::KEYED_COMMIT_RECOVERY_LOOKUP_TIMEOUT_SECS;
+        assert!(
+            phased > OLD_GUESSED_OUTER_SECS,
+            "the old 31s outer complete deadline can fire during internally bounded recovery"
+        );
+    }
+
+    #[test]
+    fn lost_ack_recovery_is_one_accepted_dispatch_then_replay() {
+        let replay = buzz_db::KeyedStreamInsert::Replay {
+            original_event_id: [0xaa; 32],
+        };
+        assert!(
+            !replay.should_dispatch(),
+            "retry after durable commit classifies Replay and must not dispatch again"
+        );
+        assert!(replay.into_fresh_stored_event().is_err());
+        assert!(keyed_http_should_increment_stored(Some(
+            keyed_inserted_stored_metric()
+        )));
+        assert!(!keyed_http_should_increment_stored(Some(
+            keyed_duplicate_stored_metric()
+        )));
+        assert_eq!(
+            keyed_accepted_duplicate_result([0xaa; 32]).message,
+            "duplicate:"
+        );
+    }
+
+    #[test]
+    fn unrelated_key_hash_collision_does_not_fail_closed() {
+        let community = Uuid::from_u128(42);
+        let author = [3u8; 32];
+        let key_a = [1u8; 32];
+        let index = keyed_stripe_index(community, &author, &key_a);
+        let held = keyed_stripes()[index]
+            .try_acquire()
+            .expect("hold the colliding stripe");
+        let mut colliding = None;
+        'search: for b0 in 0u8..=255 {
+            for b1 in 0u8..=255 {
+                let mut key_b = [0u8; 32];
+                key_b[0] = b0;
+                key_b[1] = b1;
+                if key_b == key_a {
+                    continue;
+                }
+                if keyed_stripe_index(community, &author, &key_b) == index {
+                    colliding = Some(key_b);
+                    break 'search;
+                }
+            }
+        }
+        let key_b = colliding.expect("two unrelated keys must be able to share a stripe");
+        let acquired = acquire_keyed_writer_permits(community, &author, &key_b);
+        drop(held);
+        assert!(
+            acquired.is_ok(),
+            "an unrelated-key stripe collision must not synthesize 503"
+        );
+    }
+
+    #[tokio::test]
+    async fn never_resolving_admission_times_out_as_busy() {
+        let tenant = TenantContext::resolved(
+            CommunityId::from_uuid(Uuid::from_u128(11)),
+            "keyed-admission-timeout.test",
+        );
+        let started = std::time::Instant::now();
+        let result = keyed_await_admission_for(Duration::from_millis(25), async {
+            admit_keyed_persist_miss(
+                &NeverResolvesLimiter,
+                &tenant,
+                &nostr::Keys::generate().public_key(),
+                120,
+            )
+            .await?;
+            Ok::<(), KeyedHttpError>(())
+        })
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "a never-resolving admission future must fail closed inside the wall-clock budget"
+        );
+        assert!(
+            matches!(
+                result,
+                Err(KeyedHttpError::Busy {
+                    retry_after_secs: 5
+                })
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn never_resolving_pending_future_times_out_as_busy() {
+        let started = std::time::Instant::now();
+        let result = keyed_await_admission_for(
+            Duration::from_millis(20),
+            std::future::pending::<Result<(), KeyedHttpError>>(),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(
+            matches!(
+                result,
+                Err(KeyedHttpError::Busy {
+                    retry_after_secs: 5
+                })
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn replay_and_conflict_classification_does_not_join_the_writer_gate() {
+        let replay = buzz_db::idempotency::KeyedReserveOutcome::Replay {
+            original_event_id: [9u8; 32],
+        };
+        let conflict = buzz_db::idempotency::KeyedReserveOutcome::Conflict {
+            existing_event_id: [8u8; 32],
+        };
+        assert!(!matches!(
+            replay,
+            buzz_db::idempotency::KeyedReserveOutcome::Reserved(_)
+        ));
+        assert!(!matches!(
+            conflict,
+            buzz_db::idempotency::KeyedReserveOutcome::Reserved(_)
+        ));
+        assert!(
+            !matches!(
+                replay,
+                buzz_db::idempotency::KeyedReserveOutcome::Reserved(_)
+            ) && !matches!(
+                conflict,
+                buzz_db::idempotency::KeyedReserveOutcome::Reserved(_)
+            ),
+            "replay/conflict return before principal, community, or fleet charge"
+        );
+    }
+
+    struct PanicOnAdmissionLimiter;
+
+    impl RateLimiter for PanicOnAdmissionLimiter {
+        async fn check_and_increment(
+            &self,
+            _ctx: &TenantContext,
+            _pubkey: &nostr::PublicKey,
+            _limit_type: LimitType,
+            _window_secs: u64,
+            _limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            panic!("committed classification must not charge principal admission");
+        }
+
+        async fn check_ip_connection(
+            &self,
+            _ip: &IpAddr,
+            _window_secs: u64,
+            _limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            panic!("committed classification must not charge IP admission");
+        }
+
+        async fn check_paired_admission(
+            &self,
+            _request: PairedAdmissionRequest<'_>,
+        ) -> Result<PairedAdmissionOutcome, buzz_auth::AuthError> {
+            panic!("committed classification must not charge paired admission");
+        }
+
+        async fn check_hierarchical_admission(
+            &self,
+            _request: HierarchicalAdmissionRequest<'_>,
+        ) -> Result<HierarchicalAdmissionOutcome, buzz_auth::AuthError> {
+            panic!("committed classification must not charge hierarchical admission");
+        }
+    }
+
+    struct RecordingLimiter {
+        principal: std::sync::atomic::AtomicUsize,
+        paired: std::sync::atomic::AtomicUsize,
+        hierarchical: std::sync::atomic::AtomicUsize,
+        identity_charged: std::sync::atomic::AtomicUsize,
+        community_charged: std::sync::atomic::AtomicUsize,
+        fleet_charged: std::sync::atomic::AtomicUsize,
+        limit_types: Mutex<Vec<LimitType>>,
+    }
+
+    impl RecordingLimiter {
+        fn new() -> Self {
+            Self {
+                principal: std::sync::atomic::AtomicUsize::new(0),
+                paired: std::sync::atomic::AtomicUsize::new(0),
+                hierarchical: std::sync::atomic::AtomicUsize::new(0),
+                identity_charged: std::sync::atomic::AtomicUsize::new(0),
+                community_charged: std::sync::atomic::AtomicUsize::new(0),
+                fleet_charged: std::sync::atomic::AtomicUsize::new(0),
+                limit_types: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RateLimiter for RecordingLimiter {
+        async fn check_and_increment(
+            &self,
+            _ctx: &TenantContext,
+            _pubkey: &nostr::PublicKey,
+            _limit_type: LimitType,
+            window_secs: u64,
+            limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            self.principal
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(buzz_auth::RateLimitResult::allowed(1, limit, window_secs))
+        }
+
+        async fn check_ip_connection(
+            &self,
+            _ip: &IpAddr,
+            window_secs: u64,
+            limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            Ok(buzz_auth::RateLimitResult::allowed(1, limit, window_secs))
+        }
+
+        async fn check_paired_admission(
+            &self,
+            request: PairedAdmissionRequest<'_>,
+        ) -> Result<PairedAdmissionOutcome, buzz_auth::AuthError> {
+            self.paired
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let window_secs = request.window_secs();
+            Ok(PairedAdmissionOutcome::Allowed {
+                tenant: buzz_auth::RateLimitResult::allowed(1, request.tenant_limit, window_secs),
+                fleet: buzz_auth::RateLimitResult::allowed(1, request.fleet_limit, window_secs),
+            })
+        }
+
+        async fn check_hierarchical_admission(
+            &self,
+            request: HierarchicalAdmissionRequest<'_>,
+        ) -> Result<HierarchicalAdmissionOutcome, buzz_auth::AuthError> {
+            self.hierarchical
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.identity_charged
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.community_charged
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.fleet_charged
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.limit_types
+                .lock()
+                .unwrap()
+                .push(request.limit_type.clone());
+            let window_secs = request.window_secs();
+            Ok(HierarchicalAdmissionOutcome::Allowed {
+                identity: buzz_auth::RateLimitResult::allowed(
+                    1,
+                    request.limits.identity,
+                    window_secs,
+                ),
+                community: buzz_auth::RateLimitResult::allowed(
+                    1,
+                    request.limits.community,
+                    window_secs,
+                ),
+                fleet: buzz_auth::RateLimitResult::allowed(1, request.limits.fleet, window_secs),
+            })
+        }
+    }
+
+    struct PersistIdentityDenyLimiter;
+
+    impl RateLimiter for PersistIdentityDenyLimiter {
+        async fn check_and_increment(
+            &self,
+            _ctx: &TenantContext,
+            _pubkey: &nostr::PublicKey,
+            _limit_type: LimitType,
+            window_secs: u64,
+            limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            Ok(buzz_auth::RateLimitResult::allowed(1, limit, window_secs))
+        }
+
+        async fn check_ip_connection(
+            &self,
+            _ip: &IpAddr,
+            window_secs: u64,
+            limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            Ok(buzz_auth::RateLimitResult::allowed(1, limit, window_secs))
+        }
+
+        async fn check_hierarchical_admission(
+            &self,
+            request: HierarchicalAdmissionRequest<'_>,
+        ) -> Result<HierarchicalAdmissionOutcome, buzz_auth::AuthError> {
+            let window_secs = request.window_secs();
+            if request.limit_type == LimitType::KeyedHttpFresh {
+                return Ok(HierarchicalAdmissionOutcome::Allowed {
+                    identity: buzz_auth::RateLimitResult::allowed(
+                        1,
+                        request.limits.identity,
+                        window_secs,
+                    ),
+                    community: buzz_auth::RateLimitResult::allowed(
+                        1,
+                        request.limits.community,
+                        window_secs,
+                    ),
+                    fleet: buzz_auth::RateLimitResult::allowed(
+                        1,
+                        request.limits.fleet,
+                        window_secs,
+                    ),
+                });
+            }
+            Ok(HierarchicalAdmissionOutcome::IdentityDenied(
+                buzz_auth::RateLimitResult::denied(
+                    request.limits.identity + 1,
+                    request.limits.identity,
+                    11,
+                ),
+            ))
+        }
+    }
+
+    fn keyed_admission_tenant() -> TenantContext {
+        TenantContext::resolved(
+            CommunityId::from_uuid(Uuid::from_u128(13)),
+            "keyed-classify-admit.test",
+        )
+    }
+
+    #[tokio::test]
+    async fn committed_replay_and_conflict_skip_redis_admission() {
+        let tenant = keyed_admission_tenant();
+        let principal = nostr::Keys::generate().public_key();
+        let replay = finish_keyed_committed_classify(
+            Some(buzz_db::idempotency::KeyedCommittedOutcome::Replay {
+                original_event_id: [9u8; 32],
+            }),
+            &PanicOnAdmissionLimiter,
+            &tenant,
+            &principal,
+            120,
+        )
+        .await
+        .expect("replay must skip admission");
+        match replay {
+            Some(buzz_db::idempotency::KeyedCommittedOutcome::Replay { original_event_id }) => {
+                assert_eq!(original_event_id, [9u8; 32]);
+            }
+            _other => panic!("expected replay"),
+        }
+
+        let conflict = finish_keyed_committed_classify(
+            Some(buzz_db::idempotency::KeyedCommittedOutcome::Conflict {
+                existing_event_id: [8u8; 32],
+            }),
+            &PanicOnAdmissionLimiter,
+            &tenant,
+            &principal,
+            120,
+        )
+        .await
+        .expect("conflict must skip admission");
+        match conflict {
+            Some(buzz_db::idempotency::KeyedCommittedOutcome::Conflict { existing_event_id }) => {
+                assert_eq!(existing_event_id, [8u8; 32]);
+            }
+            _other => panic!("expected conflict"),
+        }
+    }
+
+    #[test]
+    fn classify_miss_reserve_replay_race_is_honest_after_fresh_persist() {
+        // finish_keyed_committed_classify(None) is the only path that charges
+        // fresh then persist. begin_keyed_stream_reservation may still return
+        // Replay for the same key. Those counters are not rolled back.
+        let replay = buzz_db::idempotency::KeyedReserveOutcome::Replay {
+            original_event_id: [0x11; 32],
+        };
+        assert!(matches!(
+            &replay,
+            buzz_db::idempotency::KeyedReserveOutcome::Replay { .. }
+        ));
+        assert!(!matches!(
+            &replay,
+            buzz_db::idempotency::KeyedReserveOutcome::Reserved(_)
+        ));
+        let duplicate = keyed_accepted_duplicate_result([0x11; 32]);
+        assert!(duplicate.accepted);
+        assert_eq!(duplicate.message, "duplicate:");
+    }
+
+    #[tokio::test]
+    async fn committed_miss_admits_before_any_reservation() {
+        let tenant = keyed_admission_tenant();
+        let principal = nostr::Keys::generate().public_key();
+        let limiter = RecordingLimiter::new();
+        let admitted = finish_keyed_committed_classify(None, &limiter, &tenant, &principal, 120)
+            .await
+            .expect("miss must run admission");
+        assert!(
+            admitted.is_none(),
+            "an admitted miss must not open a reservation"
+        );
+        assert_eq!(
+            limiter.principal.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(limiter.paired.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            limiter
+                .hierarchical
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            limiter
+                .identity_charged
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            limiter
+                .community_charged
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            limiter
+                .fleet_charged
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            limiter.limit_types.lock().unwrap().clone(),
+            vec![LimitType::KeyedHttpFresh, LimitType::ApiCalls]
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_denial_cannot_retain_a_reservation() {
+        let tenant = keyed_admission_tenant();
+        let principal = nostr::Keys::generate().public_key();
+        let denied = finish_keyed_committed_classify(
+            None,
+            &PersistIdentityDenyLimiter,
+            &tenant,
+            &principal,
+            120,
+        )
+        .await;
+        let denied = match denied {
+            Err(error) => error,
+            Ok(other) => {
+                panic!("principal denial must fail before a reservation exists, got {other:?}")
+            }
+        };
+        match IngestInnerOutcome::from(denied) {
+            IngestInnerOutcome::Principal(_) => {}
+            IngestInnerOutcome::Internal(message) => {
+                panic!("principal denial must not be an Internal sentinel, got {message}")
+            }
+            IngestInnerOutcome::Busy { .. } => {
+                panic!("principal denial must not collapse into keyed Busy")
+            }
+            IngestInnerOutcome::Rejected(_)
+            | IngestInnerOutcome::AuthFailed(_)
+            | IngestInnerOutcome::Conflict => {
+                panic!("principal denial must stay Principal")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn redis_timeout_cannot_retain_a_reservation() {
+        let tenant = keyed_admission_tenant();
+        let principal = nostr::Keys::generate().public_key();
+        let started = std::time::Instant::now();
+        let timed_out = keyed_await_admission_for(Duration::from_millis(25), async {
+            admit_keyed_persist_miss(&NeverResolvesLimiter, &tenant, &principal, 120).await
+        })
+        .await;
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(
+            matches!(
+                timed_out,
+                Err(KeyedHttpError::Busy {
+                    retry_after_secs: 5
+                })
+            ),
+            "admission timeout must fail closed with no reservation to abort, got {timed_out:?}"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum PersistStub {
+        Allow,
+        DenyIdentity,
+        DenyCommunity,
+        DenyFleet,
+        PreMutation,
+        AmbiguousCharged,
+        AmbiguousUncharged,
+    }
+
+    struct PersistMatrixLimiter {
+        outcome: PersistStub,
+        calls: std::sync::atomic::AtomicUsize,
+        identity_charged: std::sync::atomic::AtomicUsize,
+        community_charged: std::sync::atomic::AtomicUsize,
+        fleet_charged: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PersistMatrixLimiter {
+        fn new(outcome: PersistStub) -> Self {
+            Self {
+                outcome,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                identity_charged: std::sync::atomic::AtomicUsize::new(0),
+                community_charged: std::sync::atomic::AtomicUsize::new(0),
+                fleet_charged: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn charges(&self) -> (usize, usize, usize, usize) {
+            (
+                self.calls.load(std::sync::atomic::Ordering::Relaxed),
+                self.identity_charged
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.community_charged
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.fleet_charged
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+    }
+
+    impl RateLimiter for PersistMatrixLimiter {
+        async fn check_and_increment(
+            &self,
+            _ctx: &TenantContext,
+            _pubkey: &nostr::PublicKey,
+            _limit_type: LimitType,
+            window_secs: u64,
+            limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            Ok(buzz_auth::RateLimitResult::allowed(1, limit, window_secs))
+        }
+
+        async fn check_ip_connection(
+            &self,
+            _ip: &IpAddr,
+            window_secs: u64,
+            limit: u64,
+        ) -> Result<buzz_auth::RateLimitResult, buzz_auth::AuthError> {
+            Ok(buzz_auth::RateLimitResult::allowed(1, limit, window_secs))
+        }
+
+        async fn check_hierarchical_admission(
+            &self,
+            request: HierarchicalAdmissionRequest<'_>,
+        ) -> Result<HierarchicalAdmissionOutcome, buzz_auth::AuthError> {
+            let prior = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if matches!(
+                self.outcome,
+                PersistStub::AmbiguousCharged | PersistStub::AmbiguousUncharged
+            ) {
+                assert_eq!(prior, 0, "ambiguous persist must not be blindly retried");
+            }
+            let window_secs = request.window_secs();
+            match self.outcome {
+                PersistStub::Allow => {
+                    self.identity_charged
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.community_charged
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.fleet_charged
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(HierarchicalAdmissionOutcome::Allowed {
+                        identity: buzz_auth::RateLimitResult::allowed(
+                            1,
+                            request.limits.identity,
+                            window_secs,
+                        ),
+                        community: buzz_auth::RateLimitResult::allowed(
+                            1,
+                            request.limits.community,
+                            window_secs,
+                        ),
+                        fleet: buzz_auth::RateLimitResult::allowed(
+                            1,
+                            request.limits.fleet,
+                            window_secs,
+                        ),
+                    })
+                }
+                PersistStub::DenyIdentity => Ok(HierarchicalAdmissionOutcome::IdentityDenied(
+                    buzz_auth::RateLimitResult::denied(
+                        request.limits.identity + 1,
+                        request.limits.identity,
+                        11,
+                    ),
+                )),
+                PersistStub::DenyCommunity => Ok(HierarchicalAdmissionOutcome::CommunityDenied(
+                    buzz_auth::RateLimitResult::denied(
+                        request.limits.community + 1,
+                        request.limits.community,
+                        17,
+                    ),
+                )),
+                PersistStub::DenyFleet => Ok(HierarchicalAdmissionOutcome::FleetDenied(
+                    buzz_auth::RateLimitResult::denied(
+                        request.limits.fleet + 1,
+                        request.limits.fleet,
+                        23,
+                    ),
+                )),
+                PersistStub::PreMutation => Err(buzz_auth::AuthError::Internal(
+                    "hierarchical admission counter is corrupt".into(),
+                )),
+                PersistStub::AmbiguousCharged => {
+                    self.identity_charged
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.community_charged
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.fleet_charged
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(buzz_auth::AuthError::Internal(
+                        "hierarchical persist reply lost".into(),
+                    ))
+                }
+                PersistStub::AmbiguousUncharged => Err(buzz_auth::AuthError::Internal(
+                    "hierarchical persist reply lost".into(),
+                )),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_persist_outcome_matrix_never_charges_a_subset() {
+        let tenant = keyed_admission_tenant();
+        let principal = nostr::Keys::generate().public_key();
+
+        let allow = PersistMatrixLimiter::new(PersistStub::Allow);
+        admit_keyed_persist_miss(&allow, &tenant, &principal, 300)
+            .await
+            .expect("allow");
+        assert_eq!(allow.charges(), (1, 1, 1, 1));
+
+        let identity = PersistMatrixLimiter::new(PersistStub::DenyIdentity);
+        match admit_keyed_persist_miss(&identity, &tenant, &principal, 300).await {
+            Err(KeyedHttpError::Principal(crate::admission::AdmissionError::Exceeded {
+                reset_in_secs: 11,
+            })) => {}
+            other => panic!("identity deny must stay Principal, got {other:?}"),
+        }
+        assert_eq!(identity.charges(), (1, 0, 0, 0));
+
+        let community = PersistMatrixLimiter::new(PersistStub::DenyCommunity);
+        match admit_keyed_persist_miss(&community, &tenant, &principal, 300).await {
+            Err(KeyedHttpError::Busy {
+                retry_after_secs: 17,
+            }) => {}
+            other => panic!("community deny must stay Busy, got {other:?}"),
+        }
+        assert_eq!(community.charges(), (1, 0, 0, 0));
+
+        let fleet = PersistMatrixLimiter::new(PersistStub::DenyFleet);
+        match admit_keyed_persist_miss(&fleet, &tenant, &principal, 300).await {
+            Err(KeyedHttpError::Busy {
+                retry_after_secs: 23,
+            }) => {}
+            other => panic!("fleet deny must stay Busy, got {other:?}"),
+        }
+        assert_eq!(fleet.charges(), (1, 0, 0, 0));
+
+        let pre = PersistMatrixLimiter::new(PersistStub::PreMutation);
+        match admit_keyed_persist_miss(&pre, &tenant, &principal, 300).await {
+            Err(KeyedHttpError::Busy { retry_after_secs }) => {
+                assert_eq!(retry_after_secs, KEYED_BUSY_RETRY_AFTER_SECS);
+            }
+            other => panic!("pre-mutation must fail closed Busy, got {other:?}"),
+        }
+        assert_eq!(pre.charges(), (1, 0, 0, 0));
+
+        for stub in [
+            PersistStub::AmbiguousCharged,
+            PersistStub::AmbiguousUncharged,
+        ] {
+            let limiter = PersistMatrixLimiter::new(stub);
+            match admit_keyed_persist_miss(&limiter, &tenant, &principal, 300).await {
+                Err(KeyedHttpError::Busy { .. }) => {}
+                other => panic!("ambiguous persist must fail closed, got {other:?}"),
+            }
+            let (calls, identity_c, community_c, fleet_c) = limiter.charges();
+            assert_eq!(calls, 1);
+            assert_eq!(identity_c, community_c);
+            assert_eq!(community_c, fleet_c);
+            if matches!(stub, PersistStub::AmbiguousCharged) {
+                assert_eq!(identity_c, 1);
+            } else {
+                assert_eq!(identity_c, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_persist_boundary_still_all_or_none() {
+        let tenant = keyed_admission_tenant();
+        let principal = nostr::Keys::generate().public_key();
+        let limiter = std::sync::Arc::new(PersistMatrixLimiter::new(PersistStub::Allow));
+        let a = admit_keyed_persist_miss(limiter.as_ref(), &tenant, &principal, 300);
+        let b = admit_keyed_persist_miss(limiter.as_ref(), &tenant, &principal, 300);
+        let (ra, rb) = tokio::join!(a, b);
+        ra.expect("first concurrent persist");
+        rb.expect("second concurrent persist");
+        let (calls, identity_c, community_c, fleet_c) = limiter.charges();
+        assert_eq!(calls, 2);
+        assert_eq!(identity_c, 2);
+        assert_eq!(community_c, 2);
+        assert_eq!(fleet_c, 2);
+    }
+
+    #[test]
+    fn reserved_keyed_community_principal_bytes_and_paired_window_are_exact() {
+        let mut reserved = [0u8; 32];
+        reserved[31] = 1;
+        assert_eq!(keyed_community_admission_principal().to_bytes(), reserved);
+        assert_eq!(KEYED_EVENTS_FLEET_ADMISSION_WINDOW_SECS, 60);
+        assert_eq!(KEYED_EVENTS_FLEET_ADMISSION_WINDOW.get(), 60);
+    }
+
+    #[test]
+    fn keyed_fleet_admission_is_tenant_fair_under_the_aggregate_ceiling() {
+        const {
+            assert!(KEYED_EVENTS_COMMUNITY_ADMISSION_PER_MIN < KEYED_EVENTS_FLEET_ADMISSION_PER_MIN)
+        };
+        let community_a = Uuid::from_u128(1);
+        let community_b = Uuid::from_u128(2);
+        assert_ne!(community_a, community_b);
+        let principal = keyed_community_admission_principal();
+        let user = nostr::Keys::generate().public_key();
+        assert_ne!(principal, user);
+        assert_eq!(KEYED_COMMUNITY_ADMISSION_LIMIT_TYPE, LimitType::ApiCalls);
+        let mut community_used: std::collections::HashMap<Uuid, u64> =
+            std::collections::HashMap::new();
+        let mut fleet_used = 0u64;
+        let mut admit = |community: Uuid| -> bool {
+            let count = community_used.entry(community).or_insert(0);
+            if *count >= KEYED_EVENTS_COMMUNITY_ADMISSION_PER_MIN {
+                return false;
+            }
+            if fleet_used >= KEYED_EVENTS_FLEET_ADMISSION_PER_MIN {
+                return false;
+            }
+            *count += 1;
+            fleet_used += 1;
+            true
+        };
+        for _ in 0..KEYED_EVENTS_COMMUNITY_ADMISSION_PER_MIN {
+            assert!(
+                admit(community_a),
+                "community A must be admitted up to its per-tenant share"
+            );
+        }
+        assert!(
+            !admit(community_a),
+            "an exhausted community must not keep charging the fleet sentinel"
+        );
+        assert!(
+            admit(community_b),
+            "a distinct community must still admit while fleet capacity remains"
+        );
+        assert_eq!(fleet_used, KEYED_EVENTS_COMMUNITY_ADMISSION_PER_MIN + 1);
+        assert!(
+            fleet_used < KEYED_EVENTS_FLEET_ADMISSION_PER_MIN,
+            "protected fleet capacity must remain after one community is exhausted"
+        );
+    }
+
+    #[test]
+    fn keyed_ingress_caps_are_compile_time_isolated() {
+        const {
+            assert!(KEYED_INGRESS_COMMUNITY_MAX > 0);
+            assert!(KEYED_INGRESS_COMMUNITY_MAX < KEYED_INGRESS_GLOBAL_MAX);
+            assert!(KEYED_INGRESS_COMMUNITY_MAX * 2 <= KEYED_INGRESS_GLOBAL_MAX);
+        }
+        assert_eq!(KEYED_INGRESS_GLOBAL_MAX, 32);
+        assert_eq!(KEYED_INGRESS_COMMUNITY_MAX, 16);
+        assert_eq!(KEYED_EARLY_DEADLINE_SECS, 5);
+    }
+
+    #[test]
+    fn keyed_ingress_community_saturation_isolates_and_reclaims() {
+        let _lock = lock_keyed_ingress_tests();
+        let community_a = Uuid::from_u128(0xA11);
+        let community_b = Uuid::from_u128(0xB22);
+        let global_before = keyed_ingress_global_available();
+        let mut held_a = Vec::new();
+        for _ in 0..KEYED_INGRESS_COMMUNITY_MAX {
+            held_a.push(try_acquire_keyed_ingress(community_a).expect("community A permit"));
+        }
+        match try_acquire_keyed_ingress(community_a) {
+            Err(KeyedHttpError::Busy { retry_after_secs }) => {
+                assert_eq!(retry_after_secs, KEYED_BUSY_RETRY_AFTER_SECS);
+            }
+            other => panic!("community A at 16 must fail fast, got {other:?}"),
+        }
+        let b = try_acquire_keyed_ingress(community_b).expect("community B still admits");
+        assert!(keyed_ingress_registry_contains(community_a));
+        assert!(keyed_ingress_registry_contains(community_b));
+        assert_eq!(
+            keyed_ingress_live_handles(community_a),
+            Some(KEYED_INGRESS_COMMUNITY_MAX)
+        );
+        drop(held_a);
+        drop(b);
+        assert_eq!(keyed_ingress_global_available(), global_before);
+        assert!(!keyed_ingress_registry_contains(community_a));
+        assert!(!keyed_ingress_registry_contains(community_b));
+        assert_eq!(keyed_ingress_registry_len(), 0);
+    }
+
+    #[test]
+    fn keyed_ingress_global_saturation_fails_fast() {
+        let _lock = lock_keyed_ingress_tests();
+        let community_a = Uuid::from_u128(0xC33);
+        let community_b = Uuid::from_u128(0xD44);
+        let community_c = Uuid::from_u128(0xE55);
+        let mut held = Vec::new();
+        for _ in 0..KEYED_INGRESS_COMMUNITY_MAX {
+            held.push(try_acquire_keyed_ingress(community_a).expect("A"));
+        }
+        for _ in 0..KEYED_INGRESS_COMMUNITY_MAX {
+            held.push(try_acquire_keyed_ingress(community_b).expect("B"));
+        }
+        assert_eq!(keyed_ingress_global_available(), 0);
+        match try_acquire_keyed_ingress(community_c) {
+            Err(KeyedHttpError::Busy { .. }) => {}
+            other => panic!("global 32 must fail fast, got {other:?}"),
+        }
+        drop(held);
+        assert_eq!(keyed_ingress_global_available(), KEYED_INGRESS_GLOBAL_MAX);
+        assert_eq!(keyed_ingress_registry_len(), 0);
+    }
+
+    #[test]
+    fn keyed_ingress_releases_on_panic() {
+        let _lock = lock_keyed_ingress_tests();
+        let community = Uuid::from_u128(0xF66);
+        let before = keyed_ingress_global_available();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = try_acquire_keyed_ingress(community).expect("permit");
+            panic!("ingress must drop on unwind");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(keyed_ingress_global_available(), before);
+        assert!(!keyed_ingress_registry_contains(community));
+    }
+
+    #[tokio::test]
+    async fn keyed_ingress_releases_on_cancellation() {
+        let _lock = lock_keyed_ingress_tests_async().await;
+        let community = Uuid::from_u128(0xCA11);
+        let before = keyed_ingress_global_available();
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _guard = try_acquire_keyed_ingress(community).expect("permit");
+            let _ = acquired_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        acquired_rx.await.expect("acquired");
+        assert_eq!(keyed_ingress_global_available(), before - 1);
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(keyed_ingress_global_available(), before);
+        assert!(!keyed_ingress_registry_contains(community));
+    }
+
+    #[test]
+    fn keyed_ingress_releases_on_error_return() {
+        let _lock = lock_keyed_ingress_tests();
+        let community = Uuid::from_u128(0xE77);
+        let before = keyed_ingress_global_available();
+        let result: Result<(), KeyedHttpError> = (|| {
+            let _guard = try_acquire_keyed_ingress(community)?;
+            Err(keyed_busy_default())
+        })();
+        assert!(result.is_err());
+        assert_eq!(keyed_ingress_global_available(), before);
+        assert!(!keyed_ingress_registry_contains(community));
+        assert_eq!(keyed_ingress_live_handles(community), None);
+    }
+
+    #[test]
+    fn keyed_ingress_reclaim_does_not_alias_across_aba() {
+        let _lock = lock_keyed_ingress_tests();
+        let community = Uuid::from_u128(0xABA1);
+        let first = try_acquire_keyed_ingress(community).expect("first generation");
+        assert_eq!(keyed_ingress_live_handles(community), Some(1));
+        drop(first);
+        assert!(!keyed_ingress_registry_contains(community));
+        let second = try_acquire_keyed_ingress(community).expect("reclaimed generation");
+        assert_eq!(keyed_ingress_live_handles(community), Some(1));
+        assert!(keyed_ingress_registry_contains(community));
+        drop(second);
+        assert!(!keyed_ingress_registry_contains(community));
+        assert_eq!(keyed_ingress_registry_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_early_future_hits_shared_five_second_deadline() {
+        let deadline = KeyedEarlyDeadline::from_budget(Duration::from_millis(20));
+        let started = Instant::now();
+        let result = deadline
+            .run(std::future::pending::<Result<(), KeyedHttpError>>())
+            .await;
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(
+            matches!(
+                result,
+                Err(KeyedHttpError::Busy {
+                    retry_after_secs: 5
+                })
+            ),
+            "got {result:?}"
+        );
+    }
+
+    fn wait_watch_in_flight_sync(guard: &KeyedVerifyWatchGuard, expected: usize) {
+        let started = Instant::now();
+        while guard.in_flight() != expected {
+            if started.elapsed() > Duration::from_secs(1) {
+                panic!(
+                    "watched verification in-flight {}, expected {expected}",
+                    guard.in_flight()
+                );
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    async fn wait_watch_in_flight(guard: &KeyedVerifyWatchGuard, expected: usize) {
+        let started = Instant::now();
+        while guard.in_flight() != expected {
+            if started.elapsed() > Duration::from_secs(1) {
+                panic!(
+                    "watched verification in-flight {}, expected {expected}",
+                    guard.in_flight()
+                );
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[test]
+    fn keyed_verification_leaves_no_detached_work() {
+        let _lock = lock_keyed_ingress_tests();
+        let keys = nostr::Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "fresh")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let mut guard = install_keyed_verify_watch(event.id);
+        guard.hold();
+        guard.spawn_joined_verify(event);
+        wait_watch_in_flight_sync(&guard, 1);
+        assert_eq!(guard.in_flight(), 1);
+        guard.release();
+        guard.join_verify().expect("verified");
+        assert_eq!(guard.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_verification_cancellation_keeps_ingress_until_cpu_completes() {
+        let _lock = lock_keyed_ingress_tests_async().await;
+        let keys = nostr::Keys::generate();
+        let event = signed_kind9(&keys, "fresh", Vec::new());
+        let guard = install_keyed_verify_watch(event.id);
+        guard.hold();
+        let community = Uuid::from_u128(0xCA17);
+        let before = keyed_ingress_global_available();
+        let ingress = try_acquire_keyed_ingress(community).expect("permit");
+        assert_eq!(keyed_ingress_global_available(), before - 1);
+        let early = KeyedHttpEarlyContext {
+            ingress: Some(ingress),
+            deadline: KeyedEarlyDeadline::start(),
+            verified_owner: None,
+        };
+        let auth = http_auth_for(&keys);
+        let handle = tokio::spawn(async move {
+            KeyedHttpValidatedEvent::validate_with_early(event, auth, early).await
+        });
+        wait_watch_in_flight(&guard, 1).await;
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(
+            keyed_ingress_global_available(),
+            before - 1,
+            "ingress must stay held while watched CPU is blocked"
+        );
+        guard.release();
+        wait_watch_in_flight(&guard, 0).await;
+        let released = Instant::now();
+        while keyed_ingress_global_available() != before {
+            if released.elapsed() > Duration::from_secs(1) {
+                panic!("ingress must release only after watched CPU completion");
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_validate_with_early_returns_the_same_live_context() {
+        let _lock = lock_keyed_ingress_tests_async().await;
+        let keys = nostr::Keys::generate();
+        let event = signed_kind9(&keys, "fresh", Vec::new());
+        let community = Uuid::from_u128(0xCA18);
+        let before = keyed_ingress_global_available();
+        let ingress = try_acquire_keyed_ingress(community).expect("permit");
+        let deadline = KeyedEarlyDeadline::start();
+        let early = KeyedHttpEarlyContext {
+            ingress: Some(ingress),
+            deadline,
+            verified_owner: None,
+        };
+        let (validated, early) =
+            KeyedHttpValidatedEvent::validate_with_early(event, http_auth_for(&keys), early)
+                .await
+                .expect("validated");
+        assert_eq!(event_kind_u32(validated.event()), KIND_STREAM_MESSAGE);
+        assert!(early.ingress.is_some());
+        assert!(early.deadline.same_absolute_clock(deadline));
+        assert_eq!(keyed_ingress_global_available(), before - 1);
+        drop(early);
+        assert_eq!(keyed_ingress_global_available(), before);
+    }
+
+    #[tokio::test]
+    async fn keyed_validate_with_early_join_error_maps_internal_and_releases_after_unwind() {
+        let _lock = lock_keyed_ingress_tests_async().await;
+        let keys = nostr::Keys::generate();
+        let event = signed_kind9(&keys, "fresh", Vec::new());
+        let guard = install_keyed_verify_watch(event.id);
+        guard.arm_panic();
+        let community = Uuid::from_u128(0xCA19);
+        let before = keyed_ingress_global_available();
+        let ingress = try_acquire_keyed_ingress(community).expect("permit");
+        let early = KeyedHttpEarlyContext {
+            ingress: Some(ingress),
+            deadline: KeyedEarlyDeadline::start(),
+            verified_owner: None,
+        };
+        let err = KeyedHttpValidatedEvent::validate_with_early(event, http_auth_for(&keys), early)
+            .await
+            .err()
+            .expect("join error");
+        assert!(matches!(
+            err,
+            IngestError::Internal(ref msg) if msg == "error: internal verification error"
+        ));
+        assert_eq!(keyed_ingress_global_available(), before);
+        assert_eq!(guard.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_validate_with_early_invalid_signature_keeps_rejected_mapping() {
+        let _lock = lock_keyed_ingress_tests_async().await;
+        let keys = nostr::Keys::generate();
+        let event = signed_kind9(&keys, "fresh", Vec::new());
+        let mut value = serde_json::to_value(&event).expect("json");
+        let sig = value
+            .get("sig")
+            .and_then(|v| v.as_str())
+            .expect("sig")
+            .to_owned();
+        let flipped = format!(
+            "{}{}",
+            if sig.as_bytes()[0] == b'0' { '1' } else { '0' },
+            &sig[1..]
+        );
+        value["sig"] = serde_json::Value::String(flipped);
+        let forged: Event = serde_json::from_value(value).expect("forged event");
+        let community = Uuid::from_u128(0xCA1A);
+        let before = keyed_ingress_global_available();
+        let ingress = try_acquire_keyed_ingress(community).expect("permit");
+        let early = KeyedHttpEarlyContext {
+            ingress: Some(ingress),
+            deadline: KeyedEarlyDeadline::start(),
+            verified_owner: None,
+        };
+        let err = KeyedHttpValidatedEvent::validate_with_early(forged, http_auth_for(&keys), early)
+            .await
+            .err()
+            .expect("forged sig");
+        assert!(matches!(err, IngestError::Rejected(ref msg) if msg.starts_with("invalid:")));
+        assert_eq!(keyed_ingress_global_available(), before);
     }
 
     #[test]
@@ -5536,5 +9440,14 @@ mod postgres_tests {
             counts.get(&("ws".to_owned(), "invalid".to_owned())),
             Some(&1)
         );
+    }
+}
+
+#[cfg(test)]
+mod postgres_tests {
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn ingest_write_fence_follows_community_deletion_lifecycle() {
+        super::tests::ingest_write_fence_follows_community_deletion_lifecycle().await;
     }
 }

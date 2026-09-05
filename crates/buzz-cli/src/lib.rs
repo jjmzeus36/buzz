@@ -94,6 +94,10 @@ struct Cli {
     #[arg(long, value_enum, default_value = "json")]
     format: OutputFormat,
 
+    /// Optional 64-character lowercase hex Idempotency-Key for kind 9 `messages send`.
+    #[arg(long = "idempotency-key", global = true)]
+    idempotency_key: Option<String>,
+
     #[command(subcommand)]
     command: Cmd,
 }
@@ -2054,6 +2058,14 @@ fn normalize_auth_tag_input(input: &str) -> String {
 }
 
 async fn run(cli: Cli) -> Result<(), CliError> {
+    if cli.idempotency_key.is_some()
+        && !matches!(cli.command, Cmd::Messages(MessagesCmd::Send { .. }))
+    {
+        return Err(CliError::Usage(
+            "--idempotency-key is only valid on `messages send`".into(),
+        ));
+    }
+
     let relay_url = client::normalize_relay_url(&cli.relay);
 
     // Pack commands are local-only — no relay connection needed.
@@ -2103,7 +2115,18 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 
     match cli.command {
         Cmd::Agents(sub) => commands::agents::dispatch(sub, &client).await,
-        Cmd::Messages(sub) => commands::messages::dispatch(sub, &client, &cli.format).await,
+        Cmd::Messages(sub) => match cli.idempotency_key {
+            Some(key) => {
+                commands::messages::dispatch_with_idempotency_key(
+                    sub,
+                    &client,
+                    &cli.format,
+                    Some(key),
+                )
+                .await
+            }
+            None => commands::messages::dispatch(sub, &client, &cli.format).await,
+        },
         Cmd::Channels(sub) => commands::channels::dispatch(sub, &client, &cli.format).await,
         Cmd::Canvas(sub) => commands::channels::dispatch_canvas(sub, &client).await,
         Cmd::Reactions(sub) => commands::reactions::dispatch(sub, &client).await,

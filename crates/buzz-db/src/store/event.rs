@@ -344,18 +344,30 @@ async fn huddle_started_link_exists_with_operation(
 /// Insert a Nostr event. Rejects AUTH and ephemeral kinds.
 ///
 /// Returns `(StoredEvent, was_inserted)` — `was_inserted` is `false` on duplicate.
+/// Event rows and mention index rows share this transaction. A valid event
+/// with no indexed `p` tags still uses one transaction and does not open a
+/// second connection after commit.
 pub async fn insert_event(
     pool: &PgPool,
     community_id: CommunityId,
     event: &Event,
     channel_id: Option<Uuid>,
 ) -> Result<(StoredEvent, bool)> {
-    let mut connection = crate::observability::acquire_writer(
+    let enforced = crate::runtime::enforce_kind9_p_tag_limit(event)?;
+    let connection = crate::observability::acquire_writer(
         pool,
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    insert_event_on(&mut connection, community_id, event, channel_id).await
+    let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    let result =
+        insert_event_already_validated(tx.as_mut(), community_id, event, channel_id, enforced)
+            .await?;
+    if result.1 {
+        crate::insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
+    }
+    tx.commit().await?;
+    Ok(result)
 }
 
 /// Insert a Nostr event in a caller-owned PostgreSQL transaction.
@@ -369,14 +381,16 @@ pub async fn insert_event_in_transaction(
     event: &Event,
     channel_id: Option<Uuid>,
 ) -> Result<(StoredEvent, bool)> {
-    insert_event_on(tx.as_mut(), community_id, event, channel_id).await
+    let enforced = crate::runtime::enforce_kind9_p_tag_limit(event)?;
+    insert_event_already_validated(tx.as_mut(), community_id, event, channel_id, enforced).await
 }
 
-async fn insert_event_on(
+async fn insert_event_already_validated(
     connection: &mut PgConnection,
     community_id: CommunityId,
     event: &Event,
     channel_id: Option<Uuid>,
+    _enforced: crate::runtime::Kind9PTagLimitEnforced,
 ) -> Result<(StoredEvent, bool)> {
     let kind_u16 = event.kind.as_u16();
     let kind_u32 = u32::from(kind_u16);
@@ -1338,6 +1352,26 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
     channel_id: Option<Uuid>,
     thread_meta: Option<ThreadMetadataParams<'_>>,
 ) -> Result<(StoredEvent, bool)> {
+    let enforced = crate::runtime::enforce_kind9_p_tag_limit(event)?;
+    insert_event_with_thread_metadata_already_validated(
+        tx,
+        community_id,
+        event,
+        channel_id,
+        thread_meta,
+        enforced,
+    )
+    .await
+}
+
+pub(crate) async fn insert_event_with_thread_metadata_already_validated(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    event: &Event,
+    channel_id: Option<Uuid>,
+    thread_meta: Option<ThreadMetadataParams<'_>>,
+    _enforced: crate::runtime::Kind9PTagLimitEnforced,
+) -> Result<(StoredEvent, bool)> {
     let kind_u16 = event.kind.as_u16();
     let kind_u32 = u32::from(kind_u16);
 
@@ -1500,13 +1534,16 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
     ))
 }
 
-/// Atomically insert an event and its optional thread metadata.
+/// Atomically insert an event, optional thread metadata, and mention index rows.
 ///
 /// `insert_event` and `insert_thread_metadata` calls could leave reply counters
 /// inconsistent if one succeeded and the other failed. Keep this as one
-/// transaction so reply metadata and counters commit together with the event.
+/// transaction so reply metadata, counters, and mentions commit together
+/// with the event.
 ///
-/// Returns `(StoredEvent, was_inserted)`.
+/// Returns `(StoredEvent, was_inserted)`. Duplicate event rows skip mention
+/// insertion. A valid event with no indexed `p` tags does not open a second
+/// transaction after commit.
 pub async fn insert_event_with_thread_metadata(
     pool: &PgPool,
     community_id: CommunityId,
@@ -1514,15 +1551,25 @@ pub async fn insert_event_with_thread_metadata(
     channel_id: Option<Uuid>,
     thread_meta: Option<ThreadMetadataParams<'_>>,
 ) -> Result<(StoredEvent, bool)> {
+    let enforced = crate::runtime::enforce_kind9_p_tag_limit(event)?;
     let connection = crate::observability::acquire_writer(
         pool,
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
     let mut tx = sqlx::Transaction::begin(connection, None).await?;
-    let result =
-        insert_event_with_thread_metadata_tx(&mut tx, community_id, event, channel_id, thread_meta)
-            .await?;
+    let result = insert_event_with_thread_metadata_already_validated(
+        &mut tx,
+        community_id,
+        event,
+        channel_id,
+        thread_meta,
+        enforced,
+    )
+    .await?;
+    if result.1 {
+        crate::insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
+    }
     tx.commit().await?;
     Ok(result)
 }
@@ -1536,16 +1583,7 @@ impl Db {
         event: &nostr::Event,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
-        let result =
-            crate::event::insert_event(&self.pool, community_id, event, channel_id).await?;
-        if result.1 {
-            if let Err(e) =
-                crate::insert_mentions(&self.pool, community_id, event, channel_id).await
-            {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-            }
-        }
-        Ok(result)
+        crate::event::insert_event(&self.pool, community_id, event, channel_id).await
     }
 
     /// Queries events matching the given filter parameters.
@@ -2044,22 +2082,14 @@ impl Db {
         channel_id: Option<Uuid>,
         thread_meta: Option<crate::event::ThreadMetadataParams<'_>>,
     ) -> Result<(StoredEvent, bool)> {
-        let result = crate::event::insert_event_with_thread_metadata(
+        crate::event::insert_event_with_thread_metadata(
             &self.pool,
             community_id,
             event,
             channel_id,
             thread_meta,
         )
-        .await?;
-        if result.1 {
-            if let Err(e) =
-                crate::insert_mentions(&self.pool, community_id, event, channel_id).await
-            {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-            }
-        }
-        Ok(result)
+        .await
     }
 
     /// Backfill `d_tag` for existing NIP-33 events (kind 30000–39999) that have `d_tag IS NULL`.
@@ -2119,14 +2149,8 @@ mod postgres_tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
-
     async fn setup_pool() -> PgPool {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
-
-        PgPool::connect(&database_url)
+        PgPool::connect(&crate::test_support::database_url())
             .await
             .expect("connect to test DB")
     }

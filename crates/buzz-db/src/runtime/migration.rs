@@ -194,13 +194,11 @@ mod postgres_tests {
         path::{Path, PathBuf},
     };
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
-
     /// Connection parameters parsed out of a PostgreSQL URL so the parity test
     /// can pass them to the `bin/pgschema` binary, which
     /// takes discrete `--host/--port/--user/--password/--db` flags rather than a
     /// URL. Only the shapes this test emits (`BUZZ_TEST_DATABASE_URL` /
-    /// `DATABASE_URL` / `TEST_DB_URL`) are supported.
+    /// `TEST_DATABASE_URL` / `DATABASE_URL` / `TEST_DB_URL`) are supported.
     struct PgConn {
         host: String,
         port: u16,
@@ -489,6 +487,7 @@ mod postgres_tests {
             "relay_admin_actions",
             "relay_admin_outbox",
             "relay_operator_audit",
+            "event_idempotency_reaper_cursor",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
                 globals.insert(value.to_owned());
@@ -702,7 +701,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 44);
+        assert_eq!(migrations.len(), 45);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1287,6 +1286,11 @@ mod postgres_tests {
             desired_schema.contains("'rate_limit_violations'\n    ]::TEXT[])"),
             "schema.sql exclusion list must match the pre-0041 body after ledger removal"
         );
+
+        assert_eq!(migrations[44].version, 45);
+        let event_idempotency = migrations[44].sql.as_str();
+        assert!(event_idempotency.contains("CREATE TABLE event_idempotency_keys"));
+        assert!(event_idempotency.contains("CREATE TABLE event_idempotency_reaper_cursor"));
     }
 
     #[test]
@@ -1382,6 +1386,145 @@ mod postgres_tests {
         let desired_schema = include_str!("../../../../schema/schema.sql");
         assert!(desired_schema.contains("NEW.kind IN (9, 40002, 45001, 45003)"));
         assert!(!desired_schema.contains("NEW.kind IN (7, 9, 1059, 40007, 46010)"));
+    }
+
+    #[test]
+    fn event_idempotency_migration_matches_desired_schema() {
+        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
+        migrations.sort_by_key(|migration| migration.version);
+
+        assert_eq!(migrations[44].version, 45);
+        let sql = migrations[44].sql.as_str();
+        assert!(sql.contains("CREATE TABLE event_idempotency_keys"));
+        assert!(sql.contains("PRIMARY KEY (community_id, author_pubkey, idempotency_key)"));
+        assert!(sql.contains("octet_length(author_pubkey) = 32"));
+        assert!(sql.contains("octet_length(idempotency_key) = 32"));
+        assert!(sql.contains("octet_length(intent_hash) = 32"));
+        assert!(sql.contains("octet_length(event_id) = 32"));
+        assert!(sql.contains("CREATE FUNCTION prevent_event_idempotency_keys_update()"));
+        assert!(sql.contains("CREATE TRIGGER event_idempotency_keys_immutable"));
+        assert!(sql.contains("BEFORE UPDATE ON event_idempotency_keys"));
+        assert!(sql.contains("SELECT attach_community_write_fence('event_idempotency_keys')"));
+        assert!(sql.contains(
+            "ON event_idempotency_keys (created_at, community_id, author_pubkey, idempotency_key)"
+        ));
+        assert!(sql.contains(
+            "ON event_idempotency_keys (community_id, created_at, author_pubkey, idempotency_key)"
+        ));
+        assert!(sql.contains("idx_event_idempotency_keys_community_created_at"));
+        assert!(sql.contains("created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()"));
+        assert!(!sql.contains("created_at       TIMESTAMPTZ NOT NULL DEFAULT now()"));
+        assert!(sql.contains(
+            "reservation_witness BYTEA NOT NULL CHECK (octet_length(reservation_witness) = 32)"
+        ));
+        assert!(sql.contains("CREATE TABLE event_idempotency_reaper_cursor"));
+        assert!(sql.contains("id SMALLINT PRIMARY KEY CHECK (id = 1)"));
+        assert!(sql.contains("after_community_id UUID"));
+        assert!(sql.contains(
+            "INSERT INTO event_idempotency_reaper_cursor (id, after_community_id) VALUES (1, NULL)"
+        ));
+        assert!(sql.contains("('event_idempotency_reaper_cursor'"));
+        assert!(!sql.contains("attach_community_write_fence('event_idempotency_reaper_cursor')"));
+
+        let desired_schema = include_str!("../../../../schema/schema.sql");
+        assert!(desired_schema.contains("CREATE TABLE event_idempotency_keys"));
+        assert!(
+            desired_schema.contains("PRIMARY KEY (community_id, author_pubkey, idempotency_key)")
+        );
+        assert!(desired_schema.contains("octet_length(author_pubkey) = 32"));
+        assert!(desired_schema.contains("CREATE FUNCTION prevent_event_idempotency_keys_update()"));
+        assert!(desired_schema.contains("CREATE TRIGGER event_idempotency_keys_immutable"));
+        assert!(desired_schema.contains("BEFORE UPDATE ON event_idempotency_keys"));
+        assert!(desired_schema
+            .contains("SELECT attach_community_write_fence('event_idempotency_keys')"));
+        let attach_helper = desired_schema
+            .find("CREATE FUNCTION attach_community_write_fence")
+            .expect("fence helper");
+        let attach_call = desired_schema
+            .find("SELECT attach_community_write_fence('event_idempotency_keys')")
+            .expect("fence attach call");
+        assert!(
+            attach_call > attach_helper,
+            "fence attach must sit in the post-helper block"
+        );
+        assert!(desired_schema.contains(
+            "ON event_idempotency_keys (created_at, community_id, author_pubkey, idempotency_key)",
+        ));
+        assert!(desired_schema.contains(
+            "ON event_idempotency_keys (community_id, created_at, author_pubkey, idempotency_key)",
+        ));
+        assert!(desired_schema.contains("idx_event_idempotency_keys_community_created_at"));
+        assert!(desired_schema
+            .contains("created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()"));
+        assert!(desired_schema.contains(
+            "reservation_witness BYTEA NOT NULL CHECK (octet_length(reservation_witness) = 32)"
+        ));
+        assert!(desired_schema.contains("CREATE TABLE event_idempotency_reaper_cursor"));
+        assert!(desired_schema.contains("id SMALLINT PRIMARY KEY CHECK (id = 1)"));
+        assert!(desired_schema.contains("after_community_id UUID"));
+        assert!(desired_schema.contains(
+            "INSERT INTO event_idempotency_reaper_cursor (id, after_community_id) VALUES (1, NULL)"
+        ));
+        assert!(desired_schema.contains("('event_idempotency_reaper_cursor'"));
+        assert!(!desired_schema
+            .contains("attach_community_write_fence('event_idempotency_reaper_cursor')"));
+
+        let pgschema_reconciliation =
+            include_str!("../../../../scripts/reconcile-schema-after-pgschema.sql");
+        assert!(pgschema_reconciliation
+            .contains("INSERT INTO event_idempotency_reaper_cursor (id, after_community_id)"));
+        assert!(pgschema_reconciliation.contains("ON CONFLICT (id) DO NOTHING"));
+        assert!(pgschema_reconciliation.contains("'event_idempotency_reaper_cursor'"));
+        assert!(pgschema_reconciliation.contains("has_table_privilege"));
+        assert!(pgschema_reconciliation.contains("'SELECT'"));
+        assert!(pgschema_reconciliation.contains("'UPDATE'"));
+        assert!(pgschema_reconciliation.contains("reservation_witness"));
+        assert!(
+            pgschema_reconciliation.contains("event_idempotency_keys_reservation_witness_check")
+        );
+        assert!(pgschema_reconciliation.contains("'reservation_witness'"));
+
+        let registry_create = desired_schema
+            .find("CREATE TABLE _operator_global_tables")
+            .expect("desired-state registry table");
+        let cursor_registry = desired_schema
+            .find("('event_idempotency_reaper_cursor'")
+            .expect("desired-state cursor registry row");
+        assert!(
+            cursor_registry > registry_create,
+            "event_idempotency_reaper_cursor registry write must follow CREATE TABLE _operator_global_tables"
+        );
+    }
+
+    #[test]
+    fn desired_schema_registry_writes_follow_registry_table() {
+        let sql = include_str!("../../../../schema/schema.sql");
+        let create = sql
+            .find("CREATE TABLE _operator_global_tables")
+            .expect("desired-state registry table");
+        let needle = "INSERT INTO _operator_global_tables";
+        let mut from = 0;
+        let mut inserts = 0usize;
+        while let Some(rel) = sql[from..].find(needle) {
+            let pos = from + rel;
+            assert!(
+                pos > create,
+                "desired-state registry write at byte {pos} precedes CREATE TABLE at {create}"
+            );
+            inserts += 1;
+            from = pos + needle.len();
+        }
+        assert!(
+            inserts >= 1,
+            "desired-state must insert operator-global registry rows"
+        );
+        let cursor_row = sql
+            .find("('event_idempotency_reaper_cursor'")
+            .expect("cursor registry row");
+        assert!(
+            cursor_row > create,
+            "clean desired-state execution cannot register event_idempotency_reaper_cursor before the registry table exists"
+        );
     }
 
     #[test]
@@ -1822,6 +1965,7 @@ mod postgres_tests {
         let mut expected_fences = migration.fence_attachments.clone();
         expected_fences.remove("product_feedback");
         expected_fences.remove("rate_limit_violations");
+        expected_fences.insert("event_idempotency_keys".to_owned());
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"
@@ -1925,9 +2069,7 @@ mod postgres_tests {
 
         // Dedicated database: the probe table and the orphaned backend must
         // stay invisible to concurrent tests in the shared database.
-        let base_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let base_url = crate::test_support::database_url();
         let admin = PgPool::connect(&base_url)
             .await
             .expect("connect admin database");
@@ -2081,11 +2223,7 @@ mod postgres_tests {
     }
 
     async fn connect_test_pool() -> PgPool {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
-
-        PgPool::connect(&database_url)
+        PgPool::connect(&crate::test_support::database_url())
             .await
             .expect("connect to test DB")
     }
@@ -2118,7 +2256,7 @@ mod postgres_tests {
     ///
     /// This bootstraps one probe database from `schema.sql` **through the real
     /// `bin/pgschema apply` binary** — the exact path CI (`ci.yml`) and both
-    /// test-relay launchers take — and migrates another through 1–38, then
+    /// test-relay launchers take — and migrates another through 1–45, then
     /// asserts the three admin tables have identical column definitions (name,
     /// type, nullability, default) and identical index shapes, including each
     /// key's catalog sort/null options (`pg_index.indoption`). Columns are keyed
@@ -2136,7 +2274,158 @@ mod postgres_tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn admin_schema_parity_between_desired_state_and_migrations() {
+        use crate::Db;
         use sqlx::AssertSqlSafe;
+
+        async fn reconcile(pool: &PgPool) -> sqlx::Result<sqlx::postgres::PgQueryResult> {
+            sqlx::raw_sql(AssertSqlSafe(include_str!(
+                "../../../../scripts/reconcile-schema-after-pgschema.sql"
+            )))
+            .execute(pool)
+            .await
+        }
+
+        async fn drop_r5b_probes(pool: &PgPool) -> sqlx::Result<()> {
+            sqlx::query(
+                "ALTER TABLE event_idempotency_keys \
+                 DROP COLUMN IF EXISTS r5b_probe_nullable, \
+                 DROP COLUMN IF EXISTS r5b_probe_defaulted, \
+                 DROP COLUMN IF EXISTS r5b_probe_identity, \
+                 DROP COLUMN IF EXISTS r5b_probe_generated, \
+                 DROP COLUMN IF EXISTS r5b_probe_unsafe",
+            )
+            .execute(pool)
+            .await?;
+            sqlx::query(
+                "ALTER TABLE event_idempotency_reaper_cursor \
+                 DROP COLUMN IF EXISTS r5b_probe_nullable, \
+                 DROP COLUMN IF EXISTS r5b_probe_defaulted, \
+                 DROP COLUMN IF EXISTS r5b_probe_identity, \
+                 DROP COLUMN IF EXISTS r5b_probe_generated, \
+                 DROP COLUMN IF EXISTS r5b_probe_unsafe, \
+                 DROP COLUMN IF EXISTS community_id",
+            )
+            .execute(pool)
+            .await?;
+            Ok(())
+        }
+
+        async fn drop_probe_databases(
+            admin: &PgPool,
+            desired_db: &str,
+            migrated_db: &str,
+        ) -> Vec<String> {
+            let mut errors = Vec::new();
+            for (role, probe_db) in [("desired", desired_db), ("migrated", migrated_db)] {
+                if let Err(error) = sqlx::query(AssertSqlSafe(format!(
+                    "DROP DATABASE {probe_db} WITH (FORCE)"
+                )))
+                .execute(admin)
+                .await
+                {
+                    errors.push(format!("drop {role} database {probe_db} failed: {error}"));
+                }
+            }
+            errors
+        }
+
+        fn aggregate_phase_errors(
+            behavior: std::result::Result<(), String>,
+            cleanup: sqlx::Result<()>,
+            cleanup_context: &str,
+        ) -> Vec<String> {
+            let mut errors = Vec::new();
+            if let Err(error) = behavior {
+                errors.push(error);
+            }
+            if let Err(error) = cleanup {
+                errors.push(format!("{cleanup_context}: {error}"));
+            }
+            errors
+        }
+
+        async fn probe_shape(
+            pool: &PgPool,
+            table: &str,
+            column: &str,
+        ) -> sqlx::Result<(bool, bool, bool, Option<String>)> {
+            sqlx::query_as(
+                "SELECT att.attnotnull, (att.attidentity = 'a'), (att.attgenerated = 's'), \
+                        pg_get_expr(def.adbin, def.adrelid) \
+                   FROM pg_attribute att \
+                   JOIN pg_class tbl ON tbl.oid = att.attrelid \
+                   JOIN pg_namespace ns ON ns.oid = tbl.relnamespace \
+                   LEFT JOIN pg_attrdef def \
+                     ON def.adrelid = att.attrelid AND def.adnum = att.attnum \
+                  WHERE ns.nspname = 'public' AND tbl.relname = $1 AND att.attname = $2 \
+                    AND att.attnum > 0 AND NOT att.attisdropped",
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_one(pool)
+            .await
+        }
+
+        async fn require_shape_after_second_reconcile(
+            pool: &PgPool,
+            table: &str,
+            column: &str,
+            before: &(bool, bool, bool, Option<String>),
+            context: &str,
+        ) -> std::result::Result<(), String> {
+            let after = probe_shape(pool, table, column)
+                .await
+                .map_err(|error| format!("{context} shape after second reconcile: {error}"))?;
+            if after != *before {
+                Err(format!(
+                    "second reconcile mutated {context} shape: {before:?}->{after:?}"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn keys_probe_values(
+            pool: &PgPool,
+            community: uuid::Uuid,
+        ) -> sqlx::Result<(Option<String>, String, i64, Vec<u8>)> {
+            sqlx::query_as(
+                "SELECT r5b_probe_nullable, r5b_probe_defaulted, r5b_probe_identity, \
+                        r5b_probe_generated \
+                   FROM event_idempotency_keys WHERE community_id = $1",
+            )
+            .bind(community)
+            .fetch_one(pool)
+            .await
+        }
+
+        async fn cursor_probe_values(
+            pool: &PgPool,
+        ) -> sqlx::Result<(Option<String>, String, i64, i16)> {
+            sqlx::query_as(
+                "SELECT r5b_probe_nullable, r5b_probe_defaulted, r5b_probe_identity, \
+                        r5b_probe_generated \
+                   FROM event_idempotency_reaper_cursor WHERE id = 1",
+            )
+            .fetch_one(pool)
+            .await
+        }
+
+        async fn column_present(pool: &PgPool, table: &str, column: &str) -> sqlx::Result<bool> {
+            sqlx::query_scalar(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM pg_attribute att \
+                     JOIN pg_class tbl ON tbl.oid = att.attrelid \
+                     JOIN pg_namespace ns ON ns.oid = tbl.relnamespace \
+                    WHERE ns.nspname = 'public' AND tbl.relname = $1 AND att.attname = $2 \
+                      AND att.attnum > 0 AND NOT att.attisdropped \
+                 )",
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_one(pool)
+            .await
+        }
 
         async fn columns(
             pool: &PgPool,
@@ -2182,9 +2471,47 @@ mod postgres_tests {
             .expect("read index shapes")
         }
 
-        let base_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        async fn constraints(pool: &PgPool, table: &str) -> Vec<(String, String, String)> {
+            sqlx::query_as(
+                "SELECT con.conname, con.contype::text, pg_get_constraintdef(con.oid) \
+                 FROM pg_constraint con \
+                 JOIN pg_class c ON c.oid = con.conrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = 'public' AND c.relname = $1 \
+                 ORDER BY con.conname",
+            )
+            .bind(table)
+            .fetch_all(pool)
+            .await
+            .expect("read constraints")
+        }
+
+        async fn triggers(pool: &PgPool, table: &str) -> Vec<(String, i16, String, String)> {
+            sqlx::query_as(
+                "SELECT t.tgname, t.tgtype, p.proname, pg_get_triggerdef(t.oid) \
+                 FROM pg_trigger t \
+                 JOIN pg_proc p ON p.oid = t.tgfoid \
+                 JOIN pg_class c ON c.oid = t.tgrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = 'public' AND c.relname = $1 AND NOT t.tgisinternal \
+                 ORDER BY t.tgname",
+            )
+            .bind(table)
+            .fetch_all(pool)
+            .await
+            .expect("read triggers")
+        }
+
+        async fn function_body(pool: &PgPool) -> String {
+            sqlx::query_scalar(
+                "SELECT pg_get_functiondef('prevent_event_idempotency_keys_update()'::regprocedure)",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("read function body")
+        }
+
+        let base_url = crate::test_support::database_url();
         let conn = parse_pg_url(&base_url);
         let admin = PgPool::connect(&base_url)
             .await
@@ -2253,9 +2580,354 @@ mod postgres_tests {
             .await
             .expect("connect migrated probe database");
         MIGRATOR
-            .run_to(39, &migrated)
+            .run_to(45, &migrated)
             .await
-            .expect("apply migrations 1-39");
+            .expect("apply migrations 1-45");
+
+        let extras_result = async {
+            sqlx::query(
+                "ALTER TABLE event_idempotency_keys \
+                 ADD COLUMN r5b_probe_nullable TEXT, \
+                 ADD COLUMN r5b_probe_defaulted TEXT NOT NULL DEFAULT 'r5b-keys-default', \
+                 ADD COLUMN r5b_probe_identity BIGINT GENERATED ALWAYS AS IDENTITY, \
+                 ADD COLUMN r5b_probe_generated BYTEA GENERATED ALWAYS AS (event_id) STORED",
+            )
+            .execute(&desired)
+            .await
+            .map_err(|error| format!("add keys omission-safe extras: {error}"))?;
+            sqlx::query(
+                "ALTER TABLE event_idempotency_reaper_cursor \
+                 ADD COLUMN r5b_probe_nullable TEXT, \
+                 ADD COLUMN r5b_probe_defaulted TEXT NOT NULL DEFAULT 'r5b-cursor-default', \
+                 ADD COLUMN r5b_probe_identity BIGINT GENERATED ALWAYS AS IDENTITY, \
+                 ADD COLUMN r5b_probe_generated SMALLINT GENERATED ALWAYS AS (id) STORED",
+            )
+            .execute(&desired)
+            .await
+            .map_err(|error| format!("add cursor omission-safe extras: {error}"))?;
+
+            let community = uuid::Uuid::new_v4();
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community)
+                .bind(format!("r5b-probe-{}.example", community.simple()))
+                .execute(&desired)
+                .await
+                .map_err(|error| format!("insert probe community: {error}"))?;
+            let author = [0xC3_u8; 32];
+            let key = [0xD4_u8; 32];
+            let intent = [0xE5_u8; 32];
+            let event_id = [0xA1_u8; 32];
+            let witness = [0xB2_u8; 32];
+            sqlx::query(
+                "INSERT INTO event_idempotency_keys ( \
+                     community_id, author_pubkey, idempotency_key, intent_hash, event_id, \
+                     created_at, reservation_witness, r5b_probe_nullable \
+                 ) VALUES ($1, $2, $3, $4, $5, clock_timestamp(), $6, 'r5b-keys-nullable')",
+            )
+            .bind(community)
+            .bind(author.as_slice())
+            .bind(key.as_slice())
+            .bind(intent.as_slice())
+            .bind(event_id.as_slice())
+            .bind(witness.as_slice())
+            .execute(&desired)
+            .await
+            .map_err(|error| format!("insert keys sentinel: {error}"))?;
+            sqlx::query(
+                "INSERT INTO event_idempotency_reaper_cursor \
+                     (id, after_community_id, r5b_probe_nullable) \
+                 VALUES (1, NULL, 'r5b-cursor-nullable') \
+                 ON CONFLICT (id) DO UPDATE \
+                    SET r5b_probe_nullable = 'r5b-cursor-nullable'",
+            )
+            .execute(&desired)
+            .await
+            .map_err(|error| format!("upsert cursor sentinel: {error}"))?;
+
+            let keys_before = keys_probe_values(&desired, community)
+                .await
+                .map_err(|error| format!("read keys sentinels: {error}"))?;
+            let cursor_before = cursor_probe_values(&desired)
+                .await
+                .map_err(|error| format!("read cursor sentinels: {error}"))?;
+            if keys_before.0.as_deref() != Some("r5b-keys-nullable")
+                || keys_before.1 != "r5b-keys-default"
+                || keys_before.3.as_slice() != event_id.as_slice()
+                || cursor_before.0.as_deref() != Some("r5b-cursor-nullable")
+                || cursor_before.1 != "r5b-cursor-default"
+                || cursor_before.3 != 1
+            {
+                return Err(format!(
+                    "probe sentinels were not stored: keys={keys_before:?} cursor={cursor_before:?}"
+                ));
+            }
+            let keys_shapes = (
+                probe_shape(&desired, "event_idempotency_keys", "r5b_probe_nullable")
+                    .await
+                    .map_err(|error| format!("keys nullable shape: {error}"))?,
+                probe_shape(&desired, "event_idempotency_keys", "r5b_probe_defaulted")
+                    .await
+                    .map_err(|error| format!("keys defaulted shape: {error}"))?,
+                probe_shape(&desired, "event_idempotency_keys", "r5b_probe_identity")
+                    .await
+                    .map_err(|error| format!("keys identity shape: {error}"))?,
+                probe_shape(&desired, "event_idempotency_keys", "r5b_probe_generated")
+                    .await
+                    .map_err(|error| format!("keys generated shape: {error}"))?,
+            );
+            let cursor_shapes = (
+                probe_shape(&desired, "event_idempotency_reaper_cursor", "r5b_probe_nullable")
+                    .await
+                    .map_err(|error| format!("cursor nullable shape: {error}"))?,
+                probe_shape(&desired, "event_idempotency_reaper_cursor", "r5b_probe_defaulted")
+                    .await
+                    .map_err(|error| format!("cursor defaulted shape: {error}"))?,
+                probe_shape(&desired, "event_idempotency_reaper_cursor", "r5b_probe_identity")
+                    .await
+                    .map_err(|error| format!("cursor identity shape: {error}"))?,
+                probe_shape(
+                    &desired,
+                    "event_idempotency_reaper_cursor",
+                    "r5b_probe_generated",
+                )
+                .await
+                .map_err(|error| format!("cursor generated shape: {error}"))?,
+            );
+            if keys_shapes.0 != (false, false, false, None)
+                || !keys_shapes.1.0
+                || keys_shapes.1.1
+                || keys_shapes.1.2
+                || keys_shapes.1.3.is_none()
+                || !keys_shapes.2.1
+                || !keys_shapes.3.2
+                || cursor_shapes.0 != (false, false, false, None)
+                || !cursor_shapes.1.0
+                || cursor_shapes.1.1
+                || cursor_shapes.1.2
+                || cursor_shapes.1.3.is_none()
+                || !cursor_shapes.2.1
+                || !cursor_shapes.3.2
+            {
+                return Err(format!(
+                    "probe catalog shapes are wrong: keys={keys_shapes:?} cursor={cursor_shapes:?}"
+                ));
+            }
+
+            reconcile(&desired)
+                .await
+                .map_err(|error| format!("first reconcile with extras must succeed: {error}"))?;
+            let keys_after_first = keys_probe_values(&desired, community)
+                .await
+                .map_err(|error| format!("keys sentinels after first reconcile: {error}"))?;
+            let cursor_after_first = cursor_probe_values(&desired)
+                .await
+                .map_err(|error| format!("cursor sentinels after first reconcile: {error}"))?;
+            if keys_after_first != keys_before || cursor_after_first != cursor_before {
+                return Err(format!(
+                    "first reconcile mutated extras: keys {keys_before:?}->{keys_after_first:?}, \
+                     cursor {cursor_before:?}->{cursor_after_first:?}"
+                ));
+            }
+            if probe_shape(&desired, "event_idempotency_keys", "r5b_probe_nullable")
+                .await
+                .map_err(|error| format!("keys nullable shape after first reconcile: {error}"))?
+                != keys_shapes.0
+                || probe_shape(&desired, "event_idempotency_keys", "r5b_probe_defaulted")
+                    .await
+                    .map_err(|error| {
+                        format!("keys defaulted shape after first reconcile: {error}")
+                    })?
+                    != keys_shapes.1
+                || probe_shape(&desired, "event_idempotency_keys", "r5b_probe_identity")
+                    .await
+                    .map_err(|error| {
+                        format!("keys identity shape after first reconcile: {error}")
+                    })?
+                    != keys_shapes.2
+                || probe_shape(&desired, "event_idempotency_keys", "r5b_probe_generated")
+                    .await
+                    .map_err(|error| {
+                        format!("keys generated shape after first reconcile: {error}")
+                    })?
+                    != keys_shapes.3
+                || probe_shape(
+                    &desired,
+                    "event_idempotency_reaper_cursor",
+                    "r5b_probe_nullable",
+                )
+                .await
+                .map_err(|error| {
+                    format!("cursor nullable shape after first reconcile: {error}")
+                })?
+                    != cursor_shapes.0
+                || probe_shape(
+                    &desired,
+                    "event_idempotency_reaper_cursor",
+                    "r5b_probe_defaulted",
+                )
+                .await
+                .map_err(|error| {
+                    format!("cursor defaulted shape after first reconcile: {error}")
+                })?
+                    != cursor_shapes.1
+                || probe_shape(
+                    &desired,
+                    "event_idempotency_reaper_cursor",
+                    "r5b_probe_identity",
+                )
+                .await
+                .map_err(|error| {
+                    format!("cursor identity shape after first reconcile: {error}")
+                })?
+                    != cursor_shapes.2
+                || probe_shape(
+                    &desired,
+                    "event_idempotency_reaper_cursor",
+                    "r5b_probe_generated",
+                )
+                .await
+                .map_err(|error| {
+                    format!("cursor generated shape after first reconcile: {error}")
+                })?
+                    != cursor_shapes.3
+            {
+                return Err(
+                    "first reconcile must preserve omission-safe extra definitions".to_owned(),
+                );
+            }
+
+            Db::from_pool(desired.clone())
+                .require_event_idempotency_schema()
+                .await
+                .map_err(|error| {
+                    format!(
+                        "startup gate must accept extras after reconcile (rollback compatibility): {error}"
+                    )
+                })?;
+
+            reconcile(&desired).await.map_err(|error| {
+                format!("second reconcile must be idempotent with extras: {error}")
+            })?;
+            let keys_after_second = keys_probe_values(&desired, community)
+                .await
+                .map_err(|error| format!("keys sentinels after second reconcile: {error}"))?;
+            let cursor_after_second = cursor_probe_values(&desired)
+                .await
+                .map_err(|error| format!("cursor sentinels after second reconcile: {error}"))?;
+            if keys_after_second != keys_before || cursor_after_second != cursor_before {
+                return Err(format!(
+                    "second reconcile mutated extras: keys {keys_before:?}->{keys_after_second:?}, \
+                     cursor {cursor_before:?}->{cursor_after_second:?}"
+                ));
+            }
+            require_shape_after_second_reconcile(
+                &desired,
+                "event_idempotency_keys",
+                "r5b_probe_nullable",
+                &keys_shapes.0,
+                "keys nullable",
+            )
+            .await?;
+            require_shape_after_second_reconcile(
+                &desired,
+                "event_idempotency_keys",
+                "r5b_probe_defaulted",
+                &keys_shapes.1,
+                "keys defaulted",
+            )
+            .await?;
+            require_shape_after_second_reconcile(
+                &desired,
+                "event_idempotency_keys",
+                "r5b_probe_identity",
+                &keys_shapes.2,
+                "keys identity",
+            )
+            .await?;
+            require_shape_after_second_reconcile(
+                &desired,
+                "event_idempotency_keys",
+                "r5b_probe_generated",
+                &keys_shapes.3,
+                "keys generated",
+            )
+            .await?;
+            require_shape_after_second_reconcile(
+                &desired,
+                "event_idempotency_reaper_cursor",
+                "r5b_probe_nullable",
+                &cursor_shapes.0,
+                "cursor nullable",
+            )
+            .await?;
+            require_shape_after_second_reconcile(
+                &desired,
+                "event_idempotency_reaper_cursor",
+                "r5b_probe_defaulted",
+                &cursor_shapes.1,
+                "cursor defaulted",
+            )
+            .await?;
+            require_shape_after_second_reconcile(
+                &desired,
+                "event_idempotency_reaper_cursor",
+                "r5b_probe_identity",
+                &cursor_shapes.2,
+                "cursor identity",
+            )
+            .await?;
+            require_shape_after_second_reconcile(
+                &desired,
+                "event_idempotency_reaper_cursor",
+                "r5b_probe_generated",
+                &cursor_shapes.3,
+                "cursor generated",
+            )
+            .await?;
+
+            sqlx::query("DELETE FROM event_idempotency_keys WHERE community_id = $1")
+                .bind(community)
+                .execute(&desired)
+                .await
+                .map_err(|error| format!("delete keys sentinel: {error}"))?;
+            sqlx::query("DELETE FROM communities WHERE id = $1")
+                .bind(community)
+                .execute(&desired)
+                .await
+                .map_err(|error| format!("delete probe community: {error}"))?;
+            Ok(())
+        }
+        .await;
+        let probe_cleanup = drop_r5b_probes(&desired).await;
+        let mut extras_errors = aggregate_phase_errors(
+            extras_result,
+            probe_cleanup,
+            "probe columns must drop with scoped ALTER TABLE",
+        );
+        if !extras_errors.is_empty() {
+            desired.close().await;
+            migrated.close().await;
+            extras_errors.extend(drop_probe_databases(&admin, &desired_db, &migrated_db).await);
+            panic!("{}", extras_errors.join("; "));
+        }
+        for (table, column) in [
+            ("event_idempotency_keys", "r5b_probe_nullable"),
+            ("event_idempotency_keys", "r5b_probe_defaulted"),
+            ("event_idempotency_keys", "r5b_probe_identity"),
+            ("event_idempotency_keys", "r5b_probe_generated"),
+            ("event_idempotency_reaper_cursor", "r5b_probe_nullable"),
+            ("event_idempotency_reaper_cursor", "r5b_probe_defaulted"),
+            ("event_idempotency_reaper_cursor", "r5b_probe_identity"),
+            ("event_idempotency_reaper_cursor", "r5b_probe_generated"),
+        ] {
+            let leftover = column_present(&desired, table, column)
+                .await
+                .expect("check probe column dropped");
+            assert!(
+                !leftover,
+                "{table}.{column} must be removed before exact parity"
+            );
+        }
 
         for table in [
             "relay_admin_actions",
@@ -2278,15 +2950,265 @@ mod postgres_tests {
             );
         }
 
+        const IDEMPOTENCY_TABLE: &str = "event_idempotency_keys";
+        const REAPER_CURSOR_TABLE: &str = "event_idempotency_reaper_cursor";
+        assert_eq!(
+            columns(&desired, IDEMPOTENCY_TABLE).await,
+            columns(&migrated, IDEMPOTENCY_TABLE).await,
+            "column parity mismatch for {IDEMPOTENCY_TABLE}"
+        );
+        assert_eq!(
+            index_shapes(&desired, IDEMPOTENCY_TABLE).await,
+            index_shapes(&migrated, IDEMPOTENCY_TABLE).await,
+            "index-shape parity mismatch for {IDEMPOTENCY_TABLE}"
+        );
+        assert_eq!(
+            constraints(&desired, IDEMPOTENCY_TABLE).await,
+            constraints(&migrated, IDEMPOTENCY_TABLE).await,
+            "constraint parity mismatch for {IDEMPOTENCY_TABLE}"
+        );
+        assert_eq!(
+            triggers(&desired, IDEMPOTENCY_TABLE).await,
+            triggers(&migrated, IDEMPOTENCY_TABLE).await,
+            "trigger parity mismatch for {IDEMPOTENCY_TABLE}"
+        );
+        assert_eq!(
+            function_body(&desired).await,
+            function_body(&migrated).await,
+            "immutable function body mismatch"
+        );
+        assert_eq!(
+            columns(&desired, REAPER_CURSOR_TABLE).await,
+            columns(&migrated, REAPER_CURSOR_TABLE).await,
+            "column parity mismatch for {REAPER_CURSOR_TABLE}"
+        );
+        assert_eq!(
+            index_shapes(&desired, REAPER_CURSOR_TABLE).await,
+            index_shapes(&migrated, REAPER_CURSOR_TABLE).await,
+            "index-shape parity mismatch for {REAPER_CURSOR_TABLE}"
+        );
+        assert_eq!(
+            constraints(&desired, REAPER_CURSOR_TABLE).await,
+            constraints(&migrated, REAPER_CURSOR_TABLE).await,
+            "constraint parity mismatch for {REAPER_CURSOR_TABLE}"
+        );
+        assert_eq!(
+            triggers(&desired, REAPER_CURSOR_TABLE).await,
+            triggers(&migrated, REAPER_CURSOR_TABLE).await,
+            "trigger parity mismatch for {REAPER_CURSOR_TABLE}"
+        );
+
+        async fn reaper_cursor_live_contract(pool: &PgPool) -> (i64, bool, bool, bool) {
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM event_idempotency_reaper_cursor WHERE id = 1",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("count reaper cursor rows");
+            let registered: bool = sqlx::query_scalar(
+                "SELECT EXISTS (\
+                     SELECT 1 FROM _operator_global_tables \
+                     WHERE table_name = 'event_idempotency_reaper_cursor'\
+                 )",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("read operator-global registry");
+            let can_select: bool = sqlx::query_scalar(
+                "SELECT has_table_privilege(current_user, \
+                    'event_idempotency_reaper_cursor'::regclass, 'SELECT')",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("select privilege");
+            let can_update: bool = sqlx::query_scalar(
+                "SELECT has_table_privilege(current_user, \
+                    'event_idempotency_reaper_cursor'::regclass, 'UPDATE')",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("update privilege");
+            (rows, registered, can_select, can_update)
+        }
+
+        assert_eq!(
+            reaper_cursor_live_contract(&desired).await,
+            reaper_cursor_live_contract(&migrated).await,
+            "reaper cursor singleton, registry, and privileges must match"
+        );
+        assert_eq!(
+            reaper_cursor_live_contract(&desired).await,
+            (1, true, true, true),
+            "reaper cursor must be a privileged operator-global singleton"
+        );
+
+        let negatives_result = async {
+            sqlx::query("ALTER TABLE event_idempotency_keys ALTER COLUMN event_id DROP NOT NULL")
+                .execute(&desired)
+                .await
+                .map_err(|error| format!("relax required event_id NOT NULL: {error}"))?;
+            let wrong = reconcile(&desired).await;
+            sqlx::query("ALTER TABLE event_idempotency_keys ALTER COLUMN event_id SET NOT NULL")
+                .execute(&desired)
+                .await
+                .map_err(|error| format!("restore event_id NOT NULL: {error}"))?;
+            match wrong {
+                Ok(_) => {
+                    return Err(
+                        "reconcile must fail closed for a relaxed required NOT NULL".to_owned()
+                    );
+                }
+                Err(error) => {
+                    let text = error.to_string();
+                    if !text.contains("event_id") {
+                        return Err(format!(
+                            "required-column reconcile error must identify event_id: {text}"
+                        ));
+                    }
+                }
+            }
+
+            sqlx::query(
+                "ALTER TABLE event_idempotency_keys \
+                 ALTER COLUMN created_at SET DEFAULT now()",
+            )
+            .execute(&desired)
+            .await
+            .map_err(|error| format!("tamper created_at default: {error}"))?;
+            let default_err = reconcile(&desired).await;
+            sqlx::query(
+                "ALTER TABLE event_idempotency_keys \
+                 ALTER COLUMN created_at SET DEFAULT clock_timestamp()",
+            )
+            .execute(&desired)
+            .await
+            .map_err(|error| format!("restore created_at default: {error}"))?;
+            if default_err.is_ok() {
+                return Err("reconcile must fail closed for DEFAULT now()".to_owned());
+            }
+
+            sqlx::query("ALTER TABLE event_idempotency_reaper_cursor ADD COLUMN community_id UUID")
+                .execute(&desired)
+                .await
+                .map_err(|error| format!("add forbidden cursor community_id: {error}"))?;
+            let forbidden = reconcile(&desired).await;
+            let community_id_present =
+                column_present(&desired, "event_idempotency_reaper_cursor", "community_id")
+                    .await
+                    .map_err(|error| format!("check forbidden community_id survived: {error}"))?;
+            sqlx::query("ALTER TABLE event_idempotency_reaper_cursor DROP COLUMN community_id")
+                .execute(&desired)
+                .await
+                .map_err(|error| format!("drop forbidden cursor community_id: {error}"))?;
+            if !community_id_present {
+                return Err(
+                    "forbidden cursor community_id must fail closed without being dropped"
+                        .to_owned(),
+                );
+            }
+            match forbidden {
+                Ok(_) => {
+                    return Err("reconcile must fail closed for cursor community_id".to_owned());
+                }
+                Err(error) => {
+                    let text = error.to_string();
+                    if !text.contains("community_id") {
+                        return Err(format!(
+                            "forbidden cursor community_id error must identify the column: {text}"
+                        ));
+                    }
+                }
+            }
+
+            sqlx::query(
+                "ALTER TABLE event_idempotency_keys \
+                 ADD COLUMN r5b_probe_unsafe TEXT NOT NULL DEFAULT 'unsafe'",
+            )
+            .execute(&desired)
+            .await
+            .map_err(|error| format!("add unsafe extra with default: {error}"))?;
+            sqlx::query(
+                "ALTER TABLE event_idempotency_keys \
+                 ALTER COLUMN r5b_probe_unsafe DROP DEFAULT",
+            )
+            .execute(&desired)
+            .await
+            .map_err(|error| format!("drop unsafe extra default: {error}"))?;
+            let unsafe_err = reconcile(&desired).await;
+            let unsafe_present =
+                column_present(&desired, "event_idempotency_keys", "r5b_probe_unsafe")
+                    .await
+                    .map_err(|error| format!("check unsafe extra survived: {error}"))?;
+            sqlx::query("ALTER TABLE event_idempotency_keys DROP COLUMN r5b_probe_unsafe")
+                .execute(&desired)
+                .await
+                .map_err(|error| format!("drop unsafe extra: {error}"))?;
+            if !unsafe_present {
+                return Err("unsafe extra must fail closed without being dropped".to_owned());
+            }
+            match unsafe_err {
+                Ok(_) => {
+                    return Err(
+                        "reconcile must fail closed for an extra NOT NULL column with no supplier"
+                            .to_owned(),
+                    );
+                }
+                Err(error) => {
+                    let text = error.to_string();
+                    if !text.contains("extra NOT NULL") {
+                        return Err(format!(
+                            "unsafe extra reconcile error must identify omission-safety: {text}"
+                        ));
+                    }
+                }
+            }
+
+            reconcile(&desired).await.map_err(|error| {
+                format!("reconcile must succeed after negative restores: {error}")
+            })?;
+
+            sqlx::query("ALTER TABLE event_idempotency_keys DROP COLUMN reservation_witness")
+                .execute(&desired)
+                .await
+                .map_err(|error| format!("drop required reservation_witness: {error}"))?;
+            let missing = reconcile(&desired).await;
+            match missing {
+                Ok(_) => {
+                    return Err(
+                        "reconcile must fail closed for a missing required column".to_owned()
+                    );
+                }
+                Err(error) => {
+                    let text = error.to_string();
+                    if !text.contains("reservation_witness") {
+                        return Err(format!(
+                            "missing required column error must identify \
+                             reservation_witness: {text}"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let negative_cleanup = drop_r5b_probes(&desired).await;
+        let mut negative_errors = aggregate_phase_errors(
+            negatives_result,
+            negative_cleanup,
+            "negative probes must drop with scoped ALTER TABLE",
+        );
+        if !negative_errors.is_empty() {
+            desired.close().await;
+            migrated.close().await;
+            negative_errors.extend(drop_probe_databases(&admin, &desired_db, &migrated_db).await);
+            panic!("{}", negative_errors.join("; "));
+        }
+
         desired.close().await;
         migrated.close().await;
-        for probe_db in [desired_db, migrated_db] {
-            sqlx::query(AssertSqlSafe(format!(
-                "DROP DATABASE {probe_db} WITH (FORCE)"
-            )))
-            .execute(&admin)
-            .await
-            .expect("drop probe database");
+        let drop_errors = drop_probe_databases(&admin, &desired_db, &migrated_db).await;
+        if !drop_errors.is_empty() {
+            panic!("{}", drop_errors.join("; "));
         }
     }
 
@@ -2752,10 +3674,15 @@ mod postgres_tests {
             "all NIP-FI tables must be absent after migration 0044: {present:?}"
         );
 
-        // The deletion catalog must validate with ledger relations gone.
+        run_migrations(&pool)
+            .await
+            .expect("apply remaining migrations to current HEAD schema");
+
+        // Deletion catalog validation is against current HEAD schema (now 45
+        // event_idempotency_keys), distinct from the 0044 ledger-absence proof.
         crate::deletion::DeletionStore::new(pool.clone())
             .validate_catalog()
             .await
-            .expect("deletion catalog validates after migration 0044");
+            .expect("deletion catalog validates on current HEAD schema after 0044 ledger removal");
     }
 }

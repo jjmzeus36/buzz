@@ -321,11 +321,121 @@ void main() {
 
   test('descriptor rejects unknown push fields', () {
     final information = _descriptorJson(relay.public);
+    information['admin_api'] = 'https://admin.example';
     (information['push'] as Map<String, dynamic>)['future'] = true;
 
     expect(
       () => BuzzPushLeaseDescriptor.fromRelayInformation(information),
+      throwsA(
+        isA<FormatException>().having(
+          (error) => error.message,
+          'message',
+          contains('push descriptor contains unknown field future'),
+        ),
+      ),
+    );
+  });
+
+  test(
+    'descriptor accepts current relay outer siblings and future NIP-11 extensions',
+    () {
+      final information = _descriptorJson(relay.public);
+      information['admin_api'] = 'https://admin.example';
+      information['gif'] = {
+        'provider': 'klipy',
+        'search': '/gifs/search',
+        'share': '/gifs/share',
+      };
+      information['future_nip11_extension'] = {'version': 1};
+
+      _expectCanonicalPushDiscovery(
+        BuzzPushLeaseDescriptor.fromRelayInformation(information),
+        relay.public,
+      );
+    },
+  );
+
+  test('descriptor accepts a legacy default-off NIP-11 document', () {
+    _expectCanonicalPushDiscovery(
+      BuzzPushLeaseDescriptor.fromRelayInformation(
+        _descriptorJson(relay.public),
+      ),
+      relay.public,
+    );
+  });
+
+  test('descriptor rejects malformed supported_extensions', () {
+    final information = _descriptorJson(relay.public);
+    information['supported_extensions'] = 'nip-pl';
+
+    expect(
+      () => BuzzPushLeaseDescriptor.fromRelayInformation(information),
       throwsA(isA<FormatException>()),
+    );
+  });
+
+  test('descriptor rejects a document that omits nip-pl', () {
+    final information = _descriptorJson(relay.public);
+    information['supported_extensions'] = ['nip-er'];
+
+    expect(
+      () => BuzzPushLeaseDescriptor.fromRelayInformation(information),
+      throwsA(isA<FormatException>()),
+    );
+  });
+
+  test('descriptor rejects a malformed push object', () {
+    final information = _descriptorJson(relay.public);
+    information['push'] = 'not-an-object';
+
+    expect(
+      () => BuzzPushLeaseDescriptor.fromRelayInformation(information),
+      throwsA(isA<FormatException>()),
+    );
+  });
+
+  test('descriptor rejects missing required push fields', () {
+    final information = _descriptorJson(relay.public);
+    (information['push'] as Map<String, dynamic>).remove('origin');
+
+    expect(
+      () => BuzzPushLeaseDescriptor.fromRelayInformation(information),
+      throwsA(isA<FormatException>()),
+    );
+  });
+
+  test('descriptor rejects unknown nested push limitation fields', () {
+    final information = _descriptorJson(relay.public);
+    final limitation =
+        (information['push'] as Map<String, dynamic>)['limitation']
+            as Map<String, dynamic>;
+    limitation['future'] = 1;
+
+    expect(
+      () => BuzzPushLeaseDescriptor.fromRelayInformation(information),
+      throwsA(isA<FormatException>()),
+    );
+  });
+
+  test('descriptor accepts combined push and canonical idempotency', () {
+    final information = _descriptorJson(relay.public);
+    information['supported_extensions'] = [
+      'nip-er',
+      'nip-pl',
+      'buzz-idempotency',
+    ];
+    information['idempotency'] = {
+      'header': 'Idempotency-Key',
+      'key_pattern': r'^[0-9a-f]{64}$',
+      'scope': ['community', 'author'],
+      'intent': ['pubkey', 'kind', 'tags', 'content'],
+      'conflict_status': 409,
+      'retention_seconds': 604800,
+    };
+
+    _expectCanonicalPushDiscovery(
+      BuzzPushLeaseDescriptor.fromRelayInformation(information),
+      relay.public,
     );
   });
 }
@@ -390,6 +500,21 @@ Future<void> _deliverAcknowledgement(
 
 BuzzPushLeaseDescriptor _descriptor(String relayPubkey) =>
     BuzzPushLeaseDescriptor.fromRelayInformation(_descriptorJson(relayPubkey));
+
+void _expectCanonicalPushDiscovery(
+  BuzzPushLeaseDescriptor parsed,
+  String relayPubkey,
+) {
+  expect(parsed.origin, 'wss://tenant.example:8443');
+  expect(parsed.executorKeyId, 'relay-v1');
+  expect(parsed.executorPubkey, relayPubkey);
+  expect(parsed.transport, 'apns');
+  expect(parsed.maxLeaseTtlSeconds, 2592000);
+  expect(parsed.maxContentLength, 65536);
+  expect(parsed.maxPlaintextLength, 32768);
+  expect(parsed.maxEndpointLength, 4096);
+  expect(parsed.maxStringLength, 512);
+}
 
 Map<String, dynamic> _descriptorJson(String relayPubkey) => {
   'supported_extensions': ['nip-er', 'nip-pl'],

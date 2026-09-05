@@ -21,7 +21,11 @@ pub(crate) const SUPPORTED_NIPS: &[u32] = &[1, 2, 10, 11, 16, 17, 23, 25, 29, 33
 pub(crate) const NIP_RELAY_MEMBERSHIP: u32 = 43;
 
 /// Relay information document served at `GET /` with `Accept: application/nostr+json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Serialize is implemented privately so the NIP-MI `idempotency` descriptor
+/// can appear on the wire without a public struct field. Deserialize stays
+/// derived: extra `idempotency` is ignored, matching prior documents.
+#[derive(Debug, Clone, Deserialize)]
 pub struct RelayInfo {
     /// Human-readable relay name.
     pub name: String,
@@ -170,6 +174,10 @@ impl RelayInfo {
     /// `build` advertises the provider-agnostic `buzz-gif` extension and the
     /// relay-relative metadata search endpoint. It must never contain a
     /// provider credential.
+    ///
+    /// NIP-MI advertisement is default-off here so existing seven-argument
+    /// callers stay source-compatible. `nip11_document` uses an in-module
+    /// helper to opt into advertisement.
     pub fn build(
         relay_self: Option<&str>,
         icon: Option<&str>,
@@ -179,44 +187,178 @@ impl RelayInfo {
         admin_api: Option<&str>,
         gif_provider: Option<&str>,
     ) -> Self {
-        debug_assert!(
-            !advertise_nip43 || relay_self.is_some(),
-            "advertise_nip43=true requires relay_self=Some — NIP-43 events are verified against `self`"
-        );
-
-        let mut supported_nips = SUPPORTED_NIPS.to_vec();
-        if advertise_nip43 {
-            supported_nips.push(NIP_RELAY_MEMBERSHIP);
-        }
-
-        let mut supported_extensions = vec!["nip-er".to_string()];
-        let gif = gif_provider.map(|provider| {
-            supported_extensions.push("buzz-gif".to_string());
-            GifDescriptor {
-                provider: provider.to_string(),
-                search: crate::api::gifs::SEARCH_PATH.to_string(),
-                share: crate::api::gifs::SHARE_PATH.to_string(),
-            }
-        });
-
-        Self {
-            name: "Buzz Relay".to_string(),
-            description: "Buzz — private team communication relay".to_string(),
-            icon: icon.filter(|s| !s.is_empty()).map(|s| s.to_string()),
-            pubkey: None,
-            contact: None,
-            supported_nips,
-            supported_extensions: Some(supported_extensions),
-            push: None,
-            software: "https://github.com/block/buzz".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            limitation: Some(relay_limitation(max_message_length)),
-            pairing_relay_url: pairing_relay_url.map(str::to_string),
-            admin_api: admin_api.map(str::to_string),
-            gif,
-            relay_self: relay_self.map(|s| s.to_string()),
-        }
+        build_with_idempotency(
+            relay_self,
+            icon,
+            max_message_length,
+            pairing_relay_url,
+            admin_api,
+            gif_provider,
+            AdvertisedFeatures {
+                nip43: advertise_nip43,
+                idempotency: false,
+            },
+        )
     }
+}
+
+/// Private NIP-11 advertisement switches. Bundled so
+/// [`build_with_idempotency`] stays within Clippy's argument limit.
+struct AdvertisedFeatures {
+    nip43: bool,
+    idempotency: bool,
+}
+
+/// Builds NIP-11 with explicit advertisement flags.
+///
+/// `features.idempotency` should be `true` only after the schema prerequisite
+/// holds and every serving replica enforces keyed `POST /events`. When true,
+/// the `buzz-idempotency` extension token is stored on `supported_extensions`;
+/// [`RelayInfo`]'s private serializer then emits the canonical six-field
+/// `idempotency` descriptor. When false, both are omitted. The serializer
+/// derives the descriptor from the token, so the pair cannot split.
+fn build_with_idempotency(
+    relay_self: Option<&str>,
+    icon: Option<&str>,
+    max_message_length: usize,
+    pairing_relay_url: Option<&str>,
+    admin_api: Option<&str>,
+    gif_provider: Option<&str>,
+    features: AdvertisedFeatures,
+) -> RelayInfo {
+    debug_assert!(
+        !features.nip43 || relay_self.is_some(),
+        "advertise_nip43=true requires relay_self=Some — NIP-43 events are verified against `self`"
+    );
+
+    let mut supported_nips = SUPPORTED_NIPS.to_vec();
+    if features.nip43 {
+        supported_nips.push(NIP_RELAY_MEMBERSHIP);
+    }
+
+    let mut supported_extensions = vec!["nip-er".to_string()];
+    if features.idempotency {
+        supported_extensions.push("buzz-idempotency".to_string());
+    }
+    let gif = gif_provider.map(|provider| {
+        supported_extensions.push("buzz-gif".to_string());
+        GifDescriptor {
+            provider: provider.to_string(),
+            search: crate::api::gifs::SEARCH_PATH.to_string(),
+            share: crate::api::gifs::SHARE_PATH.to_string(),
+        }
+    });
+
+    RelayInfo {
+        name: "Buzz Relay".to_string(),
+        description: "Buzz — private team communication relay".to_string(),
+        icon: icon.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+        pubkey: None,
+        contact: None,
+        supported_nips,
+        supported_extensions: Some(supported_extensions),
+        push: None,
+        software: "https://github.com/block/buzz".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        limitation: Some(relay_limitation(max_message_length)),
+        pairing_relay_url: pairing_relay_url.map(str::to_string),
+        admin_api: admin_api.map(str::to_string),
+        gif,
+        relay_self: relay_self.map(|s| s.to_string()),
+    }
+}
+
+impl Serialize for RelayInfo {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Private wire view: same field names and omission rules as the
+        // public struct, plus the NIP-MI descriptor iff the extension token
+        // is present. Token without descriptor and descriptor without token
+        // cannot be emitted.
+        #[derive(Serialize)]
+        struct RelayInfoWire<'a> {
+            name: &'a str,
+            description: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            icon: Option<&'a str>,
+            pubkey: Option<&'a str>,
+            contact: Option<&'a str>,
+            supported_nips: &'a [u32],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            supported_extensions: Option<&'a [String]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            push: Option<&'a serde_json::Value>,
+            software: &'a str,
+            version: &'a str,
+            limitation: Option<&'a RelayLimitation>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pairing_relay_url: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            admin_api: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            gif: Option<&'a GifDescriptor>,
+            #[serde(rename = "self", skip_serializing_if = "Option::is_none")]
+            relay_self: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            idempotency: Option<serde_json::Value>,
+        }
+
+        // Bind every public field without `..` so a new `RelayInfo` field is a
+        // compile error until it is given an explicit wire mapping.
+        let RelayInfo {
+            name,
+            description,
+            icon,
+            pubkey,
+            contact,
+            supported_nips,
+            supported_extensions,
+            push,
+            software,
+            version,
+            limitation,
+            pairing_relay_url,
+            admin_api,
+            gif,
+            relay_self,
+        } = self;
+
+        RelayInfoWire {
+            name,
+            description,
+            icon: icon.as_deref(),
+            pubkey: pubkey.as_deref(),
+            contact: contact.as_deref(),
+            supported_nips,
+            supported_extensions: supported_extensions.as_deref(),
+            push: push.as_ref(),
+            software,
+            version,
+            limitation: limitation.as_ref(),
+            pairing_relay_url: pairing_relay_url.as_deref(),
+            admin_api: admin_api.as_deref(),
+            gif: gif.as_ref(),
+            relay_self: relay_self.as_deref(),
+            idempotency: nip11_idempotency_descriptor(supported_extensions.as_deref()),
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Canonical six-field descriptor when `supported_extensions` carries the
+/// exact `buzz-idempotency` token; `None` otherwise.
+fn nip11_idempotency_descriptor(
+    supported_extensions: Option<&[String]>,
+) -> Option<serde_json::Value> {
+    supported_extensions
+        .is_some_and(|extensions| {
+            extensions
+                .iter()
+                .any(|extension| extension == buzz_core::idempotency::EXTENSION_ID)
+        })
+        .then(buzz_core::idempotency::canonical_nip11_descriptor)
 }
 
 /// Axum handler that returns the NIP-11 relay information document as JSON.
@@ -229,6 +371,25 @@ pub async fn relay_info_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     axum::response::Json(nip11_document(&state, raw_host).await)
+}
+
+/// Compile-time lock: the public handler must return `Json<RelayInfo>`.
+/// Changing it to `Json<Value>` (or any other body type) fails to compile.
+#[allow(dead_code)]
+const _RELAY_INFO_HANDLER_TYPED_RETURN: fn() = _assert_relay_info_handler_signature;
+
+#[allow(dead_code)]
+fn _assert_relay_info_handler_signature() {
+    fn assert_handler<F, Fut>(_: F)
+    where
+        F: Fn(
+            axum::extract::State<std::sync::Arc<crate::state::AppState>>,
+            axum::http::HeaderMap,
+        ) -> Fut,
+        Fut: std::future::Future<Output = axum::response::Json<RelayInfo>>,
+    {
+    }
+    assert_handler(relay_info_handler);
 }
 
 fn push_descriptor(
@@ -273,25 +434,52 @@ fn push_descriptor(
     }))
 }
 
+/// Env var that enables NIP-11 NIP-MI advertisement. Default-off.
+const IDEMPOTENCY_ADVERTISE_ENV: &str = "BUZZ_IDEMPOTENCY_ADVERTISE";
+
+/// Parse `BUZZ_IDEMPOTENCY_ADVERTISE`. Default-off; only the clear
+/// affirmatives `true` and `1` enable advertisement. Tests pass the raw
+/// value so they never mutate process-global environment.
+fn parse_idempotency_advertise(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1") | Some("true"))
+}
+
+fn advertise_idempotency_from_env() -> bool {
+    parse_idempotency_advertise(std::env::var(IDEMPOTENCY_ADVERTISE_ENV).ok().as_deref())
+}
+
 /// Builds the served NIP-11 document for a request arriving on `raw_host`.
 ///
 /// Centralised so the content-negotiated root handler and the dedicated
-/// `/info` endpoint can't drift apart. Every input to `RelayInfo::build`
-/// stays a pre-derived scalar: [`nip11_facts`] (config + keypair) plus the
-/// host-scoped workspace icon. Optional provider capabilities are passed as
-/// config-derived scalar identifiers; no provider credential enters NIP-11.
+/// `GET /info` endpoint cannot drift: both return this typed value.
+/// `Json<RelayInfo>` serializes it through the private [`Serialize`]
+/// implementation, including the atomic NIP-MI pair. There is no production
+/// `Value` adapter and no serialization-failure fallback to JSON `null` or
+/// a token/descriptor-partial document.
+///
+/// Every input to `RelayInfo::build` stays a pre-derived scalar:
+/// [`nip11_facts`] (config + keypair) plus the host-scoped workspace icon.
+/// Optional provider capabilities are passed as config-derived scalar
+/// identifiers; no provider credential enters NIP-11. The
+/// `buzz-idempotency` token and canonical six-field `idempotency`
+/// descriptor are serialized together so a served document cannot advertise
+/// one without the other.
 pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &str) -> RelayInfo {
     let (relay_self, advertise_nip43) = nip11_facts(state);
     let icon = workspace_icon_for_host(state, raw_host).await;
     let admin_api = admin_api_advertisement(state.config.admin.as_ref());
-    let mut info = RelayInfo::build(
+    let advertise_idempotency = advertise_idempotency_from_env();
+    let mut info = build_with_idempotency(
         relay_self.as_deref(),
         icon.as_deref(),
-        advertise_nip43,
         state.config.max_frame_bytes,
         state.config.pairing_relay_url.as_deref(),
         admin_api.as_deref(),
         state.config.klipy.as_ref().map(|_| "klipy"),
+        AdvertisedFeatures {
+            nip43: advertise_nip43,
+            idempotency: advertise_idempotency,
+        },
     );
     let tenant_host = if state.config.push_enabled {
         crate::tenant::bind_community(&state.db, raw_host)
@@ -503,10 +691,12 @@ mod tests {
         let unconfigured =
             RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None, None, None);
         assert!(unconfigured.gif.is_none());
-        assert!(!unconfigured
+        let unconfigured_extensions = unconfigured
             .supported_extensions
-            .expect("extensions")
-            .contains(&"buzz-gif".to_string()));
+            .as_ref()
+            .expect("extensions");
+        assert!(!unconfigured_extensions.contains(&"buzz-gif".to_string()));
+        assert!(!unconfigured_extensions.contains(&"buzz-idempotency".to_string()));
     }
 
     /// NIP-WP → NIP-11 mirror: a set workspace icon is served in the standard
@@ -691,5 +881,443 @@ mod tests {
     fn admin_api_advertised_as_https_for_non_loopback_host() {
         let advertised = admin_api_advertisement(Some(&admin_config("admin.example.com")));
         assert_eq!(advertised.as_deref(), Some("https://admin.example.com"));
+    }
+
+    #[test]
+    fn idempotency_advertise_env_is_default_off_and_accepts_only_clear_affirmatives() {
+        assert!(!parse_idempotency_advertise(None));
+        assert!(!parse_idempotency_advertise(Some("")));
+        assert!(!parse_idempotency_advertise(Some("false")));
+        assert!(!parse_idempotency_advertise(Some("0")));
+        assert!(!parse_idempotency_advertise(Some("TRUE")));
+        assert!(!parse_idempotency_advertise(Some("yes")));
+        assert!(!parse_idempotency_advertise(Some("true ")));
+        assert!(parse_idempotency_advertise(Some("true")));
+        assert!(parse_idempotency_advertise(Some("1")));
+    }
+
+    fn sample_info(idempotency: bool) -> RelayInfo {
+        build_with_idempotency(
+            None,
+            None,
+            DEFAULT_MAX_FRAME_BYTES,
+            None,
+            None,
+            None,
+            AdvertisedFeatures {
+                nip43: false,
+                idempotency,
+            },
+        )
+    }
+
+    fn has_buzz_idempotency_token(json: &serde_json::Value) -> bool {
+        json.get("supported_extensions")
+            .and_then(|value| value.as_array())
+            .is_some_and(|extensions| extensions.contains(&serde_json::json!("buzz-idempotency")))
+    }
+
+    fn has_canonical_idempotency_descriptor(json: &serde_json::Value) -> bool {
+        json.get("idempotency") == Some(&buzz_core::idempotency::canonical_nip11_descriptor())
+            && json
+                .get("idempotency")
+                .and_then(|value| value.as_object())
+                .is_some_and(|object| object.len() == 6)
+    }
+
+    fn served_nip11_is_atomic(json: &serde_json::Value) -> bool {
+        has_buzz_idempotency_token(json) == has_canonical_idempotency_descriptor(json)
+    }
+
+    #[test]
+    fn idempotency_advertisement_omits_token_and_descriptor_when_off() {
+        let json = serde_json::to_value(sample_info(false)).expect("serialize");
+        assert!(json.is_object());
+        assert!(!json.is_null());
+        assert!(
+            json.get("idempotency").is_none(),
+            "off must omit the top-level idempotency descriptor, not serialize null"
+        );
+        let extensions = json
+            .get("supported_extensions")
+            .and_then(|value| value.as_array())
+            .expect("extensions");
+        assert!(
+            !extensions.contains(&serde_json::json!("buzz-idempotency")),
+            "off must omit the buzz-idempotency token"
+        );
+        assert!(
+            !buzz_core::idempotency::nip11_keyed_client_accepts(&json),
+            "keyed clients must reject an unadvertised document"
+        );
+    }
+
+    #[test]
+    fn idempotency_advertisement_emits_token_and_canonical_descriptor_when_on() {
+        let json = serde_json::to_value(sample_info(true)).expect("serialize");
+        assert!(json.is_object());
+        assert!(!json.is_null());
+        let extensions = json
+            .get("supported_extensions")
+            .and_then(|value| value.as_array())
+            .expect("extensions");
+        assert!(
+            extensions.contains(&serde_json::json!("buzz-idempotency")),
+            "on must emit the buzz-idempotency token"
+        );
+        let descriptor = json.get("idempotency").expect("descriptor");
+        assert_eq!(
+            descriptor,
+            &buzz_core::idempotency::canonical_nip11_descriptor()
+        );
+        assert_eq!(descriptor.as_object().expect("object").len(), 6);
+        assert!(
+            buzz_core::idempotency::nip11_keyed_client_accepts(&json),
+            "keyed clients must accept the exact canonical pair"
+        );
+    }
+
+    #[test]
+    fn served_nip11_cannot_carry_token_without_canonical_descriptor() {
+        let advertised = sample_info(true);
+        let served = serde_json::to_value(&advertised).expect("serialize");
+        assert!(
+            served_nip11_is_atomic(&served),
+            "RelayInfo serialize must not advertise the token without the six-field descriptor"
+        );
+        assert!(has_buzz_idempotency_token(&served));
+        assert!(has_canonical_idempotency_descriptor(&served));
+        assert!(buzz_core::idempotency::nip11_keyed_client_accepts(&served));
+
+        let omitted = sample_info(false);
+        let off = serde_json::to_value(&omitted).expect("serialize");
+        assert!(served_nip11_is_atomic(&off));
+        assert!(!has_buzz_idempotency_token(&off));
+        assert!(!has_canonical_idempotency_descriptor(&off));
+        assert!(!buzz_core::idempotency::nip11_keyed_client_accepts(&off));
+    }
+
+    #[test]
+    fn served_nip11_cannot_carry_descriptor_without_token() {
+        let mut info = sample_info(true);
+        info.supported_extensions = Some(vec!["nip-er".to_string()]);
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert!(!has_buzz_idempotency_token(&json));
+        assert!(json.get("idempotency").is_none());
+        assert!(served_nip11_is_atomic(&json));
+        assert!(!buzz_core::idempotency::nip11_keyed_client_accepts(&json));
+    }
+
+    #[test]
+    fn optional_fields_keep_historical_omission_and_null_behavior() {
+        let info = RelayInfo {
+            name: "n".into(),
+            description: "d".into(),
+            icon: None,
+            pubkey: None,
+            contact: None,
+            supported_nips: Vec::new(),
+            supported_extensions: None,
+            push: None,
+            software: "s".into(),
+            version: "v".into(),
+            limitation: None,
+            pairing_relay_url: None,
+            admin_api: None,
+            gif: None,
+            relay_self: None,
+        };
+        let json = serde_json::to_value(&info).expect("serialize");
+        for omitted in [
+            "icon",
+            "supported_extensions",
+            "push",
+            "pairing_relay_url",
+            "admin_api",
+            "gif",
+            "self",
+            "idempotency",
+        ] {
+            assert!(
+                json.get(omitted).is_none(),
+                "{omitted} must be omitted, not null"
+            );
+        }
+        assert!(json.get("pubkey").expect("pubkey").is_null());
+        assert!(json.get("contact").expect("contact").is_null());
+        assert!(json.get("limitation").expect("limitation").is_null());
+    }
+
+    fn sparse_relay_info() -> RelayInfo {
+        RelayInfo {
+            name: "n".into(),
+            description: "d".into(),
+            icon: None,
+            pubkey: None,
+            contact: None,
+            supported_nips: Vec::new(),
+            supported_extensions: None,
+            push: None,
+            software: "s".into(),
+            version: "v".into(),
+            limitation: None,
+            pairing_relay_url: None,
+            admin_api: None,
+            gif: None,
+            relay_self: None,
+        }
+    }
+
+    fn sparse_relay_info_wire_json() -> serde_json::Value {
+        serde_json::json!({
+            "name": "n",
+            "description": "d",
+            "pubkey": null,
+            "contact": null,
+            "supported_nips": [],
+            "software": "s",
+            "version": "v",
+            "limitation": null,
+        })
+    }
+
+    #[test]
+    fn relay_info_wire_sparse_json_is_exact() {
+        let json = serde_json::to_value(sparse_relay_info()).expect("serialize");
+        assert_eq!(json, sparse_relay_info_wire_json());
+    }
+
+    fn populated_wire_relay_info(idempotency: bool) -> RelayInfo {
+        let mut supported_extensions = vec!["nip-er".to_string(), "buzz-gif".to_string()];
+        if idempotency {
+            supported_extensions.push(buzz_core::idempotency::EXTENSION_ID.to_string());
+        }
+        RelayInfo {
+            name: "Buzz Relay".into(),
+            description: "Buzz — private team communication relay".into(),
+            icon: Some("https://example/icon.webp".into()),
+            pubkey: Some("pk".into()),
+            contact: Some("ops@example".into()),
+            supported_nips: vec![1, 11],
+            supported_extensions: Some(supported_extensions),
+            push: Some(serde_json::json!({"origin": "ws://tenant.example"})),
+            software: "https://github.com/block/buzz".into(),
+            version: "test-version".into(),
+            limitation: Some(RelayLimitation {
+                max_message_length: Some(262_144),
+                max_subscriptions: Some(1024),
+                max_filters: Some(10),
+                max_limit: Some(500),
+                max_subid_length: Some(256),
+                min_pow_difficulty: Some(16),
+                auth_required: true,
+                payment_required: false,
+                restricted_writes: true,
+                due_delivery_mode: Some("push".into()),
+                max_not_before_delta: Some(31_536_000),
+            }),
+            pairing_relay_url: Some("wss://pairing.example".into()),
+            admin_api: Some("https://admin.example".into()),
+            gif: Some(GifDescriptor {
+                provider: "klipy".into(),
+                search: "/gifs/search".into(),
+                share: "/gifs/share".into(),
+            }),
+            relay_self: Some(
+                "0000000000000000000000000000000000000000000000000000000000000001".into(),
+            ),
+        }
+    }
+
+    #[test]
+    fn relay_info_wire_populated_default_off_json_is_exact() {
+        let json = serde_json::to_value(populated_wire_relay_info(false)).expect("serialize");
+        let expected = serde_json::json!({
+            "name": "Buzz Relay",
+            "description": "Buzz — private team communication relay",
+            "icon": "https://example/icon.webp",
+            "pubkey": "pk",
+            "contact": "ops@example",
+            "supported_nips": [1, 11],
+            "supported_extensions": ["nip-er", "buzz-gif"],
+            "push": {"origin": "ws://tenant.example"},
+            "software": "https://github.com/block/buzz",
+            "version": "test-version",
+            "limitation": {
+                "max_message_length": 262144,
+                "max_subscriptions": 1024,
+                "max_filters": 10,
+                "max_limit": 500,
+                "max_subid_length": 256,
+                "min_pow_difficulty": 16,
+                "auth_required": true,
+                "payment_required": false,
+                "restricted_writes": true,
+                "due_delivery_mode": "push",
+                "max_not_before_delta": 31536000
+            },
+            "pairing_relay_url": "wss://pairing.example",
+            "admin_api": "https://admin.example",
+            "gif": {
+                "provider": "klipy",
+                "search": "/gifs/search",
+                "share": "/gifs/share"
+            },
+            "self": "0000000000000000000000000000000000000000000000000000000000000001"
+        });
+        assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn relay_info_wire_populated_idempotency_json_is_exact() {
+        let json = serde_json::to_value(populated_wire_relay_info(true)).expect("serialize");
+        let expected = serde_json::json!({
+            "name": "Buzz Relay",
+            "description": "Buzz — private team communication relay",
+            "icon": "https://example/icon.webp",
+            "pubkey": "pk",
+            "contact": "ops@example",
+            "supported_nips": [1, 11],
+            "supported_extensions": ["nip-er", "buzz-gif", "buzz-idempotency"],
+            "push": {"origin": "ws://tenant.example"},
+            "software": "https://github.com/block/buzz",
+            "version": "test-version",
+            "limitation": {
+                "max_message_length": 262144,
+                "max_subscriptions": 1024,
+                "max_filters": 10,
+                "max_limit": 500,
+                "max_subid_length": 256,
+                "min_pow_difficulty": 16,
+                "auth_required": true,
+                "payment_required": false,
+                "restricted_writes": true,
+                "due_delivery_mode": "push",
+                "max_not_before_delta": 31536000
+            },
+            "pairing_relay_url": "wss://pairing.example",
+            "admin_api": "https://admin.example",
+            "gif": {
+                "provider": "klipy",
+                "search": "/gifs/search",
+                "share": "/gifs/share"
+            },
+            "self": "0000000000000000000000000000000000000000000000000000000000000001",
+            "idempotency": buzz_core::idempotency::canonical_nip11_descriptor(),
+        });
+        assert_eq!(json, expected);
+    }
+
+    fn populated_info(idempotency: bool) -> RelayInfo {
+        let mut info = build_with_idempotency(
+            Some("0000000000000000000000000000000000000000000000000000000000000001"),
+            Some("https://example/icon.webp"),
+            DEFAULT_MAX_FRAME_BYTES,
+            Some("wss://pairing.example"),
+            Some("https://admin.example"),
+            Some("klipy"),
+            AdvertisedFeatures {
+                nip43: false,
+                idempotency,
+            },
+        );
+        info.pubkey = Some("pk".into());
+        info.contact = Some("ops@example".into());
+        info.push = Some(serde_json::json!({"origin": "ws://tenant.example"}));
+        info
+    }
+
+    #[test]
+    fn relay_info_round_trips_through_deserialize_with_and_without_idempotency() {
+        // Populated skippable fields so the JSON contains every public key.
+        // Unknown top-level `idempotency` is ignored. Missing `Option` fields
+        // deserialize as `None` (see the omitted-fields round-trip below).
+        let off_json = serde_json::to_value(populated_info(false)).expect("serialize");
+        assert!(off_json.get("idempotency").is_none());
+        let off_decoded: RelayInfo =
+            serde_json::from_value(off_json.clone()).expect("deserialize historical document");
+        assert_eq!(
+            off_decoded.icon.as_deref(),
+            Some("https://example/icon.webp")
+        );
+        assert_eq!(
+            off_decoded.relay_self.as_deref(),
+            Some("0000000000000000000000000000000000000000000000000000000000000001")
+        );
+        assert_eq!(
+            serde_json::to_value(&off_decoded).expect("reserialize"),
+            off_json
+        );
+
+        let on_json = serde_json::to_value(populated_info(true)).expect("serialize");
+        assert_eq!(
+            on_json.get("idempotency"),
+            Some(&buzz_core::idempotency::canonical_nip11_descriptor())
+        );
+        let on_decoded: RelayInfo =
+            serde_json::from_value(on_json.clone()).expect("deserialize advertised document");
+        assert!(on_decoded
+            .supported_extensions
+            .as_ref()
+            .expect("extensions")
+            .contains(&buzz_core::idempotency::EXTENSION_ID.to_string()));
+        assert_eq!(
+            serde_json::to_value(&on_decoded).expect("reserialize"),
+            on_json
+        );
+
+        // Extra top-level `idempotency` remains unknown to the struct and is
+        // ignored, matching prior Deserialize. Re-serialize must not keep a
+        // descriptor without the token.
+        let mut hostile = off_json.clone();
+        hostile["idempotency"] = buzz_core::idempotency::canonical_nip11_descriptor();
+        let hostile_decoded: RelayInfo =
+            serde_json::from_value(hostile).expect("unknown idempotency field is ignored");
+        let hostile_json = serde_json::to_value(&hostile_decoded).expect("reserialize");
+        assert!(hostile_json.get("idempotency").is_none());
+        assert!(served_nip11_is_atomic(&hostile_json));
+    }
+
+    #[test]
+    fn relay_info_round_trips_omitted_optional_fields() {
+        let sparse = serde_json::json!({
+            "name": "n",
+            "description": "d",
+            "supported_nips": [],
+            "software": "s",
+            "version": "v",
+        });
+        let decoded: RelayInfo =
+            serde_json::from_value(sparse).expect("missing Option fields deserialize as None");
+        assert!(decoded.icon.is_none());
+        assert!(decoded.pubkey.is_none());
+        assert!(decoded.contact.is_none());
+        assert!(decoded.supported_extensions.is_none());
+        assert!(decoded.push.is_none());
+        assert!(decoded.limitation.is_none());
+        assert!(decoded.pairing_relay_url.is_none());
+        assert!(decoded.admin_api.is_none());
+        assert!(decoded.gif.is_none());
+        assert!(decoded.relay_self.is_none());
+
+        let json = serde_json::to_value(&decoded).expect("serialize");
+        assert_eq!(json, sparse_relay_info_wire_json());
+
+        let round_tripped: RelayInfo =
+            serde_json::from_value(json.clone()).expect("deserialize historical nulls");
+        assert_eq!(
+            serde_json::to_value(&round_tripped).expect("reserialize"),
+            json
+        );
+    }
+
+    #[test]
+    fn served_relay_info_serializes_to_object_and_keeps_rollout_atomicity() {
+        for advertise in [false, true] {
+            let json = serde_json::to_value(sample_info(advertise)).expect("serialize");
+            assert!(json.is_object(), "served NIP-11 must be an object");
+            assert!(!json.is_null(), "serialization must not become JSON null");
+            assert!(served_nip11_is_atomic(&json));
+        }
     }
 }

@@ -7,8 +7,7 @@ use uuid::Uuid;
 const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
 
 async fn setup_db() -> Db {
-    let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
-    let pool = PgPool::connect(&database_url)
+    let pool = PgPool::connect(&crate::test_support::database_url())
         .await
         .expect("connect to test DB");
     if std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref() == Ok("migration") {
@@ -589,7 +588,7 @@ async fn migration_schema_database_guard_covers_legacy_writer_and_nip09_deletion
 // the query instead of trusting the routing code's word for it.
 
 async fn admin_url() -> String {
-    std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into())
+    crate::test_support::database_url()
 }
 
 /// Create a fresh scratch database on the same server and optionally run migrations.
@@ -3018,4 +3017,871 @@ async fn floor_guard_blocks_updates_that_move_rows_below_the_fence() {
     );
 
     drop_scratch_db(&admin, pool, &name).await;
+}
+
+// ---- Canonical p-tag mention extraction and insert atomicity --------------
+
+fn mention_hex(n: u16) -> String {
+    format!("{n:064x}")
+}
+
+fn ptag_event_kind(kind: u16, content: &str, tags: Vec<nostr::Tag>) -> nostr::Event {
+    nostr::EventBuilder::new(nostr::Kind::Custom(kind), content)
+        .tags(tags)
+        .custom_created_at(nostr::Timestamp::now())
+        .sign_with_keys(&nostr::Keys::generate())
+        .expect("sign")
+}
+
+fn ptag_event(content: &str, tags: Vec<nostr::Tag>) -> nostr::Event {
+    ptag_event_kind(9, content, tags)
+}
+
+fn repeated_p_tags(count: usize, value: &str) -> Vec<nostr::Tag> {
+    (0..count)
+        .map(|_| nostr::Tag::parse(["p", value]).expect("p"))
+        .collect()
+}
+
+fn distinct_p_tags(count: usize) -> Vec<nostr::Tag> {
+    (0..count as u16)
+        .map(|n| nostr::Tag::parse(["p", &mention_hex(n)]).expect("p"))
+        .collect()
+}
+
+fn assert_too_many_kind9_p_tags(err: DbError) {
+    match err {
+        DbError::InvalidData(message) => {
+            assert!(
+                message.contains("too many p tags"),
+                "unexpected InvalidData: {message}"
+            );
+        }
+        other => panic!("expected InvalidData for kind-9 p-tag cap, got {other}"),
+    }
+}
+
+async fn make_channel(pool: &PgPool, community: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by) \
+         VALUES ($1, $2, $3, 'stream'::channel_type, 'open'::channel_visibility, $4)",
+    )
+    .bind(id)
+    .bind(community)
+    .bind(format!("ptag-channel-{}", id.simple()))
+    .bind([0x11u8; 32].as_slice())
+    .execute(pool)
+    .await
+    .expect("insert channel");
+    id
+}
+
+async fn thread_reply_count(pool: &PgPool, community: Uuid, event_id: &[u8]) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE(reply_count, 0)::BIGINT FROM thread_metadata \
+         WHERE community_id = $1 AND event_id = $2",
+    )
+    .bind(community)
+    .bind(event_id)
+    .fetch_optional(pool)
+    .await
+    .expect("read reply_count")
+    .unwrap_or(0)
+}
+
+async fn mention_pubkeys(pool: &PgPool, community: Uuid, event_id: &[u8]) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT pubkey_hex FROM event_mentions \
+         WHERE community_id = $1 AND event_id = $2 \
+         ORDER BY pubkey_hex",
+    )
+    .bind(community)
+    .bind(event_id)
+    .fetch_all(pool)
+    .await
+    .expect("list mentions")
+}
+
+async fn mention_count(pool: &PgPool, community: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM event_mentions WHERE community_id = $1")
+        .bind(community)
+        .fetch_one(pool)
+        .await
+        .expect("count mentions")
+}
+
+async fn event_row_count(pool: &PgPool, community: Uuid, event_id: &[u8]) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM events WHERE community_id = $1 AND id = $2")
+        .bind(community)
+        .bind(event_id)
+        .fetch_one(pool)
+        .await
+        .expect("count event")
+}
+
+async fn install_community_mention_insert_failure(
+    pool: &PgPool,
+    community: Uuid,
+) -> (String, String) {
+    let suffix = community.simple().to_string();
+    let fn_name = format!("buzz_fail_mentions_{suffix}");
+    let trig_name = format!("buzz_fail_mentions_{suffix}");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION {fn_name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced mention insertion failure' USING ERRCODE = 'integrity_constraint_violation'; END; $$"
+    )))
+    .execute(pool)
+    .await
+    .expect("create mention-fail function");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER {trig_name} BEFORE INSERT ON event_mentions FOR EACH ROW WHEN (NEW.community_id = '{community}') EXECUTE FUNCTION {fn_name}()"
+    )))
+    .execute(pool)
+    .await
+    .expect("create mention-fail trigger");
+    (fn_name, trig_name)
+}
+
+async fn uninstall_community_mention_insert_failure(pool: &PgPool, trig_name: &str, fn_name: &str) {
+    let drop_trigger = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER IF EXISTS {trig_name} ON event_mentions"
+    )))
+    .execute(pool)
+    .await;
+    let drop_function = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP FUNCTION IF EXISTS {fn_name}()"
+    )))
+    .execute(pool)
+    .await;
+    match (drop_trigger, drop_function) {
+        (Ok(_), Ok(_)) => {}
+        (trigger, function) => {
+            panic!("mention-fail cleanup failed: trigger={trigger:?} function={function:?}");
+        }
+    }
+}
+
+async fn admit_serving_write(
+    db: &Db,
+    community: CommunityId,
+) -> crate::deletion::ServingWriteLease {
+    db.deletion_store()
+        .acquire_serving_write_lease(
+            community,
+            "ptag-serving-write-test",
+            "buzz-db-runtime-tests",
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("admit serving write")
+}
+
+#[test]
+fn extract_mention_p_tags_accepts_exact_lowercase_p_and_normalizes_hex() {
+    let hex = mention_hex(1);
+    let upper = hex.to_ascii_uppercase();
+    let mixed: String = hex
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if i % 2 == 0 {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        })
+        .collect();
+    let event = ptag_event(
+        "extract-valid",
+        vec![
+            nostr::Tag::parse(["p", &hex]).expect("lower p"),
+            nostr::Tag::parse(["p", &upper]).expect("upper hex"),
+            nostr::Tag::parse(["p", &mixed]).expect("mixed hex"),
+            nostr::Tag::parse(["p", &hex, "wss://relay.example", "alice"]).expect("trailing"),
+        ],
+    );
+    let extracted = extract_mention_p_tags(&event);
+    assert_eq!(extracted.malformed_p_tags, 0);
+    assert_eq!(
+        extracted.valid_pubkeys,
+        vec![hex.clone(), hex.clone(), hex.clone(), hex]
+    );
+}
+
+#[test]
+fn extract_mention_p_tags_rejects_malformed_actual_p_tags_and_ignores_others() {
+    let valid = mention_hex(2);
+    let mut non_ascii = String::from("é");
+    non_ascii.push_str(&"a".repeat(62));
+    assert_eq!(non_ascii.len(), 64);
+    let mut tags = vec![
+        nostr::Tag::parse(["p", ""]).expect("empty p"),
+        nostr::Tag::parse(["p", &"a".repeat(63)]).expect("63-byte p"),
+        nostr::Tag::parse(["p", &"a".repeat(65)]).expect("65-byte p"),
+        nostr::Tag::parse(["p", &non_ascii]).expect("non-ascii p"),
+        nostr::Tag::parse(["p", &"g".repeat(64)]).expect("nonhex p"),
+        nostr::Tag::parse(["P", &valid]).expect("uppercase kind"),
+        nostr::Tag::parse(["e", &"11".repeat(32)]).expect("e tag"),
+        nostr::Tag::parse(["t", "topic"]).expect("t tag"),
+        nostr::Tag::parse(["p", &valid]).expect("valid p"),
+    ];
+    let mut expected_malformed = 5usize;
+    if let Ok(missing) = nostr::Tag::parse(["p"]) {
+        tags.insert(0, missing);
+        expected_malformed = expected_malformed.saturating_add(1);
+    }
+    let event = ptag_event("extract-malformed", tags);
+    let extracted = extract_mention_p_tags(&event);
+    assert_eq!(extracted.malformed_p_tags, expected_malformed);
+    assert_eq!(extracted.valid_pubkeys, vec![valid]);
+}
+
+#[test]
+fn extract_mention_p_tags_preserves_duplicate_occurrences_without_rust_dedup() {
+    let hex = mention_hex(3);
+    let event = ptag_event(
+        "extract-dups",
+        vec![
+            nostr::Tag::parse(["p", &hex]).expect("p1"),
+            nostr::Tag::parse(["p", &hex]).expect("p2"),
+            nostr::Tag::parse(["p", &hex]).expect("p3"),
+        ],
+    );
+    let extracted = extract_mention_p_tags(&event);
+    assert_eq!(extracted.valid_pubkeys.len(), 3);
+    assert!(extracted.valid_pubkeys.iter().all(|value| value == &hex));
+}
+
+#[test]
+fn malformed_p_tag_debug_is_one_aggregate_event_without_payload_strings() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::Event;
+    use tracing::Subscriber;
+
+    struct Dump(String);
+    impl Visit for Dump {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!("{}={:?};", field.name(), value));
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.push_str(&format!("{}={};", field.name(), value));
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.push_str(&format!("{}={};", field.name(), value));
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.0.push_str(&format!("{}={};", field.name(), value));
+        }
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.0.push_str(&format!("{}={};", field.name(), value));
+        }
+    }
+
+    struct Capture {
+        buf: Arc<Mutex<String>>,
+        events: Arc<AtomicUsize>,
+    }
+    impl Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            self.events.fetch_add(1, Ordering::SeqCst);
+            let mut dump = Dump(String::new());
+            event.record(&mut dump);
+            dump.0.push_str(event.metadata().name());
+            self.buf.lock().expect("log mutex").push_str(&dump.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    let raw = "leak-this-malformed-p-tag";
+    let content = "secret-event-content-must-not-log";
+    let event = ptag_event(
+        content,
+        vec![
+            nostr::Tag::parse(["p", raw]).expect("malformed p"),
+            nostr::Tag::parse(["p", ""]).expect("empty p"),
+            nostr::Tag::parse(["e", &"22".repeat(32)]).expect("e tag"),
+        ],
+    );
+    let buf = Arc::new(Mutex::new(String::new()));
+    let events = Arc::new(AtomicUsize::new(0));
+    tracing::subscriber::with_default(
+        Capture {
+            buf: Arc::clone(&buf),
+            events: Arc::clone(&events),
+        },
+        || {
+            let extracted = extract_mention_p_tags(&event);
+            super::emit_malformed_p_tag_debug(&event, extracted.malformed_p_tags);
+        },
+    );
+    let captured = buf.lock().expect("log mutex").clone();
+    assert_eq!(events.load(Ordering::SeqCst), 1);
+    assert!(
+        captured.contains("malformed_p_tags"),
+        "expected malformed_p_tags field, got {captured}"
+    );
+    assert!(
+        !captured.contains(raw),
+        "raw malformed p-tag must not be logged: {captured}"
+    );
+    assert!(
+        !captured.contains(content),
+        "event content must not be logged: {captured}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn duplicate_mixed_case_p_tags_store_one_canonical_mention_row() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let hex = "ab".repeat(32);
+    let upper = hex.to_ascii_uppercase();
+    let event = ptag_event(
+        "dup-mixed",
+        vec![
+            nostr::Tag::parse(["p", &upper]).expect("upper"),
+            nostr::Tag::parse(["p", &hex]).expect("lower"),
+        ],
+    );
+    event::insert_event(&db.pool, community, &event, None)
+        .await
+        .expect("insert event");
+    assert_eq!(
+        mention_pubkeys(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        vec![hex]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn mention_insert_chunks_five_thousand_one_occurrences() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let count = MENTION_INSERT_CHUNK_ROWS + 1;
+    let tags: Vec<nostr::Tag> = (0..count as u16)
+        .map(|n| nostr::Tag::parse(["p", &mention_hex(n)]).expect("p"))
+        .collect();
+    let event = ptag_event_kind(1, "chunk-boundary", tags);
+    assert_eq!(extract_mention_p_tags(&event).valid_pubkeys.len(), count);
+    event::insert_event(&db.pool, community, &event, None)
+        .await
+        .expect("5001 mention rows must insert across the chunk boundary");
+    let stored = mention_pubkeys(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await;
+    let mut expected: Vec<String> = (0..count as u16).map(mention_hex).collect();
+    expected.sort();
+    assert_eq!(stored.len(), count);
+    assert_eq!(stored, expected);
+    assert!(stored
+        .iter()
+        .all(|value| value == &value.to_ascii_lowercase()));
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn serving_write_commits_event_and_mentions_together() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let hex = mention_hex(4);
+    let event = ptag_event(
+        "serving-ok",
+        vec![nostr::Tag::parse(["p", &hex]).expect("p")],
+    );
+    let lease = admit_serving_write(&db, community).await;
+    let (stored, inserted) = db
+        .insert_event_with_serving_write_guard(&lease, &event, None)
+        .await
+        .expect("serving write");
+    assert!(inserted);
+    assert_eq!(stored.event.id, event.id);
+    assert_eq!(
+        event_row_count(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        1
+    );
+    assert_eq!(
+        mention_pubkeys(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        vec![hex]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn serving_write_mention_failure_rolls_back_event_and_mentions() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let hex = mention_hex(5);
+    let event = ptag_event(
+        "serving-fail",
+        vec![nostr::Tag::parse(["p", &hex]).expect("p")],
+    );
+    let (fn_name, trig_name) =
+        install_community_mention_insert_failure(&db.pool, community_uuid).await;
+    let lease = admit_serving_write(&db, community).await;
+    let result = db
+        .insert_event_with_serving_write_guard(&lease, &event, None)
+        .await;
+    uninstall_community_mention_insert_failure(&db.pool, &trig_name, &fn_name).await;
+    result.expect_err("mention failure must fail the public serving-write method");
+    assert_eq!(
+        event_row_count(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        0
+    );
+    assert_eq!(mention_count(&db.pool, community_uuid).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn serving_write_duplicate_retry_skips_mention_insert() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let hex = mention_hex(6);
+    let event = ptag_event(
+        "serving-dup",
+        vec![nostr::Tag::parse(["p", &hex]).expect("p")],
+    );
+    let lease = admit_serving_write(&db, community).await;
+    let (_, first_inserted) = db
+        .insert_event_with_serving_write_guard(&lease, &event, None)
+        .await
+        .expect("first serving write");
+    assert!(first_inserted);
+    let (fn_name, trig_name) =
+        install_community_mention_insert_failure(&db.pool, community_uuid).await;
+    let (_, retried) = db
+        .insert_event_with_serving_write_guard(&lease, &event, None)
+        .await
+        .expect("duplicate serving write must remain idempotent");
+    assert!(!retried);
+    assert_eq!(
+        event_row_count(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        1
+    );
+    assert_eq!(
+        mention_pubkeys(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        vec![hex]
+    );
+    uninstall_community_mention_insert_failure(&db.pool, &trig_name, &fn_name).await;
+}
+
+#[test]
+fn kind9_p_tag_limit_unit_accepts_sixty_four_rejects_sixty_five() {
+    let hex = mention_hex(1);
+    let ok = ptag_event("cap-ok", repeated_p_tags(64, &hex));
+    assert!(enforce_kind9_p_tag_limit(&ok).is_ok());
+    assert_eq!(buzz_core::idempotency::keyed_p_tag_count(&ok), 64);
+
+    let over = ptag_event("cap-over", repeated_p_tags(65, &hex));
+    assert_too_many_kind9_p_tags(enforce_kind9_p_tag_limit(&over).expect_err("65 actual p tags"));
+    assert_eq!(buzz_core::idempotency::keyed_p_tag_count(&over), 65);
+}
+
+#[test]
+fn kind9_p_tag_limit_unit_counts_malformed_and_duplicate_actual_p_tags() {
+    let hex = mention_hex(2);
+    let mut tags = repeated_p_tags(64, &hex);
+    tags.push(nostr::Tag::parse(["p", "not-a-hex-pubkey"]).expect("malformed p"));
+    let over = ptag_event("malformed-cap", tags);
+    assert_eq!(buzz_core::idempotency::keyed_p_tag_count(&over), 65);
+    assert_too_many_kind9_p_tags(
+        enforce_kind9_p_tag_limit(&over).expect_err("malformed actual p tags count"),
+    );
+}
+
+#[test]
+fn kind9_p_tag_limit_unit_ignores_uppercase_p_and_non_p_tags() {
+    let hex = mention_hex(3);
+    let mut tags = repeated_p_tags(64, &hex);
+    tags.extend((0..65).map(|_| nostr::Tag::parse(["P", &hex]).expect("uppercase P")));
+    tags.extend((0..65).map(|_| nostr::Tag::parse(["e", &hex]).expect("e tag")));
+    let event = ptag_event("ignore-non-p", tags);
+    assert_eq!(buzz_core::idempotency::keyed_p_tag_count(&event), 64);
+    assert!(enforce_kind9_p_tag_limit(&event).is_ok());
+}
+
+#[test]
+fn kind9_p_tag_limit_unit_does_not_apply_to_other_kinds() {
+    let hex = mention_hex(4);
+    let event = ptag_event_kind(1, "kind1-uncapped", repeated_p_tags(65, &hex));
+    assert_eq!(buzz_core::idempotency::keyed_p_tag_count(&event), 65);
+    assert!(enforce_kind9_p_tag_limit(&event).is_ok());
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn ordinary_insert_event_mention_failure_rolls_back_coupled_state() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let hex = mention_hex(10);
+    let event = ptag_event(
+        "ordinary-fail",
+        vec![nostr::Tag::parse(["p", &hex]).expect("p")],
+    );
+    let (fn_name, trig_name) =
+        install_community_mention_insert_failure(&db.pool, community_uuid).await;
+    let result = db.insert_event(community, &event, None).await;
+    uninstall_community_mention_insert_failure(&db.pool, &trig_name, &fn_name).await;
+    result.expect_err("mention failure must fail ordinary insert_event");
+    assert_eq!(
+        event_row_count(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        0
+    );
+    assert_eq!(mention_count(&db.pool, community_uuid).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn ordinary_insert_event_retry_succeeds_after_mention_trigger_removed() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let hex = mention_hex(11);
+    let event = ptag_event(
+        "ordinary-retry",
+        vec![nostr::Tag::parse(["p", &hex]).expect("p")],
+    );
+    let (fn_name, trig_name) =
+        install_community_mention_insert_failure(&db.pool, community_uuid).await;
+    let failed = db.insert_event(community, &event, None).await;
+    uninstall_community_mention_insert_failure(&db.pool, &trig_name, &fn_name).await;
+    failed.expect_err("trigger must reject the first write");
+    let (stored, inserted) = db
+        .insert_event(community, &event, None)
+        .await
+        .expect("retry after trigger removal");
+    assert!(inserted);
+    assert_eq!(stored.event.id, event.id);
+    assert_eq!(
+        event_row_count(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        1
+    );
+    assert_eq!(
+        mention_pubkeys(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        vec![hex]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn ordinary_insert_event_duplicate_does_not_rerun_mention_insert() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let hex = mention_hex(12);
+    let event = ptag_event(
+        "ordinary-dup",
+        vec![nostr::Tag::parse(["p", &hex]).expect("p")],
+    );
+    let (_, first_inserted) = db
+        .insert_event(community, &event, None)
+        .await
+        .expect("first ordinary insert");
+    assert!(first_inserted);
+    let (fn_name, trig_name) =
+        install_community_mention_insert_failure(&db.pool, community_uuid).await;
+    let result = db.insert_event(community, &event, None).await;
+    uninstall_community_mention_insert_failure(&db.pool, &trig_name, &fn_name).await;
+    let (_, retried) = result.expect("duplicate must skip mention insertion");
+    assert!(!retried);
+    assert_eq!(
+        event_row_count(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        1
+    );
+    assert_eq!(
+        mention_pubkeys(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        vec![hex]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn ordinary_insert_event_unrelated_community_unaffected_by_mention_trigger() {
+    let db = setup_db().await;
+    let community_a = make_community(&db.pool).await;
+    let community_b = make_community(&db.pool).await;
+    let cid_a = CommunityId::from_uuid(community_a);
+    let cid_b = CommunityId::from_uuid(community_b);
+    let hex_a = mention_hex(13);
+    let hex_b = mention_hex(14);
+    let event_a = ptag_event(
+        "community-a",
+        vec![nostr::Tag::parse(["p", &hex_a]).expect("p")],
+    );
+    let event_b = ptag_event(
+        "community-b",
+        vec![nostr::Tag::parse(["p", &hex_b]).expect("p")],
+    );
+    let (fn_name, trig_name) =
+        install_community_mention_insert_failure(&db.pool, community_a).await;
+    let ok_b = db.insert_event(cid_b, &event_b, None).await;
+    let fail_a = db.insert_event(cid_a, &event_a, None).await;
+    uninstall_community_mention_insert_failure(&db.pool, &trig_name, &fn_name).await;
+    let (_, inserted_b) = ok_b.expect("unrelated community must write");
+    assert!(inserted_b);
+    fail_a.expect_err("triggered community must roll back");
+    assert_eq!(
+        event_row_count(&db.pool, community_b, event_b.id.as_bytes().as_slice()).await,
+        1
+    );
+    assert_eq!(
+        mention_pubkeys(&db.pool, community_b, event_b.id.as_bytes().as_slice()).await,
+        vec![hex_b]
+    );
+    assert_eq!(
+        event_row_count(&db.pool, community_a, event_a.id.as_bytes().as_slice()).await,
+        0
+    );
+    assert_eq!(mention_count(&db.pool, community_a).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn ordinary_insert_event_no_indexed_p_tags_succeeds_under_mention_trigger() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let event = ptag_event("no-p-tags", Vec::new());
+    let (fn_name, trig_name) =
+        install_community_mention_insert_failure(&db.pool, community_uuid).await;
+    let result = db.insert_event(community, &event, None).await;
+    uninstall_community_mention_insert_failure(&db.pool, &trig_name, &fn_name).await;
+    let (_, inserted) = result.expect("no indexed p tags must not execute mention INSERT");
+    assert!(inserted);
+    assert_eq!(
+        event_row_count(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        1
+    );
+    assert_eq!(mention_count(&db.pool, community_uuid).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn ordinary_insert_event_with_thread_metadata_mention_failure_rolls_back_coupled_state() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let channel = make_channel(&db.pool, community_uuid).await;
+    let parent = ptag_event("thread-parent", Vec::new());
+    let parent_ts =
+        chrono::DateTime::from_timestamp(parent.created_at.as_secs() as i64, 0).expect("parent ts");
+    let (_, parent_inserted) = db
+        .insert_event_with_thread_metadata(
+            community,
+            &parent,
+            Some(channel),
+            Some(event::ThreadMetadataParams {
+                event_id: parent.id.as_bytes(),
+                event_created_at: parent_ts,
+                channel_id: channel,
+                parent_event_id: None,
+                parent_event_created_at: None,
+                root_event_id: None,
+                root_event_created_at: None,
+                depth: 0,
+                broadcast: true,
+            }),
+        )
+        .await
+        .expect("insert parent");
+    assert!(parent_inserted);
+
+    let hex = mention_hex(15);
+    let reply = ptag_event(
+        "thread-reply",
+        vec![nostr::Tag::parse(["p", &hex]).expect("p")],
+    );
+    let reply_ts =
+        chrono::DateTime::from_timestamp(reply.created_at.as_secs() as i64, 0).expect("reply ts");
+    let (fn_name, trig_name) =
+        install_community_mention_insert_failure(&db.pool, community_uuid).await;
+    let result = db
+        .insert_event_with_thread_metadata(
+            community,
+            &reply,
+            Some(channel),
+            Some(event::ThreadMetadataParams {
+                event_id: reply.id.as_bytes(),
+                event_created_at: reply_ts,
+                channel_id: channel,
+                parent_event_id: Some(parent.id.as_bytes()),
+                parent_event_created_at: Some(parent_ts),
+                root_event_id: Some(parent.id.as_bytes()),
+                root_event_created_at: Some(parent_ts),
+                depth: 1,
+                broadcast: false,
+            }),
+        )
+        .await;
+    uninstall_community_mention_insert_failure(&db.pool, &trig_name, &fn_name).await;
+    result.expect_err("mention failure must roll back reply event and counters");
+    assert_eq!(
+        event_row_count(&db.pool, community_uuid, reply.id.as_bytes().as_slice()).await,
+        0
+    );
+    assert_eq!(mention_count(&db.pool, community_uuid).await, 0);
+    assert_eq!(
+        thread_reply_count(&db.pool, community_uuid, parent.id.as_bytes().as_slice()).await,
+        0
+    );
+    assert_eq!(
+        event_row_count(&db.pool, community_uuid, parent.id.as_bytes().as_slice()).await,
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn kind9_write_p_tag_limit_accepts_sixty_four_actual_tags() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let event = ptag_event("kind9-64", distinct_p_tags(64));
+    assert_eq!(buzz_core::idempotency::keyed_p_tag_count(&event), 64);
+    let (_, inserted) = db
+        .insert_event(community, &event, None)
+        .await
+        .expect("64 actual p tags must persist");
+    assert!(inserted);
+    assert_eq!(
+        mention_pubkeys(&db.pool, community_uuid, event.id.as_bytes().as_slice())
+            .await
+            .len(),
+        64
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn kind9_write_p_tag_limit_rejects_sixty_five_actual_tags() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let event = ptag_event("kind9-65", distinct_p_tags(65));
+    assert_eq!(buzz_core::idempotency::keyed_p_tag_count(&event), 65);
+    let err = db
+        .insert_event(community, &event, None)
+        .await
+        .expect_err("65 actual p tags must fail before write");
+    assert_too_many_kind9_p_tags(err);
+    assert_eq!(
+        event_row_count(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        0
+    );
+    assert_eq!(mention_count(&db.pool, community_uuid).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn kind9_write_p_tag_limit_counts_malformed_and_duplicate_actual_p_tags() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let hex = mention_hex(20);
+    let mut tags = repeated_p_tags(64, &hex);
+    tags.push(nostr::Tag::parse(["p", ""]).expect("malformed p"));
+    let event = ptag_event("kind9-malformed-65", tags);
+    let err = db
+        .insert_event(community, &event, None)
+        .await
+        .expect_err("malformed actual p tags count toward the cap");
+    assert_too_many_kind9_p_tags(err);
+    assert_eq!(
+        event_row_count(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn kind9_write_p_tag_limit_ignores_uppercase_kind_and_non_p_tags() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let hex = mention_hex(21);
+    let mut tags = repeated_p_tags(64, &hex);
+    tags.extend((0..65).map(|_| nostr::Tag::parse(["P", &hex]).expect("uppercase P")));
+    tags.extend((0..65).map(|_| nostr::Tag::parse(["t", "topic"]).expect("t tag")));
+    let event = ptag_event("kind9-ignore-non-p", tags);
+    assert_eq!(buzz_core::idempotency::keyed_p_tag_count(&event), 64);
+    let (_, inserted) = db
+        .insert_event(community, &event, None)
+        .await
+        .expect("uppercase P and non-p tags must not count");
+    assert!(inserted);
+    assert_eq!(
+        mention_pubkeys(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        vec![hex]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn kind9_write_p_tag_limit_does_not_apply_to_other_kinds() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let event = ptag_event_kind(1, "kind1-65", distinct_p_tags(65));
+    let (_, inserted) = db
+        .insert_event(community, &event, None)
+        .await
+        .expect("non-kind-9 contracts stay uncapped");
+    assert!(inserted);
+    assert_eq!(
+        mention_pubkeys(&db.pool, community_uuid, event.id.as_bytes().as_slice())
+            .await
+            .len(),
+        65
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn kind9_write_p_tag_limit_insert_event_in_transaction_rejects_sixty_five() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let event = ptag_event("kind9-tx-65", distinct_p_tags(65));
+    let mut tx = db.pool.begin().await.expect("begin bypass tx");
+    let result = event::insert_event_in_transaction(&mut tx, community, &event, None).await;
+    tx.rollback().await.expect("rollback bypass tx");
+    assert_too_many_kind9_p_tags(result.expect_err("in-transaction kind-9 cap"));
+    assert_eq!(
+        event_row_count(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn kind9_write_p_tag_limit_thread_writer_rejects_sixty_five() {
+    let db = setup_db().await;
+    let community_uuid = make_community(&db.pool).await;
+    let community = CommunityId::from_uuid(community_uuid);
+    let event = ptag_event("kind9-thread-65", distinct_p_tags(65));
+    let err = db
+        .insert_event_with_thread_metadata(community, &event, None, None)
+        .await
+        .expect_err("thread writer must apply the kind-9 cap");
+    assert_too_many_kind9_p_tags(err);
+    assert_eq!(
+        event_row_count(&db.pool, community_uuid, event.id.as_bytes().as_slice()).await,
+        0
+    );
+    assert_eq!(mention_count(&db.pool, community_uuid).await, 0);
 }
