@@ -216,13 +216,22 @@ CREATE TABLE events (
     -- community-leading btree filters BitmapAnd-ed with the GIN probe, so the
     -- GIN index itself stays the minimal `GIN (search_tsv)` (Max's caveat:
     -- avoid btree_gin unless EXPLAIN proves it buys something).
-    -- Privacy: encrypted/private routing wrappers and p-gated membership notices
-    -- must never be discoverable through NIP-50 full-text search. NULL tsvector
-    -- never matches `@@`.
-    -- Keep in sync with migrations (final state: 0001 + 0005 + 0014 + 0033).
+    -- Fresh installs index only the five kinds allowed by migration 0008.
+    -- Match its final generated expression, including the 0014/0033 wrappers;
+    -- all other kinds return NULL, which never matches `@@`. Published
+    -- migrations retain the separate brownfield/operator-managed policy.
     search_tsv  TSVECTOR GENERATED ALWAYS AS (
-        CASE WHEN kind IN (1059, 30179, 30300, 30350, 30622, 44100, 44101, 44200) THEN NULL::tsvector
-             ELSE to_tsvector('simple', content)
+        CASE WHEN kind = 30179 THEN NULL::tsvector
+             ELSE (
+                 CASE WHEN kind = 30350 THEN NULL::tsvector
+                      ELSE (
+                          CASE WHEN kind IN (0, 9, 40002, 45001, 45003)
+                               THEN to_tsvector('simple', content)
+                               ELSE NULL::tsvector
+                          END
+                      )
+                 END
+             )
         END
     ) STORED,
     sig         BYTEA NOT NULL,
@@ -872,6 +881,161 @@ CREATE TABLE parameterized_event_watermarks (
 );
 CREATE INDEX idx_event_mentions_community_event
     ON event_mentions (community_id, event_id);
+
+-- Final NIP-RS database guards (migrations 0009-0011). Desired-state
+-- bootstrap must preserve exact replay, retention, and live-mention semantics.
+CREATE OR REPLACE FUNCTION guard_nip_rs_watermark() RETURNS trigger AS $$
+DECLARE
+    advanced BOOLEAN;
+BEGIN
+    IF NEW.kind = 30078
+       AND NEW.d_tag ~ '^read-state:[0-9a-f]{32}$'
+       AND (
+           SELECT count(*)
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE jsonb_typeof(tag) = 'array'
+             AND tag->0 = '"d"'::jsonb
+       ) = 1
+       AND EXISTS (
+           SELECT 1
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE jsonb_typeof(tag) = 'array'
+             AND jsonb_array_length(tag) >= 2
+             AND jsonb_typeof(tag->1) = 'string'
+             AND tag->>0 = 'd'
+             AND tag->>1 = NEW.d_tag
+       )
+       AND (
+           SELECT count(*)
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE tag = '["t", "read-state"]'::jsonb
+       ) = 1 THEN
+        INSERT INTO parameterized_event_watermarks
+            (community_id, kind, pubkey, d_tag, created_at, event_id)
+        VALUES
+            (NEW.community_id, NEW.kind, NEW.pubkey, NEW.d_tag, NEW.created_at, NEW.id)
+        ON CONFLICT (community_id, kind, pubkey, d_tag) DO UPDATE SET
+            created_at = EXCLUDED.created_at,
+            event_id = EXCLUDED.event_id
+        WHERE EXCLUDED.created_at > parameterized_event_watermarks.created_at
+           OR (EXCLUDED.created_at = parameterized_event_watermarks.created_at
+               AND EXCLUDED.event_id < parameterized_event_watermarks.event_id)
+        RETURNING TRUE INTO advanced;
+
+        IF NOT COALESCE(advanced, FALSE) THEN
+            IF EXISTS (
+                SELECT 1
+                FROM parameterized_event_watermarks
+                WHERE community_id = NEW.community_id
+                  AND kind = NEW.kind
+                  AND pubkey = NEW.pubkey
+                  AND d_tag = NEW.d_tag
+                  AND created_at = NEW.created_at
+                  AND event_id = NEW.id
+            ) THEN
+                RETURN NULL;
+            END IF;
+
+            RAISE EXCEPTION 'stale NIP-RS event rejected by durable watermark'
+                USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_events_nip_rs_watermark
+    BEFORE INSERT ON events
+    FOR EACH ROW EXECUTE FUNCTION guard_nip_rs_watermark();
+
+CREATE FUNCTION guard_nip_rs_hard_delete() RETURNS trigger AS $$
+BEGIN
+    IF current_setting('buzz.nip_rs_hard_delete', true) IS DISTINCT FROM 'on' THEN
+        RAISE EXCEPTION 'NIP-RS hard delete requires corrected writer opt-in'
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_events_guard_nip_rs_hard_delete
+    BEFORE DELETE ON events
+    FOR EACH ROW
+    WHEN (OLD.kind = 30078 AND OLD.d_tag ~ '^read-state:[0-9a-f]{32}$')
+    EXECUTE FUNCTION guard_nip_rs_hard_delete();
+
+CREATE OR REPLACE FUNCTION purge_soft_deleted_nip_rs() RETURNS trigger AS $$
+BEGIN
+    IF OLD.deleted_at IS NULL
+       AND NEW.deleted_at IS NOT NULL
+       AND NEW.kind = 30078
+       AND NEW.d_tag ~ '^read-state:[0-9a-f]{32}$'
+       AND (
+           SELECT count(*)
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE jsonb_typeof(tag) = 'array'
+             AND tag->0 = '"d"'::jsonb
+       ) = 1
+       AND EXISTS (
+           SELECT 1
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE jsonb_typeof(tag) = 'array'
+             AND jsonb_array_length(tag) >= 2
+             AND jsonb_typeof(tag->1) = 'string'
+             AND tag->>0 = 'd'
+             AND tag->>1 = NEW.d_tag
+       )
+       AND (
+           SELECT count(*)
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE tag = '["t", "read-state"]'::jsonb
+       ) = 1 THEN
+        PERFORM set_config('buzz.nip_rs_hard_delete', 'on', true);
+
+        DELETE FROM events
+        WHERE community_id = NEW.community_id
+          AND created_at = NEW.created_at
+          AND id = NEW.id;
+
+        DELETE FROM event_mentions
+        WHERE community_id = NEW.community_id AND event_id = NEW.id;
+    END IF;
+
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_events_purge_soft_deleted_nip_rs
+    AFTER UPDATE OF deleted_at ON events
+    FOR EACH ROW EXECUTE FUNCTION purge_soft_deleted_nip_rs();
+
+CREATE FUNCTION guard_event_mention_live() RETURNS trigger AS $$
+BEGIN
+    IF NEW.event_kind IS DISTINCT FROM 30078 THEN
+        RETURN NEW;
+    END IF;
+
+    PERFORM 1
+    FROM events
+    WHERE community_id = NEW.community_id
+      AND id = NEW.event_id
+      AND created_at = NEW.event_created_at
+      AND deleted_at IS NULL
+    FOR KEY SHARE;
+
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_event_mentions_require_live_event
+    BEFORE INSERT ON event_mentions
+    FOR EACH ROW EXECUTE FUNCTION guard_event_mention_live();
 
 CREATE TABLE product_feedback (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

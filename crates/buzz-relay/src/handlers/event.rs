@@ -791,6 +791,14 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
     }
 }
 
+// Generic ephemeral events share the external raw lowercase-p tag cap.
+fn validate_ephemeral_p_tags(event: &Event) -> Result<(), String> {
+    if buzz_core::idempotency::keyed_p_tag_count(event) > buzz_core::idempotency::KEYED_MAX_P_TAGS {
+        return Err("invalid: too many p tags".into());
+    }
+    Ok(())
+}
+
 /// Handle ephemeral events (kind 20000–29999) — WS-only, never stored.
 async fn handle_ephemeral_event(
     event: Event,
@@ -800,6 +808,8 @@ async fn handle_ephemeral_event(
     conn: Arc<ConnectionState>,
     state: Arc<AppState>,
 ) -> Result<(), String> {
+    validate_ephemeral_p_tags(&event)?;
+
     let event_clone = event.clone();
     let event_id = event.id.to_hex();
     let verify_result = tokio::task::spawn_blocking(move || verify_event(&event_clone)).await;
@@ -1181,6 +1191,78 @@ mod tests {
     use tokio::sync::{mpsc, Mutex, RwLock};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    fn ephemeral_p_tag_fixture(kind: u16, tags: Vec<Tag>) -> nostr::Event {
+        let expected_tag_count = tags.len();
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(kind), "fixture")
+            .tags(tags)
+            .allow_self_tagging()
+            .sign_with_keys(&keys)
+            .expect("sign fixture");
+        assert_eq!(event.tags.len(), expected_tag_count);
+        event
+    }
+
+    #[test]
+    fn ephemeral_p_tag_limit_preserves_boundary_for_generic_kinds() {
+        use buzz_core::idempotency::{keyed_p_tag_count, KEYED_MAX_P_TAGS};
+
+        for kind in [20000, KIND_PRESENCE_UPDATE as u16, 24134, 29999] {
+            for count in [
+                0,
+                KEYED_MAX_P_TAGS - 1,
+                KEYED_MAX_P_TAGS,
+                KEYED_MAX_P_TAGS + 1,
+            ] {
+                let tags = (0..count)
+                    .map(|_| Tag::parse(["p", "fixture"]).expect("p tag"))
+                    .collect();
+                let event = ephemeral_p_tag_fixture(kind, tags);
+                assert_eq!(keyed_p_tag_count(&event), count);
+                let expected = if count <= KEYED_MAX_P_TAGS {
+                    Ok(())
+                } else {
+                    Err("invalid: too many p tags".to_string())
+                };
+                assert_eq!(super::validate_ephemeral_p_tags(&event), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn ephemeral_p_tag_limit_counts_duplicate_and_malformed_raw_tags() {
+        use buzz_core::idempotency::{keyed_p_tag_count, KEYED_MAX_P_TAGS};
+
+        let value = "ab".repeat(32);
+        let mut tags: Vec<Tag> = (0..KEYED_MAX_P_TAGS)
+            .map(|_| Tag::parse(["p", value.as_str()]).expect("p tag"))
+            .collect();
+        tags.push(Tag::parse(["p", "not-a-hex-pubkey"]).expect("raw p tag"));
+        let event = ephemeral_p_tag_fixture(KIND_PRESENCE_UPDATE as u16, tags);
+        assert_eq!(keyed_p_tag_count(&event), KEYED_MAX_P_TAGS + 1);
+        assert_eq!(
+            super::validate_ephemeral_p_tags(&event),
+            Err("invalid: too many p tags".to_string())
+        );
+    }
+
+    #[test]
+    fn ephemeral_p_tag_limit_ignores_uppercase_and_other_tag_names() {
+        use buzz_core::idempotency::{keyed_p_tag_count, KEYED_MAX_P_TAGS};
+
+        let mut tags: Vec<Tag> = (0..KEYED_MAX_P_TAGS)
+            .map(|_| Tag::parse(["p", "fixture"]).expect("p tag"))
+            .collect();
+        for name in ["P", "preimage", "t", "e"] {
+            tags.extend(
+                (0..=KEYED_MAX_P_TAGS).map(|_| Tag::parse([name, "p"]).expect("other tag")),
+            );
+        }
+        let event = ephemeral_p_tag_fixture(24134, tags);
+        assert_eq!(keyed_p_tag_count(&event), KEYED_MAX_P_TAGS);
+        assert_eq!(super::validate_ephemeral_p_tags(&event), Ok(()));
+    }
 
     #[test]
     fn fanout_event_frame_matches_legacy_format_byte_for_byte() {

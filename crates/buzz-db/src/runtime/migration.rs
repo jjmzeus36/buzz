@@ -37,7 +37,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
 pub(crate) async fn run_migrations_through(pool: &PgPool, target: i64) -> Result<()> {
     with_exclusive_schema_destruction_lock(pool, |mut conn| async move {
         let outcome = async {
-            reject_legacy_nip_rs_cardinality_ambiguity(&mut conn).await?;
+            if target >= 7 {
+                migrate_legacy_nip_rs_through_0007(&mut conn).await?;
+            }
             MIGRATOR.run_to(target, &mut conn).await?;
             Ok(())
         }
@@ -48,7 +50,7 @@ pub(crate) async fn run_migrations_through(pool: &PgPool, target: i64) -> Result
 }
 
 async fn run_migrations_locked(conn: &mut PgConnection) -> Result<()> {
-    reject_legacy_nip_rs_cardinality_ambiguity(conn).await?;
+    migrate_legacy_nip_rs_through_0007(conn).await?;
     MIGRATOR.run(&mut *conn).await?;
     // The replica-fence proof (see `replica_fence`) requires the commit-time
     // `created_at` floor trigger from migration 0021 — correctly shaped — on
@@ -117,9 +119,15 @@ where
 
 /// Migration 0007 is checksum-frozen and predates exact NIP-RS tag-cardinality
 /// enforcement. A populated database still on 0001-0006 must not let 0007
-/// irreversibly purge duplicate-tag history. Fail before sqlx starts its
-/// migration transaction so an operator can inspect and repair those rows.
-async fn reject_legacy_nip_rs_cardinality_ambiguity(conn: &mut PgConnection) -> Result<()> {
+/// irreversibly purge duplicate-tag history. Hold the events writer lock from
+/// validation through 0007 in one outer transaction. SQLx 0.9 uses savepoints
+/// for its nested migration transactions; releasing them retains this lock.
+async fn migrate_legacy_nip_rs_through_0007(conn: &mut PgConnection) -> Result<()> {
+    // Take SQLx's migration lock before any table lock, including when older
+    // SQLx migrators overlap. Its run calls take balanced reentrant locks.
+    // This acquisition lasts until the exclusive wrapper closes this same
+    // detached connection, including errors and cancellation.
+    <PgConnection as sqlx::migrate::Migrate>::lock(&mut *conn).await?;
     let migrations_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations')::text")
             .fetch_one(&mut *conn)
@@ -135,6 +143,14 @@ async fn reject_legacy_nip_rs_cardinality_ambiguity(conn: &mut PgConnection) -> 
         return Ok(());
     }
 
+    // READ COMMITTED makes validation see writers that committed while this
+    // lock acquisition waited. Keep the lock outside SQLx's savepoints.
+    let mut tx = conn
+        .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+        .await?;
+    sqlx::query("LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
     let ambiguous: bool = sqlx::query_scalar(
         "SELECT EXISTS (\
              SELECT 1 FROM events e \
@@ -173,7 +189,7 @@ async fn reject_legacy_nip_rs_cardinality_ambiguity(conn: &mut PgConnection) -> 
                )\
          )",
     )
-    .fetch_one(conn)
+    .fetch_one(&mut *tx)
     .await?;
 
     if ambiguous {
@@ -182,6 +198,10 @@ async fn reject_legacy_nip_rs_cardinality_ambiguity(conn: &mut PgConnection) -> 
                 .into(),
         ));
     }
+    // Commit the frozen migration and its SQLx bookkeeping before admitting
+    // writers again. Later migrations retain their ordinary transactions.
+    MIGRATOR.run_to(7, &mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1727,9 +1747,9 @@ mod postgres_tests {
             if *path == this_file {
                 assert_eq!(
                     (macro_hits, run_hits, run_to_hits),
-                    (1, 1, 1),
+                    (1, 1, 2),
                     "migration.rs must embed the migrator once, run it once in production, \
-                     and expose exactly one test-only bounded run"
+                     and expose one bounded legacy upgrade plus one test-only bounded run"
                 );
             } else if *path == push_gateway_exception {
                 continue;
@@ -1775,7 +1795,19 @@ mod postgres_tests {
                 && run_to_site < locked
                 && source[entry..run_to_site].contains("#[cfg(test)]")
                 && source[entry..run_to_site].contains("with_exclusive_schema_destruction_lock("),
-            "the bounded migrator run must remain test-only and use the exclusive lock wrapper"
+            "the first bounded migrator run must remain test-only and use the exclusive lock wrapper"
+        );
+        let legacy = source
+            .find("async fn migrate_legacy_nip_rs_through_0007(")
+            .expect("legacy migration transaction helper");
+        let legacy_run = source.rfind(&migrator_run_to).expect("legacy bounded run");
+        assert!(
+            legacy > wrapper
+                && legacy_run > legacy
+                && source[legacy_run..].starts_with(&format!("{migrator_run_to}7,"))
+                && source[locked..wrapper].contains("migrate_legacy_nip_rs_through_0007(conn)")
+                && source[entry..locked].contains("if target >= 7"),
+            "the production bounded run must stay under the exclusive wrapper and stop at 0007"
         );
         assert!(
             source[wrapper..].contains("pg_advisory_lock($1)")
@@ -2511,6 +2543,58 @@ mod postgres_tests {
             .expect("read function body")
         }
 
+        // Compare the actual guard catalog after the same pgschema and repeated
+        // reconciliation path in this test, including inherited partition triggers.
+        async fn nip_rs_guard_catalog(
+            pool: &PgPool,
+        ) -> sqlx::Result<Vec<(String, String, String)>> {
+            sqlx::query_as(
+                r#"SELECT 'function'::TEXT AS object_kind, p.proname::TEXT AS object_name,
+                          pg_get_functiondef(p.oid) AS definition
+                   FROM pg_proc p
+                   JOIN pg_namespace n ON n.oid = p.pronamespace
+                   WHERE n.nspname = current_schema() AND p.pronargs = 0
+                     AND p.prokind = 'f' AND p.proname = ANY($1::TEXT[])
+                   UNION ALL
+                   SELECT 'trigger', c.relname::TEXT || '.' || t.tgname::TEXT,
+                          jsonb_build_object(
+                              'definition', pg_get_triggerdef(t.oid),
+                              'enabled', t.tgenabled,
+                              'function_schema', fn.nspname,
+                              'parent_table', parent_table.relname,
+                              'parent_trigger', parent_trigger.tgname
+                          )::TEXT
+                   FROM pg_trigger t
+                   JOIN pg_proc p ON p.oid = t.tgfoid
+                   JOIN pg_namespace fn ON fn.oid = p.pronamespace
+                   JOIN pg_class c ON c.oid = t.tgrelid
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   LEFT JOIN pg_trigger parent_trigger ON parent_trigger.oid = t.tgparentid
+                   LEFT JOIN pg_class parent_table ON parent_table.oid = parent_trigger.tgrelid
+                   WHERE n.nspname = current_schema() AND NOT t.tgisinternal
+                     AND t.tgname = ANY($2::TEXT[])
+                   ORDER BY 1, 2"#,
+            )
+            .bind(
+                &[
+                    "guard_nip_rs_watermark",
+                    "guard_nip_rs_hard_delete",
+                    "purge_soft_deleted_nip_rs",
+                    "guard_event_mention_live",
+                ][..],
+            )
+            .bind(
+                &[
+                    "trg_events_nip_rs_watermark",
+                    "trg_events_guard_nip_rs_hard_delete",
+                    "trg_events_purge_soft_deleted_nip_rs",
+                    "trg_event_mentions_require_live_event",
+                ][..],
+            )
+            .fetch_all(pool)
+            .await
+        }
+
         let base_url = crate::test_support::database_url();
         let conn = parse_pg_url(&base_url);
         let admin = PgPool::connect(&base_url)
@@ -2895,6 +2979,32 @@ mod postgres_tests {
                 .execute(&desired)
                 .await
                 .map_err(|error| format!("delete probe community: {error}"))?;
+
+            // Compare the actual STORED expression after real pgschema and
+            // repeated reconciliation with the final fresh-migration policy.
+            let desired_search = probe_shape(&desired, "events", "search_tsv")
+                .await
+                .map_err(|error| format!("read desired-state search expression: {error}"))?;
+            let migrated_search = probe_shape(&migrated, "events", "search_tsv")
+                .await
+                .map_err(|error| format!("read migrated search expression: {error}"))?;
+            if desired_search != migrated_search {
+                return Err(format!(
+                    "search_tsv generated-column parity mismatch: \
+                     desired={desired_search:?} migrated={migrated_search:?}"
+                ));
+            }
+            if !desired_search.2 {
+                return Err("search_tsv must be a STORED generated column".to_owned());
+            }
+            let Some(expression) = desired_search.3.as_deref() else {
+                return Err("search_tsv must have a generated expression".to_owned());
+            };
+            if !expression.contains("ARRAY[0, 9, 40002, 45001, 45003]")
+                || !expression.contains("ELSE NULL::tsvector")
+            {
+                return Err(format!("unexpected fresh-install search policy: {expression}"));
+            }
             Ok(())
         }
         .await;
@@ -2948,6 +3058,38 @@ mod postgres_tests {
                  migration uses a construct pgschema cannot represent (e.g. NULLS FIRST), the \
                  migration and schema.sql must both use a representable shape."
             );
+        }
+
+        let nip_rs_parity: std::result::Result<(), String> = async {
+            let desired_guards = nip_rs_guard_catalog(&desired)
+                .await
+                .map_err(|error| format!("read desired-state NIP-RS guards: {error}"))?;
+            let migrated_guards = nip_rs_guard_catalog(&migrated)
+                .await
+                .map_err(|error| format!("read migrated NIP-RS guards: {error}"))?;
+            // Four functions, three event triggers on the parent and eight
+            // partitions, and one event_mentions trigger. Reject empty parity.
+            if migrated_guards.len() != 32 {
+                return Err(format!(
+                    "expected 32 migrated NIP-RS guard catalog rows, got {}",
+                    migrated_guards.len()
+                ));
+            }
+            if desired_guards != migrated_guards {
+                return Err(format!(
+                    "NIP-RS guard catalog parity mismatch: desired={desired_guards:?}; \
+                     migrated={migrated_guards:?}"
+                ));
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = nip_rs_parity {
+            desired.close().await;
+            migrated.close().await;
+            let mut errors = vec![error];
+            errors.extend(drop_probe_databases(&admin, &desired_db, &migrated_db).await);
+            panic!("{}", errors.join("; "));
         }
 
         const IDEMPOTENCY_TABLE: &str = "event_idempotency_keys";
@@ -3210,6 +3352,354 @@ mod postgres_tests {
         if !drop_errors.is_empty() {
             panic!("{}", drop_errors.join("; "));
         }
+    }
+
+    async fn wait_for_pre_0007_backend_state(
+        pool: &PgPool,
+        pid: i32,
+        blocker: Option<i32>,
+        exact_query: Option<&str>,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let reached: bool = sqlx::query_scalar(
+                    "SELECT CASE WHEN $2::int4 IS NULL THEN NOT EXISTS (\
+                         SELECT 1 FROM pg_stat_activity \
+                         WHERE pid = $1 AND datname = current_database()\
+                     ) ELSE $2 = ANY(pg_blocking_pids($1)) AND (\
+                         $3::text IS NULL OR EXISTS (\
+                             SELECT 1 FROM pg_stat_activity \
+                             WHERE pid = $1 AND datname = current_database() AND query = $3\
+                         )\
+                     ) END",
+                )
+                .bind(pid)
+                .bind(blocker)
+                .bind(exact_query)
+                .fetch_one(pool)
+                .await
+                .expect("read bounded migration barrier state");
+                if reached {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("migration backend did not reach the expected catalog barrier");
+    }
+
+    async fn pre_0007_writer_lock_fixture(cancel: bool) {
+        // The SQLx migration future need not be Send. Local tasks retain the
+        // same concurrent barriers, abort ownership, and cleanup on this runtime.
+        tokio::task::LocalSet::new()
+            .run_until(pre_0007_writer_lock_fixture_local(cancel))
+            .await;
+    }
+
+    async fn pre_0007_writer_lock_fixture_local(cancel: bool) {
+        use std::time::Duration;
+
+        use sqlx::AssertSqlSafe;
+
+        let base_url = crate::test_support::database_url();
+        let admin = PgPool::connect(&base_url)
+            .await
+            .expect("connect fixture admin");
+        let probe_db = format!("buzz_pre0007_lock_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {probe_db}")))
+            .execute(&admin)
+            .await
+            .expect("create owned lock fixture database");
+        let (base_prefix, _) = base_url.rsplit_once('/').expect("database URL path");
+        let pool = PgPool::connect(&format!("{base_prefix}/{probe_db}"))
+            .await
+            .expect("connect owned lock fixture database");
+        let phase_pool = pool.clone();
+        // Capture assertion failures so cleanup still drops only this UUID-named
+        // database. JoinSet aborts its owned tasks if the phase panics or times out.
+        let mut phase = tokio::task::spawn_local(async move {
+            run_migrations_through(&phase_pool, 6)
+                .await
+                .expect("prepare migration 6");
+            let community = uuid::Uuid::new_v4();
+            let event_id = [0x41_u8; 32];
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community)
+                .bind(format!("pre0007-lock-{}.example", community.simple()))
+                .execute(&phase_pool)
+                .await
+                .expect("insert ordinary fixture community");
+            sqlx::query(
+                "INSERT INTO events \
+                 (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at) \
+                 VALUES ($1, $2, $3, NOW(), 1, '[]'::jsonb, 'original', $4, NOW())",
+            )
+            .bind(community)
+            .bind(event_id.as_slice())
+            .bind([0x42_u8; 32].as_slice())
+            .bind([0x43_u8; 64].as_slice())
+            .execute(&phase_pool)
+            .await
+            .expect("insert ordinary kind-1 database row");
+
+            // A fixture-only ledger trigger parks SQLx after the unchanged 0007
+            // script, before its savepoint/bookkeeping can commit. No NIP-RS
+            // payload, ambiguity, or purge scenario is created by this fixture.
+            sqlx::raw_sql(
+                "CREATE FUNCTION pre0007_bookkeeping_gate() RETURNS trigger AS $$ \
+                 BEGIN \
+                     IF NEW.version = 7 THEN PERFORM pg_advisory_xact_lock(2010, 7); END IF; \
+                     RETURN NEW; \
+                 END; $$ LANGUAGE plpgsql; \
+                 CREATE TRIGGER pre0007_bookkeeping_gate BEFORE INSERT ON _sqlx_migrations \
+                 FOR EACH ROW EXECUTE FUNCTION pre0007_bookkeeping_gate();",
+            )
+            .execute(&phase_pool)
+            .await
+            .expect("install owned fixture bookkeeping barrier");
+            let mut gate = phase_pool
+                .acquire()
+                .await
+                .expect("gate connection")
+                .detach();
+            let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut gate)
+                .await
+                .expect("gate backend");
+            sqlx::query("SELECT pg_advisory_lock(2010, 7)")
+                .execute(&mut gate)
+                .await
+                .expect("hold bookkeeping barrier");
+
+            let mut first = phase_pool.acquire().await.expect("first writer").detach();
+            let first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut first)
+                .await
+                .expect("first writer backend");
+            let mut first_tx = first
+                .begin()
+                .await
+                .expect("first ordinary writer transaction");
+            sqlx::query(
+                "UPDATE events SET content = 'first-writer' WHERE community_id = $1 AND id = $2",
+            )
+            .bind(community)
+            .bind(event_id.as_slice())
+            .execute(&mut *first_tx)
+            .await
+            .expect("hold ordinary writer lock");
+
+            let mut jobs = tokio::task::JoinSet::new();
+            let (migration_pid_tx, migration_pid_rx) = tokio::sync::oneshot::channel();
+            let migration_pool = phase_pool.clone();
+            let migration = jobs.spawn_local(async move {
+                let result = with_exclusive_schema_destruction_lock(
+                    &migration_pool,
+                    move |mut conn| async move {
+                        let outcome: Result<()> = async {
+                            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                                .fetch_one(&mut conn)
+                                .await?;
+                            let _ = migration_pid_tx.send(pid);
+                            migrate_legacy_nip_rs_through_0007(&mut conn).await
+                        }
+                        .await;
+                        (conn, outcome)
+                    },
+                )
+                .await;
+                ("migration", result)
+            });
+            let migration_pid = migration_pid_rx.await.expect("production helper backend");
+            // Exact active query distinguishes the new pre-validation lock from
+            // the later lock inside the multi-statement frozen 0007 script.
+            wait_for_pre_0007_backend_state(
+                &phase_pool,
+                migration_pid,
+                Some(first_pid),
+                Some("LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE"),
+            )
+            .await;
+
+            let (writer_pid_tx, writer_pid_rx) = tokio::sync::oneshot::channel();
+            let writer_pool = phase_pool.clone();
+            jobs.spawn_local(async move {
+                let mut conn = writer_pool.acquire().await.expect("queued writer").detach();
+                let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut conn).await.expect("queued writer backend");
+                let _ = writer_pid_tx.send(pid);
+                let result: Result<()> = sqlx::query(
+                    "UPDATE events SET content = 'queued-writer' WHERE community_id = $1 AND id = $2",
+                ).bind(community).bind(event_id.as_slice())
+                    .execute(&mut conn).await.map(|_| ()).map_err(Into::into);
+                let _ = conn.close().await;
+                ("writer", result)
+            });
+            let writer_pid = writer_pid_rx.await.expect("queued writer backend reported");
+            wait_for_pre_0007_backend_state(&phase_pool, writer_pid, Some(migration_pid), None)
+                .await;
+            first_tx
+                .commit()
+                .await
+                .expect("commit preceding valid writer");
+            first.close().await.expect("close preceding writer");
+            wait_for_pre_0007_backend_state(&phase_pool, migration_pid, Some(gate_pid), None).await;
+            wait_for_pre_0007_backend_state(&phase_pool, writer_pid, Some(migration_pid), None)
+                .await;
+            let events_locked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 \
+                 AND relation = 'events'::regclass AND mode = 'ShareRowExclusiveLock' AND granted)",
+            )
+            .bind(migration_pid)
+            .fetch_one(&phase_pool)
+            .await
+            .expect("read continuous events lock");
+            assert!(
+                events_locked,
+                "same backend must retain the events lock through SQLx bookkeeping"
+            );
+            assert_eq!(applied_versions(&phase_pool).await.last().copied(), Some(6));
+
+            let mut completed = Vec::new();
+            if cancel {
+                migration.abort();
+                loop {
+                    match jobs.join_next().await.expect("cancelled helper result") {
+                        Err(stopped) => {
+                            assert!(stopped.is_cancelled() && stopped.id() == migration.id());
+                            break;
+                        }
+                        Ok((label, result)) => {
+                            // The backend may notice the closed socket immediately;
+                            // then the valid writer can finish before the abort joins.
+                            assert_eq!(label, "writer");
+                            result.expect("writer released by cancelled backend succeeds");
+                            completed.push(label);
+                        }
+                    }
+                }
+            }
+            let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(2010, 7)")
+                .fetch_one(&mut gate)
+                .await
+                .expect("release bookkeeping barrier");
+            assert!(released);
+            gate.close().await.expect("close gate connection");
+            wait_for_pre_0007_backend_state(&phase_pool, migration_pid, None, None).await;
+            while let Some(joined) = jobs.join_next().await {
+                let (label, result) = joined.expect("fixture worker joins normally");
+                result.expect("fixture worker succeeds");
+                completed.push(label);
+            }
+            completed.sort_unstable();
+            assert_eq!(
+                completed,
+                if cancel {
+                    vec!["writer"]
+                } else {
+                    vec!["migration", "writer"]
+                }
+            );
+            assert_eq!(
+                applied_versions(&phase_pool).await.last().copied(),
+                Some(if cancel { 6 } else { 7 })
+            );
+            let recorded: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM _sqlx_migrations WHERE version = 7 AND success",
+            )
+            .fetch_one(&phase_pool)
+            .await
+            .expect("read committed migration count");
+            assert_eq!(recorded, if cancel { 0 } else { 1 });
+            let watermark_table: bool = sqlx::query_scalar(
+                "SELECT to_regclass('parameterized_event_watermarks') IS NOT NULL",
+            )
+            .fetch_one(&phase_pool)
+            .await
+            .expect("read committed 0007 DDL");
+            assert_eq!(
+                watermark_table, !cancel,
+                "cancelled outer transaction must roll back 0007 DDL"
+            );
+            let content: String = sqlx::query_scalar(
+                "SELECT content FROM events WHERE community_id = $1 AND id = $2",
+            )
+            .bind(community)
+            .bind(event_id.as_slice())
+            .fetch_one(&phase_pool)
+            .await
+            .expect("read committed ordinary writer");
+            assert_eq!(content, "queued-writer");
+
+            let mut probe = phase_pool
+                .acquire()
+                .await
+                .expect("released-lock probe")
+                .detach();
+            let shared_free: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock_shared($1)")
+                .bind(SCHEMA_DESTRUCTION_LOCK_KEY)
+                .fetch_one(&mut probe)
+                .await
+                .expect("schema lock probe");
+            assert!(
+                shared_free,
+                "schema lock must be released after backend exit"
+            );
+            sqlx::query("SELECT pg_advisory_unlock_shared($1)")
+                .bind(SCHEMA_DESTRUCTION_LOCK_KEY)
+                .execute(&mut probe)
+                .await
+                .expect("release schema probe");
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                <PgConnection as sqlx::migrate::Migrate>::lock(&mut probe),
+            )
+            .await
+            .expect("SQLx migration lock must be free")
+            .expect("acquire SQLx lock probe");
+            <PgConnection as sqlx::migrate::Migrate>::unlock(&mut probe)
+                .await
+                .expect("release SQLx probe");
+            let mut probe_tx = probe.begin().await.expect("writer-lock probe transaction");
+            sqlx::query("LOCK TABLE events IN ROW EXCLUSIVE MODE NOWAIT")
+                .execute(&mut *probe_tx)
+                .await
+                .expect("writer lock must be free after backend exit");
+            probe_tx
+                .rollback()
+                .await
+                .expect("release writer-lock probe");
+            probe.close().await.expect("close released-lock probe");
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(45), &mut phase).await;
+        if outcome.is_err() {
+            phase.abort();
+            let _ = phase.await;
+        }
+        pool.close().await;
+        let cleanup = sqlx::query(AssertSqlSafe(format!(
+            "DROP DATABASE {probe_db} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await;
+        admin.close().await;
+        assert!(
+            matches!(&outcome, Ok(Ok(()))) && cleanup.is_ok(),
+            "bounded lock fixture outcome={outcome:?}; owned database cleanup={cleanup:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn cluster_global_pre_0007_writer_lock_covers_validation_through_commit() {
+        pre_0007_writer_lock_fixture(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn cluster_global_pre_0007_cancellation_rolls_back_ddl_and_releases_writer_lock() {
+        pre_0007_writer_lock_fixture(true).await;
     }
 
     #[tokio::test]

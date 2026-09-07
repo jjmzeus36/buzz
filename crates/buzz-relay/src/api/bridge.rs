@@ -1379,11 +1379,13 @@ pub async fn submit_event(
         state.config.require_auth_token || idempotency_key.is_some(),
     )
     .map_err(IntoResponse::into_response)?;
+    let keyed_deadline = idempotency_key.is_some().then(KeyedEarlyDeadline::start);
     let pubkey_hex = pubkey.to_hex();
 
     let mut early = None;
-    if idempotency_key.is_some() {
-        // After NIP-98, before KeyedEarlyDeadline and Redis attempt admission.
+    if let Some(deadline) = keyed_deadline {
+        // Bound upstream attempt-admission work within the post-auth deadline.
+        // Local overload rejects before charging; admitted requests charge once.
         // Fail-fast process-global 32 and per-bound-community 16; never queues.
         let pre_attempt = match try_acquire_keyed_pre_attempt(*tenant.community().as_uuid()) {
             Ok(permit) => permit,
@@ -1393,7 +1395,6 @@ pub async fn submit_event(
                 return Err((status, retry_after, body).into_response());
             }
         };
-        let deadline = KeyedEarlyDeadline::start();
         if deadline.expired() {
             let (status, retry_after, body) = keyed_busy_http_parts(KEYED_BUSY_RETRY_AFTER_SECS);
             return Err((status, retry_after, body).into_response());

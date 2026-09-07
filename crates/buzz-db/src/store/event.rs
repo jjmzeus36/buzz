@@ -444,6 +444,45 @@ async fn insert_event_already_validated(
     ))
 }
 
+// Keep these restrictions identical for pages and counts. Every value remains bound.
+fn push_custom_tag_filter(qb: &mut QueryBuilder<Postgres>, q: &EventQuery, col_prefix: &str) {
+    if let Some((ref name, ref value)) = q.custom_tag {
+        let containment = serde_json::json!([[name, value]]);
+        qb.push(format!(" AND {col_prefix}tags @> "))
+            .push_bind(containment);
+    }
+}
+
+fn push_shared_gated_filter(qb: &mut QueryBuilder<Postgres>, q: &EventQuery, col_prefix: &str) {
+    // Shared-gated visibility pushdown: exclude SHARED_GATED_KINDS events that
+    // are neither authored by the reader nor explicitly shared.  Applied BEFORE
+    // ORDER/LIMIT so that a page of newer private events does not push visible
+    // shared ones off the end of the result set (the catalog query pattern).
+    //
+    // Clause: AND (kind NOT IN (30175, 30178) OR pubkey = $reader
+    //              OR tags @> '[["shared","true"]]')
+    //
+    // The JSONB containment check is served by idx_events_tags_gin (migration
+    // 0004, jsonb_path_ops).  `tags @> '[["shared","true"]]'` matches any array
+    // that contains exactly the sub-array — a two-element `["shared","true"]`
+    // tag passes; a tag-absent event does not.  Because ingest requires exactly
+    // two elements for the shared tag (parts.len() == 2), no stored event can
+    // carry a three-element superset.
+    if let Some(ref reader_bytes) = q.shared_gated_reader {
+        let shared_containment = serde_json::json!([["shared", "true"]]);
+        qb.push(format!(" AND ({col_prefix}kind NOT IN ("));
+        let mut sep = qb.separated(", ");
+        for kind in SHARED_GATED_KINDS {
+            sep.push_bind(*kind as i32);
+        }
+        qb.push(format!(") OR {col_prefix}pubkey = "));
+        qb.push_bind(reader_bytes.clone());
+        qb.push(format!(" OR {col_prefix}tags @> "));
+        qb.push_bind(shared_containment);
+        qb.push(")");
+    }
+}
+
 /// Query events with optional filters. Results ordered by `created_at DESC`.
 ///
 /// Uses `QueryBuilder` for dynamic filter composition — avoids string concatenation
@@ -626,11 +665,7 @@ pub(crate) async fn query_events_on(
         }
     }
 
-    if let Some((ref name, ref value)) = q.custom_tag {
-        let containment = serde_json::json!([[name, value]]);
-        qb.push(format!(" AND {col_prefix}tags @> "))
-            .push_bind(containment);
-    }
+    push_custom_tag_filter(&mut qb, q, col_prefix);
 
     if let Some(s) = q.since {
         qb.push(format!(" AND {col_prefix}created_at >= "))
@@ -668,33 +703,7 @@ pub(crate) async fn query_events_on(
         }
     }
 
-    // Shared-gated visibility pushdown: exclude SHARED_GATED_KINDS events that
-    // are neither authored by the reader nor explicitly shared.  Applied BEFORE
-    // ORDER/LIMIT so that a page of newer private events does not push visible
-    // shared ones off the end of the result set (the catalog query pattern).
-    //
-    // Clause: AND (kind NOT IN (30175, 30178) OR pubkey = $reader
-    //              OR tags @> '[["shared","true"]]')
-    //
-    // The JSONB containment check is served by idx_events_tags_gin (migration
-    // 0004, jsonb_path_ops).  `tags @> '[["shared","true"]]'` matches any array
-    // that contains exactly the sub-array — a two-element `["shared","true"]`
-    // tag passes; a tag-absent event does not.  Because ingest requires exactly
-    // two elements for the shared tag (parts.len() == 2), no stored event can
-    // carry a three-element superset.
-    if let Some(ref reader_bytes) = q.shared_gated_reader {
-        let shared_containment = serde_json::json!([["shared", "true"]]);
-        qb.push(format!(" AND ({col_prefix}kind NOT IN ("));
-        let mut sep = qb.separated(", ");
-        for kind in SHARED_GATED_KINDS {
-            sep.push_bind(*kind as i32);
-        }
-        qb.push(format!(") OR {col_prefix}pubkey = "));
-        qb.push_bind(reader_bytes.clone());
-        qb.push(format!(" OR {col_prefix}tags @> "));
-        qb.push_bind(shared_containment);
-        qb.push(")");
-    }
+    push_shared_gated_filter(&mut qb, q, col_prefix);
 
     // Composite ordering for deterministic pagination across ALL callers of
     // query_events (WebSocket REQ, REST endpoints, canvas, notes, etc.).
@@ -895,6 +904,8 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
         }
     }
 
+    push_custom_tag_filter(&mut qb, q, col_prefix);
+
     if let Some(s) = q.since {
         qb.push(format!(" AND {col_prefix}created_at >= "))
             .push_bind(s);
@@ -917,6 +928,8 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
             qb.push(")");
         }
     }
+
+    push_shared_gated_filter(&mut qb, q, col_prefix);
 
     let row = qb.build().fetch_one(&mut *conn).await?;
     let cnt: i64 = row.try_get("cnt")?;
@@ -2503,6 +2516,133 @@ mod postgres_tests {
             .custom_created_at(nostr::Timestamp::from(created_at))
             .sign_with_keys(&Keys::generate())
             .expect("sign timestamped event")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn count_and_page_share_custom_tag_and_visibility_filters() {
+        let pool = setup_pool().await;
+        let mut tx = pool.begin().await.expect("begin isolated filter fixture");
+        // Only connection-local temporary tables receive synthetic rows. The
+        // production on-session query paths run against their normal columns.
+        sqlx::query("CREATE TEMP TABLE events (LIKE events INCLUDING DEFAULTS) ON COMMIT DROP")
+            .execute(&mut *tx)
+            .await
+            .expect("create temporary event fixture");
+        sqlx::query(
+            "CREATE TEMP TABLE event_mentions (LIKE event_mentions INCLUDING DEFAULTS) ON COMMIT DROP",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("create temporary mention fixture");
+
+        let community = CommunityId::from_uuid(Uuid::new_v4());
+        let reader = Keys::generate();
+        let foreign = Keys::generate();
+        let reader_hex = reader.public_key().to_hex();
+        let mut cases = vec![(9_u16, false, false, true)];
+        for kind in SHARED_GATED_KINDS {
+            let kind = u16::try_from(*kind).expect("stored shared kind");
+            cases.extend([
+                (kind, true, false, true),
+                (kind, false, true, true),
+                (kind, false, false, true),
+                (kind, true, false, false),
+            ]);
+        }
+        let mut fixtures = Vec::new();
+        for (index, (kind, own, shared, chosen)) in cases.into_iter().enumerate() {
+            let label = format!("filter-fixture-{index}");
+            let mut tags = vec![
+                Tag::parse(["d", label.as_str()]).expect("d tag"),
+                Tag::parse(["topic", if chosen { "chosen" } else { "other" }]).expect("topic tag"),
+                Tag::parse(["p", reader_hex.as_str()]).expect("p tag"),
+            ];
+            if shared {
+                tags.push(Tag::parse(["shared", "true"]).expect("shared tag"));
+            }
+            let event = EventBuilder::new(Kind::Custom(kind), label)
+                .tags(tags)
+                .custom_created_at(nostr::Timestamp::from(1_800_000_000 + index as u64))
+                .sign_with_keys(if own { &reader } else { &foreign })
+                .expect("sign synthetic event");
+            let (_, inserted) = insert_event_in_transaction(&mut tx, community, &event, None)
+                .await
+                .expect("insert temporary event");
+            assert!(inserted);
+            sqlx::query(
+                "INSERT INTO event_mentions \
+                 (community_id, event_id, pubkey_hex, event_created_at, channel_id, event_kind) \
+                 SELECT $1, $2, $3, created_at, NULL, kind FROM events \
+                 WHERE community_id = $1 AND id = $2",
+            )
+            .bind(community.as_uuid())
+            .bind(event.id.as_bytes().as_slice())
+            .bind(&reader_hex)
+            .execute(&mut *tx)
+            .await
+            .expect("index synthetic mention");
+            let visible = !SHARED_GATED_KINDS.contains(&u32::from(kind)) || own || shared;
+            fixtures.push((event.id, chosen, visible));
+        }
+
+        for joined in [false, true] {
+            for custom in [false, true] {
+                for gated in [false, true] {
+                    let mut q = EventQuery {
+                        custom_tag: custom.then(|| ("topic".to_owned(), "chosen".to_owned())),
+                        shared_gated_reader: gated.then(|| reader.public_key().to_bytes().to_vec()),
+                        p_tag_hex: joined.then(|| reader_hex.clone()),
+                        limit: Some(100),
+                        ..EventQuery::for_community(community)
+                    };
+                    let expected: Vec<_> = fixtures
+                        .iter()
+                        .rev()
+                        .filter(|(_, chosen, visible)| (!custom || *chosen) && (!gated || *visible))
+                        .map(|(id, _, _)| *id)
+                        .collect();
+                    let page = query_events_on(&mut tx, &q)
+                        .await
+                        .expect("query fixture page");
+                    assert_eq!(
+                        page.iter()
+                            .map(|stored| stored.event.id)
+                            .collect::<Vec<_>>(),
+                        expected,
+                        "joined={joined}, custom={custom}, gated={gated}"
+                    );
+                    assert_eq!(
+                        count_events_on(&mut tx, &q).await.expect("count fixture"),
+                        expected.len() as i64,
+                        "joined={joined}, custom={custom}, gated={gated}"
+                    );
+                    q.limit = Some(1);
+                    q.offset = Some(1);
+                    let page = query_events_on(&mut tx, &q)
+                        .await
+                        .expect("query fixture slice");
+                    assert_eq!(page.len(), 1);
+                    assert_eq!(page[0].event.id, expected[1]);
+                    assert_eq!(
+                        count_events_on(&mut tx, &q)
+                            .await
+                            .expect("count ignores pagination"),
+                        expected.len() as i64
+                    );
+                    q.custom_tag = Some(("topic".to_owned(), "absent".to_owned()));
+                    assert!(query_events_on(&mut tx, &q)
+                        .await
+                        .expect("empty page")
+                        .is_empty());
+                    assert_eq!(count_events_on(&mut tx, &q).await.expect("empty count"), 0);
+                }
+            }
+        }
+        tx.rollback()
+            .await
+            .expect("discard temporary filter fixture");
+        pool.close().await;
     }
 
     #[tokio::test]

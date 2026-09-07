@@ -127,6 +127,9 @@ run_unit_tests() {
   run_test_step "buzz-auth unit tests" \
     cargo test -p buzz-auth --lib -- --nocapture
 
+  run_test_step "buzz-auth documentation tests" \
+    cargo test -p buzz-auth --doc -- --nocapture
+
   run_test_step "buzz-voice tests" \
     cargo test -p buzz-voice --lib -- --nocapture
 
@@ -150,9 +153,8 @@ run_unit_tests() {
   # Paired/hierarchical admission constructor/script unit tests (no Redis).
   # Mirrors `just test-unit`. Real-Redis paired_* and hierarchical_* tests
   # are #[ignore]d and run only in integration / Backend Integration.
-  # Unfiltered --lib (no name filter) so doctest harnesses are allowed;
-  # do not use run_required_cargo_test here, which treats "running 0 tests"
-  # from an empty doctest harness as a selector failure.
+  # This is an unfiltered library target, not a required name selector.
+  # Documentation tests require their own --doc invocation.
   run_test_step "buzz-pubsub unit tests" \
     cargo test -p buzz-pubsub --lib -- --nocapture
 
@@ -175,8 +177,9 @@ run_unit_tests() {
   # scripts/normative-corpus.json via include_str! and replays the full locked
   # corpus as pure in-process tests (no infra). Mirrors the nextest path in
   # `just test-unit` — the two lists must stay in step.
+  # Include the package's integration targets, as the nextest path does.
   run_test_step "buzz-agent unit tests" \
-    cargo test -p buzz-agent --lib -- --nocapture
+    cargo test -p buzz-agent -- --nocapture
 
   # ACP author-gate and queue tests are pure unit tests. Keep this fallback in
   # step with `just test-unit`; ignored lifecycle tests run elsewhere.

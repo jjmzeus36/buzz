@@ -379,6 +379,10 @@ pub fn semantic_intent_hash(event: &Event) -> Result<[u8; HASH_LEN], Idempotency
 }
 
 /// Compact JSON bytes hashed by [`semantic_intent_hash`].
+///
+/// NIP-MI v1 pins serde_json's minimal string escaping: short control escapes,
+/// lowercase `\u00xx` for other ASCII controls, and literal UTF-8 otherwise.
+/// Preserve this byte contract across serializer changes; retained hashes use it.
 pub fn canonical_intent_bytes(event: &Event) -> Result<Vec<u8>, IdempotencyError> {
     serde_json::to_vec(&canonical_intent_value(event)).map_err(|_| IdempotencyError::Canonicalize)
 }
@@ -453,6 +457,35 @@ mod tests {
             "supported_extensions": [EXTENSION_ID],
             "idempotency": descriptor,
         })
+    }
+
+    #[test]
+    fn canonical_intent_matches_escaping_and_unicode_golden_vector() {
+        let keys = Keys::parse(GOLDEN_SECRET_HEX).expect("golden secret");
+        let content = concat!(
+            "\u{0}\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}\u{9}\u{a}\u{b}\u{c}\u{d}\u{e}\u{f}\u{10}\u{11}\u{12}\u{13}\u{14}\u{15}\u{16}\u{17}\u{18}\u{19}\u{1a}\u{1b}\u{1c}\u{1d}\u{1e}\u{1f}",
+            "\"\\/é e\u{301} 中 😀 \u{2028}\u{2029}\u{7f}",
+        );
+        let event = EventBuilder::new(Kind::Custom(9), content)
+            .tags([Tag::parse(["t", "é e\u{301} \"\\/"]).expect("tag")])
+            .custom_created_at(Timestamp::from(1_700_000_000))
+            .sign_with_keys(&keys)
+            .expect("sign");
+        // Fixed external vector, never derived from the serializer under test.
+        let expected = concat!(
+            r#"["buzz-idempotency-v1","79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",9,[["t","é é \"\\/"]],"\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f\"\\/é é 中 😀 "#,
+            "\u{2028}\u{2029}\u{7f}",
+            r#""]"#,
+        )
+        .as_bytes();
+        assert_eq!(
+            canonical_intent_bytes(&event).expect("canonical bytes"),
+            expected
+        );
+        assert_eq!(
+            hex::encode(semantic_intent_hash(&event).expect("intent hash")),
+            "9013b8c4e31c852a35a9479f8bb46f54c696b866a7095053914ae965b7dac761"
+        );
     }
 
     #[test]

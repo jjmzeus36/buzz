@@ -401,10 +401,11 @@ fn push_descriptor(
 ) -> Option<serde_json::Value> {
     let host = tenant_host?;
     push_configured.then_some(())?;
-    let scheme = if relay_url.starts_with("wss://") {
-        "wss"
-    } else {
-        "ws"
+    let relay = url::Url::parse(relay_url).ok()?;
+    let scheme = match relay.scheme() {
+        "wss" => "wss",
+        "ws" => "ws",
+        _ => return None,
     };
     Some(serde_json::json!({
         "origin": format!("{scheme}://{host}"),
@@ -605,6 +606,29 @@ mod tests {
             descriptor["push_kinds"],
             serde_json::json!(crate::handlers::push_lease::PUSH_KINDS)
         );
+    }
+
+    #[test]
+    fn push_descriptor_preserves_canonical_websocket_scheme() {
+        let keys = nostr::Keys::generate();
+        for (relay, origin) in [
+            ("wss://relay.example", "wss://tenant.example:8443"),
+            ("WSS://relay.example", "wss://tenant.example:8443"),
+            ("WsS://relay.example", "wss://tenant.example:8443"),
+            ("ws://relay.example", "ws://tenant.example:8443"),
+            ("WS://relay.example", "ws://tenant.example:8443"),
+        ] {
+            let descriptor =
+                push_descriptor(true, relay, "key", &keys, Some("tenant.example:8443"))
+                    .expect("valid WebSocket descriptor");
+            assert_eq!(descriptor["origin"], origin, "{relay}");
+        }
+        for relay in ["https://relay.example", "not a url", "wss://"] {
+            assert!(
+                push_descriptor(true, relay, "key", &keys, Some("tenant.example")).is_none(),
+                "unsupported or malformed relay: {relay}"
+            );
+        }
     }
 
     #[test]

@@ -353,6 +353,25 @@ fn format_events(normalized: &str, format: &crate::OutputFormat) -> String {
     }
 }
 
+fn parse_message_kinds(kinds: &str) -> Result<Vec<u64>, CliError> {
+    kinds
+        .split(',')
+        .map(|kind| {
+            let kind = kind.trim();
+            kind.parse::<u64>().map_err(|_| {
+                CliError::Usage(format!(
+                    "invalid --kinds token {kind:?}: expected an unsigned 64-bit integer"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn parse_query_events(response: &str) -> Result<Vec<serde_json::Value>, CliError> {
+    serde_json::from_str(response)
+        .map_err(|error| CliError::Other(format!("failed to parse query response: {error}")))
+}
+
 pub async fn cmd_get_messages(
     client: &BuzzClient,
     channel_id: &str,
@@ -371,12 +390,9 @@ pub async fn cmd_get_messages(
         "limit": limit
     });
 
-    // If specific kinds requested, override
-    if let Some(k) = kinds {
-        let kind_list: Vec<u64> = k.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-        if !kind_list.is_empty() {
-            filter["kinds"] = serde_json::json!(kind_list);
-        }
+    // If specific kinds requested, override only after every token validates.
+    if let Some(kinds) = kinds {
+        filter["kinds"] = serde_json::json!(parse_message_kinds(kinds)?);
     }
 
     if let Some(b) = before {
@@ -387,7 +403,7 @@ pub async fn cmd_get_messages(
     }
 
     let resp = client.query(&filter).await?;
-    let mut events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    let mut events = parse_query_events(&resp)?;
     events.sort_by_key(|e| e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0));
     let normalized = normalize_events(&events);
     println!("{}", format_events(&normalized, format));
@@ -452,7 +468,7 @@ pub async fn cmd_get_thread(
         "limit": 1
     });
     let resp = client.query_multi(&[reply_filter, root_filter]).await?;
-    let mut events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    let mut events = parse_query_events(&resp)?;
     events.sort_by_key(|event| {
         event
             .get("created_at")
@@ -498,7 +514,7 @@ pub async fn cmd_search(
         filter["since"] = serde_json::json!(s);
     }
     let resp = client.query(&filter).await?;
-    let mut events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    let mut events = parse_query_events(&resp)?;
     // The full-text path returns relevance order; a pure author/time query has
     // no relevance, so present newest-first like `messages get`.
     if query.is_none() {
@@ -1134,10 +1150,11 @@ mod tests {
     use super::{
         channel_id_from_event, cmd_get_thread, cmd_send_message, event_mention_pubkeys,
         find_root_from_tags, format_events, match_profiles_by_name, merge_message_mentions,
-        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
-        resolve_names_to_pubkeys, resolve_thread_target, send_allows_idempotency_key,
-        send_effective_kind, thread_ref_from_event, thread_ref_from_parent_tags,
-        unsupported_idempotency_key_kind, BuzzClient, CliError, SendMessageParams, Uuid,
+        missing_members, normalize_explicit_mentions, parse_member_pubkeys, parse_message_kinds,
+        parse_query_events, resolve_names_to_pubkeys, resolve_thread_target,
+        send_allows_idempotency_key, send_effective_kind, thread_ref_from_event,
+        thread_ref_from_parent_tags, unsupported_idempotency_key_kind, BuzzClient, CliError,
+        SendMessageParams, Uuid,
     };
     use buzz_sdk::mentions::{
         extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
@@ -1154,6 +1171,58 @@ mod tests {
     const PK_VALID_A: &str = "35c18ae273fccfaf80d629e20e7f8721b90499379addff533054acc2504c12b4";
     const PK_VALID_B: &str = "c6237ef84fa537c78dcee78efd2d4e59f728859c7f194da42ac51ededfa0be05";
     const PK_VALID_C: &str = "f4a42a97e594b77bdbd8ee35191c8b28a94a4cb871d96f32921558275421fb68";
+
+    #[test]
+    fn message_kinds_preserve_order_duplicates_whitespace_and_u64_values() {
+        assert_eq!(
+            parse_message_kinds(" 9, 40002,9, 18446744073709551615 ").unwrap(),
+            vec![9, 40002, 9, u64::MAX]
+        );
+    }
+
+    #[test]
+    fn message_kinds_reject_any_invalid_token_as_usage_error() {
+        for input in [
+            "",
+            " ",
+            "invalid",
+            "9,invalid",
+            "invalid,9",
+            "9,",
+            ",9",
+            "9,,40002",
+            "-1",
+            "18446744073709551616",
+        ] {
+            let error = parse_message_kinds(input).expect_err(input);
+            assert!(matches!(&error, CliError::Usage(_)), "{input:?}: {error}");
+            assert_eq!(crate::error::exit_code(&error), 1);
+        }
+    }
+
+    #[test]
+    fn query_events_preserve_empty_arrays_order_and_event_fields() {
+        assert!(parse_query_events(" \n [] \t").unwrap().is_empty());
+        let expected = vec![
+            json!({"id": ID_B, "created_at": 2, "extra": {"present": true}}),
+            json!({"id": ID_A, "created_at": 1, "content": "first event"}),
+        ];
+        let response = serde_json::to_string(&expected).unwrap();
+        assert_eq!(parse_query_events(&response).unwrap(), expected);
+    }
+
+    #[test]
+    fn query_events_reject_malformed_or_non_array_responses_as_errors() {
+        for response in ["", "[", "[{", "[] trailing", "null", "{}", "42", "\"text\""] {
+            let error = parse_query_events(response).expect_err(response);
+            assert!(
+                matches!(&error, CliError::Other(_)),
+                "{response:?}: {error}"
+            );
+            assert_eq!(crate::error::exit_code(&error), 4);
+            assert!(!crate::error::is_retryable_error(&error));
+        }
+    }
 
     #[test]
     fn compact_event_format_remains_the_three_key_contract() {

@@ -132,7 +132,15 @@ Future<void> _deactivateCommunityPushLease(
   }
   final decoded = nostr.Nip19.decode(payload: nsec);
   final memberPubkey = community.pubkey ?? nostr.Keys(decoded.data).public;
-  final descriptor = await fetchBuzzPushLeaseDescriptor(community.relayUrl);
+  final uri = Uri.parse(community.relayUrl);
+  final httpScheme = switch (uri.scheme) {
+    'wss' => 'https',
+    'ws' => 'http',
+    _ => uri.scheme,
+  };
+  final descriptor = await fetchBuzzPushLeaseDescriptor(
+    uri.replace(scheme: httpScheme).toString(),
+  );
   final matchingGrant = (await readBuzzPushEndpointGrants())
       .where(
         (grant) =>
@@ -145,12 +153,6 @@ Future<void> _deactivateCommunityPushLease(
   }
   final installationId =
       community.pushLeaseInstallationId ?? matchingGrant.installationId;
-  final uri = Uri.parse(community.relayUrl);
-  final httpScheme = switch (uri.scheme) {
-    'wss' => 'https',
-    'ws' => 'http',
-    _ => uri.scheme,
-  };
   final wsScheme = httpScheme == 'https' ? 'wss' : 'ws';
   final wsUrl = uri.replace(scheme: wsScheme).toString();
   // Skip over the one renewal generation that could already be in flight

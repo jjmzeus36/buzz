@@ -695,9 +695,17 @@ jobs:
       - name: Relay E2E tests
         run: |
           cargo test -p buzz-test-client --test e2e_persona --test e2e_team_catalog --test e2e_nostr_interop --test e2e_project -- --ignored --nocapture
-          cargo test -p buzz-test-client --test e2e_relay invite -- --ignored --nocapture
-          cargo test -p buzz-test-client --test e2e_relay nip43_membership_snapshots_are_rejected -- --ignored --nocapture
-          cargo test -p buzz-test-client --test e2e_relay nip29_departure_wire -- --ignored --nocapture
+          # List and run with the same target, name filter and ignored-only
+          # selection. Cargo otherwise succeeds when a required name disappears.
+          for selector in invite nip43_membership_snapshots_are_rejected nip29_departure_wire; do
+            test_args=(-p buzz-test-client --test e2e_relay "$selector" -- --ignored)
+            listing=$(cargo test "${test_args[@]}" --list --format terse)
+            if ! grep -qE ': test$' <<< "$listing"; then
+              echo "Required relay selector matched no eligible tests: $selector" >&2
+              exit 1
+            fi
+            cargo test "${test_args[@]}" --nocapture
+          done
         env:
           RELAY_URL: ws://localhost:3000
           GIT_CREDENTIAL_NOSTR_BIN: ${{ github.workspace }}/target/ci/git-credential-nostr

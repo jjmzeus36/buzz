@@ -37,36 +37,43 @@ not a release, deployment, or Stage 1 completion claim.
 2. Cryptographic NIP-98 authentication and authenticated-signer derivation
    only. Invalid header, unmapped host, failed authentication, and unkeyed
    requests never enter this lane.
-3. Atomic authenticated attempt identity+community+fleet charge exactly
-   once (`KeyedHttpAttempts`, 60s window, 300 / 1,200 / 2,400). Allowed
+3. Start one absolute five-second early deadline immediately after
+   authentication. It is never reset per await. Obtain a fail-fast local
+   pre-attempt permit: process-global 32 and authenticated-community 16,
+   without a waiter queue. Local resource exhaustion MUST return HTTP 503
+   with `Retry-After` before upstream attempt charging or replay-marker I/O.
+   Such rejected requests consume no attempt, fresh, or persist quota. Keep
+   the permit until early ingress is acquired or this request exits.
+4. For a request admitted by that local bound, perform atomic authenticated
+   attempt identity+community+fleet admission exactly once
+   (`KeyedHttpAttempts`, 60s window, 300 / 1,200 / 2,400). Allowed
    increments all three once. Explicit identity/community/fleet denial and
    known pre-mutation failure increment none and stop. An ambiguous
    transport timeout or lost reply fails closed and may leave all three
    changed or all three unchanged, never a subset, and MUST NOT be blindly
    retried.
-4. Fail-fast RAII ingress: process-global 32 and authenticated-community
-   16. No waiter queue. One absolute five-second early deadline starts
-   immediately after authentication and is never reset per await. Its
-   remaining budget covers attempt admission and every cancellation-safe
-   fallible early I/O await through replay, validation, committed
-   classification, fresh admission, and atomic persist admission. Blocking
-   signature verification is joined before those permits can release.
-5. NIP-98 replay-marker check/write.
-6. Parse, event signature, membership, verified-owner metadata,
+5. Fail-fast RAII ingress: process-global 32 and authenticated-community
+   16. No waiter queue. Acquire ingress before releasing the pre-attempt
+   permit. The remaining early deadline covers attempt admission and every
+   cancellation-safe fallible early I/O await through replay, validation,
+   committed classification, fresh admission, and atomic persist admission.
+   Blocking signature verification is joined before those permits can release.
+6. NIP-98 replay-marker check/write.
+7. Parse, event signature, membership, verified-owner metadata,
    supported-kind, body, and the generic external `p` cap.
-7. Semantic intent preparation exactly once and committed DB classification
+8. Semantic intent preparation exactly once and committed DB classification
    (Replay, Conflict, or miss — no Pending variant).
-8. Fresh identity+community+fleet admission only for a committed miss
+9. Fresh identity+community+fleet admission only for a committed miss
    (`KeyedHttpFresh`). Replay, Conflict, and open-reservation
    replay/conflict/timeout consume no fresh or persist admission.
    Rollback-to-miss may proceed to fresh. A classify-miss that later
    races to replay at authoritative reserve may honestly have consumed
    fresh and persist.
-9. Atomic persist identity+community+fleet admission (authenticated HTTP
-   principal, tenant-prefixed community key, unreachable persist fleet
-   sentinel, `ApiCalls`, 60s, configured-principal / 600 / 1,200).
-10. Release early ingress permits.
-11. Authoritative reservation, persist/commit, abort/replay/conflict
+10. Atomic persist identity+community+fleet admission (authenticated HTTP
+    principal, tenant-prefixed community key, unreachable persist fleet
+    sentinel, `ApiCalls`, 60s, configured-principal / 600 / 1,200).
+11. Release early ingress permits.
+12. Authoritative reservation, persist/commit, abort/replay/conflict
     handling. Do not hold a DB transaction or reservation across Redis
     awaits. Do not time out a durable DB commit after it has begun.
     Verified-owner materialization waits until after an accepted terminal
@@ -135,6 +142,29 @@ SHA-256 of compact UTF-8 JSON:
 
 Excluded: `id`, `created_at`, `sig`. Included: every user-semantic field
 (`pubkey`, `kind`, `tags` in event order with every element, `content`).
+
+
+The v1 canonical bytes MUST use the following encoding. These rules pin the
+existing Buzz encoding; they do not change the meaning of retained v1 hashes.
+
+- Encode the array as UTF-8 without a BOM, trailing newline, or whitespace
+  outside strings. Use the field order shown above. Encode `pubkey-hex` as
+  64 lowercase hex characters and `kind` as an unsigned base-10 integer with
+  no leading zeros (except `0`), exponent, or decimal point.
+- Preserve tag order, every tag element, and the exact Unicode scalar sequence
+  of every string. Do not sort, deduplicate, trim, or normalize Unicode.
+- In strings, encode double quote as `\"` and backslash as `\\`. Encode U+0008,
+  U+0009, U+000A, U+000C, and U+000D as `\b`, `\t`, `\n`, `\f`, and `\r` respectively.
+  Encode every other U+0000–U+001F scalar as `\u00xx`, using lowercase hex.
+- Emit every other scalar directly in UTF-8. In particular, `/`, non-ASCII
+  text, U+007F, U+2028, and U+2029 MUST NOT be escaped. Alternative JSON
+  spellings that decode to the same string are not alternative canonical bytes.
+
+The core `canonical_intent_matches_escaping_and_unicode_golden_vector` fixture
+pins an interoperability vector containing all U+0000–U+001F controls, quote,
+backslash, slash, composed and decomposed accented text, CJK, an astral scalar,
+U+2028, U+2029, and U+007F in content, plus escapable and Unicode tag data.
+Its canonical UTF-8 SHA-256 is `9013b8c4e31c852a35a9479f8bb46f54c696b866a7095053914ae965b7dac761`.
 
 ## Reservation
 

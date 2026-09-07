@@ -410,6 +410,25 @@ fn validate_manifest_component(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject the entry delimiter without changing any stored or hashed bytes.
+fn validate_manifest_entry_framing(value: &str) -> Result<()> {
+    if value.contains('\n') {
+        return Err(DbError::DeletionSafety(
+            "storage manifest entry contains a reserved newline delimiter".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate loaded fields before returning a chunk for destructive use.
+fn validate_loaded_manifest_chunk_framing(chunk: ManifestKeyChunk) -> Result<ManifestKeyChunk> {
+    validate_manifest_entry_framing(&chunk.prefix)?;
+    for key in &chunk.keys {
+        validate_manifest_entry_framing(key)?;
+    }
+    Ok(chunk)
+}
+
 /// One durable fleet-wide object-store taxonomy sweep record.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaxonomySweep {
@@ -444,7 +463,8 @@ type TaxonomySweepRow = (
 /// The executor's prefix enumeration and the destructive freeze's chunk
 /// validation both fold entries through this, so "the chunk rows are exactly
 /// the frozen enumeration" reduces to digest equality. Each entry is hashed
-/// with a trailing newline so concatenation cannot alias two streams.
+/// with a trailing newline; embedded newlines are rejected so entry boundaries
+/// remain unambiguous without changing the persisted digest format.
 pub struct KeyStreamDigest {
     hasher: Sha256,
     last: Option<String>,
@@ -487,6 +507,7 @@ impl KeyStreamDigest {
     /// require strictly ascending serialized entries. Digest equality still
     /// binds the exact stream that was listed and chunked.
     pub fn fold_unordered(&mut self, key: &str) -> Result<()> {
+        validate_manifest_entry_framing(key)?;
         self.hasher.update(key.as_bytes());
         self.hasher.update(b"\n");
         self.last = Some(key.to_owned());
@@ -1472,6 +1493,12 @@ impl DeletionStore {
     pub async fn clear_manifest_key_chunks(&self, token: &LeaseToken) -> Result<()> {
         let generation = require_fence_generation(token)?;
         let mut tx = self.pool.begin().await?;
+        // Lock before validating so a new claim or freeze cannot change the
+        // request between token verification and chunk removal.
+        sqlx::query("SELECT id FROM community_deletion_requests WHERE id = $1 FOR UPDATE")
+            .bind(token.request_id)
+            .execute(&mut *tx)
+            .await?;
         verify_lease_and_fence(&mut tx, token, DeletionStage::Fenced, generation).await?;
         sqlx::query("DELETE FROM community_deletion_manifest_keys WHERE request_id = $1")
             .bind(token.request_id)
@@ -1523,11 +1550,13 @@ impl DeletionStore {
         .bind(token.request_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(chunk_no, prefix, keys)| ManifestKeyChunk {
+        row.map(|(chunk_no, prefix, keys)| ManifestKeyChunk {
             chunk_no,
             prefix,
             keys: keys.0,
-        }))
+        })
+        .map(validate_loaded_manifest_chunk_framing)
+        .transpose()
     }
 
     /// Return `(total, deleted)` chunk counts for one request.
@@ -2831,6 +2860,11 @@ pub fn validate_storage_manifest(manifest: &StorageManifest) -> Result<()> {
                 "storage manifest contains an empty prefix".to_string(),
             ));
         }
+        if manifest.version == 4 && prefix.prefix.contains('\n') {
+            return Err(DbError::DeletionSafety(
+                "legacy storage manifest prefix contains a reserved newline delimiter".to_string(),
+            ));
+        }
         if prefix.keys_digest.len() != 64
             || !prefix
                 .keys_digest
@@ -3286,6 +3320,166 @@ mod tests {
         let round_tripped: FrozenInventory =
             serde_json::from_slice(&serde_json::to_vec(&inventory).unwrap()).unwrap();
         assert_eq!(digest, round_tripped.digest().unwrap());
+    }
+
+    #[test]
+    fn legacy_v4_manifest_hash_and_serialization_are_unchanged() {
+        // CR and unit separator are ordinary v4 key bytes, not its LF delimiter.
+        let keys = vec![
+            "_meta/c/a\r.json".to_string(),
+            "_meta/c/b\u{1f}.json".to_string(),
+        ];
+        let mut digest = KeyStreamDigest::new();
+        for key in &keys {
+            digest.fold(key).expect("valid legacy key");
+        }
+        let (keys_digest, object_count) = digest.finish();
+        assert_eq!(
+            keys_digest,
+            "888f0c064e4bd925fa54741be9b302c4746ad82799d4c44e3aab945dced159e0"
+        );
+        assert_eq!(object_count, 2);
+        let inventory = FrozenInventory {
+            schema: SchemaManifest {
+                scoped_tables: vec!["events".to_string()],
+                row_counts: BTreeMap::from([("events".to_string(), 3)]),
+                fenced_tables: vec!["events".to_string()],
+            },
+            storage: StorageManifest {
+                version: 4,
+                prefixes: vec![PrefixManifest {
+                    prefix: "_meta/c/".to_string(),
+                    object_count,
+                    total_bytes: 4,
+                    keys_digest,
+                }],
+            },
+        };
+        let expected_json = concat!(
+            r#"{"schema":{"scoped_tables":["events"],"row_counts":{"events":3},"fenced_tables":["events"]},"#,
+            r#""storage":{"version":4,"prefixes":[{"prefix":"_meta/c/","object_count":2,"total_bytes":4,"keys_digest":"888f0c064e4bd925fa54741be9b302c4746ad82799d4c44e3aab945dced159e0"}]}}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&inventory).expect("serialize"),
+            expected_json
+        );
+        assert_eq!(
+            hex::encode(inventory.digest().expect("digest")),
+            "f1986bb4d3a357c3fbd04128a810fc8547ee0666d7f6bff3e827a6e3ec0d21ce"
+        );
+        let restored: FrozenInventory =
+            serde_json::from_str(expected_json).expect("stored inventory");
+        assert_eq!(restored, inventory);
+        assert_eq!(
+            restored.digest().expect("restored digest"),
+            inventory.digest().expect("digest")
+        );
+        validate_storage_manifest(&restored.storage).expect("valid stored v4 summary");
+        let chunks = vec![(0, "_meta/c/".to_string(), sqlx::types::Json(keys))];
+        validate_manifest_key_chunks(&restored.storage, &chunks).expect("valid stored v4 chunks");
+    }
+
+    #[test]
+    fn key_stream_digest_rejects_newline_without_mutating_state() {
+        for unordered in [false, true] {
+            let mut digest = KeyStreamDigest::new();
+            digest.fold("a/1").expect("first key");
+            let rejected = if unordered {
+                digest.fold_unordered("a/2\ninvalid")
+            } else {
+                digest.fold("a/2\ninvalid")
+            };
+            assert!(matches!(rejected, Err(DbError::DeletionSafety(message))
+                if message == "storage manifest entry contains a reserved newline delimiter"));
+            // Neither the hasher, count nor last-key ordering state may change.
+            digest.fold("a/2").expect("next valid key after rejection");
+            assert_eq!(
+                digest.finish(),
+                (
+                    "e224e71b498f83fccc0963cee6192bc1f5a030e0a1324be3926969c8ecf10702".to_string(),
+                    2
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_v4_manifest_validation_rejects_newline_fields() {
+        let mut manifest = storage_manifest();
+        manifest.prefixes[0].prefix.push('\n');
+        assert!(
+            matches!(validate_storage_manifest(&manifest), Err(DbError::DeletionSafety(message))
+            if message == "legacy storage manifest prefix contains a reserved newline delimiter")
+        );
+
+        // Check the actual pure validation seam called by destructive freeze.
+        let manifest = storage_manifest();
+        let chunks = vec![(
+            0,
+            "_meta/c/".to_string(),
+            sqlx::types::Json(vec!["_meta/c/invalid\nentry".to_string()]),
+        )];
+        assert!(
+            matches!(validate_manifest_key_chunks(&manifest, &chunks), Err(DbError::DeletionSafety(message))
+            if message == "storage manifest entry contains a reserved newline delimiter")
+        );
+    }
+
+    #[test]
+    fn loaded_manifest_framing_preserves_valid_v4_and_v5_entries() {
+        let legacy = ManifestKeyChunk {
+            chunk_no: 7,
+            prefix: "_meta/c/".to_string(),
+            keys: vec![
+                "_meta/c/a\r.json".to_string(),
+                "_meta/c/b\u{1f}.json".to_string(),
+            ],
+        };
+        let versioned = ManifestKeyChunk {
+            chunk_no: 8,
+            prefix: "_meta/c/".to_string(),
+            keys: vec![
+                StorageManifestEntry::new("_meta/c/a.json", "v2", "object")
+                    .encode()
+                    .expect("valid v5 entry"),
+                StorageManifestEntry::new("_meta/c/a.json", "v1", "delete_marker")
+                    .encode()
+                    .expect("valid v5 delete marker"),
+            ],
+        };
+        for expected in [legacy, versioned] {
+            let serialized = serde_json::to_vec(&expected).expect("stored chunk bytes");
+            let loaded: ManifestKeyChunk = serde_json::from_slice(&serialized).expect("load chunk");
+            let checked = validate_loaded_manifest_chunk_framing(loaded).expect("valid framing");
+            assert_eq!(checked, expected);
+            assert_eq!(
+                serde_json::to_vec(&checked).expect("checked bytes"),
+                serialized
+            );
+        }
+    }
+
+    #[test]
+    fn loaded_manifest_framing_rejects_newline_before_returning_a_chunk() {
+        let valid = ManifestKeyChunk {
+            chunk_no: 3,
+            prefix: "_meta/c/".to_string(),
+            keys: vec!["_meta/c/a.json".to_string(), "_meta/c/b.json".to_string()],
+        };
+        for field in 0..=valid.keys.len() {
+            let mut invalid = valid.clone();
+            if field == valid.keys.len() {
+                invalid.prefix.push('\n');
+            } else {
+                invalid.keys[field].push('\n');
+            }
+            // Deserialize fixed malformed data through the same type as loaded rows.
+            let stored = serde_json::to_vec(&invalid).expect("fixture bytes");
+            let loaded = serde_json::from_slice(&stored).expect("load fixture");
+            assert!(matches!(validate_loaded_manifest_chunk_framing(loaded),
+                Err(DbError::DeletionSafety(message))
+                    if message == "storage manifest entry contains a reserved newline delimiter"));
+        }
     }
 
     #[test]

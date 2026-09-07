@@ -283,11 +283,15 @@ pub async fn remove_relay_member(
     }
 }
 
+const REMOVE_RELAY_MEMBER_IF_ROLE_SQL: &str =
+    "DELETE FROM relay_members WHERE community_id = $1 AND pubkey = $2 AND role = $3 \
+     AND role <> 'owner'";
+
 /// Removes a relay member only if their current role matches `expected_role`.
 ///
-/// The delete and the role check are collapsed into a single
-/// `DELETE … WHERE pubkey = $1 AND role = $2`, making the operation atomic —
-/// no TOCTOU race between a prior read and this delete.
+/// The delete, expected-role check, and owner exclusion are one atomic
+/// `DELETE` scoped by community and pubkey, with `role = $3 AND role <> 'owner'`.
+/// There is no TOCTOU race between a prior read and this delete.
 ///
 /// Returns:
 /// - `Removed` — row was deleted.
@@ -304,20 +308,18 @@ pub async fn remove_relay_member_if_role(
 ) -> Result<RemoveResult> {
     let mut connection =
         observability::acquire_writer(pool, observability::WriterOperation::Authorization).await?;
-    let result = sqlx::query(
-        "DELETE FROM relay_members WHERE community_id = $1 AND pubkey = $2 AND role = $3",
-    )
-    .bind(community.as_uuid())
-    .bind(pubkey)
-    .bind(expected_role)
-    .execute(&mut *connection)
-    .await?;
+    let result = sqlx::query(REMOVE_RELAY_MEMBER_IF_ROLE_SQL)
+        .bind(community.as_uuid())
+        .bind(pubkey)
+        .bind(expected_role)
+        .execute(&mut *connection)
+        .await?;
 
     if result.rows_affected() > 0 {
         return Ok(RemoveResult::Removed);
     }
 
-    // rows_affected == 0: either not found or role changed. One cheap read to
+    // rows_affected == 0: not found, owner, or role changed. One cheap read to
     // distinguish the cases so callers can return the right error message.
     let row = sqlx::query("SELECT role FROM relay_members WHERE community_id = $1 AND pubkey = $2")
         .bind(community.as_uuid())
@@ -1166,6 +1168,55 @@ mod postgres_tests {
             .await
             .expect("bootstrap owner");
         (community, owner)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn role_removal_predicate_preserves_owners_and_scope() {
+        let pool = setup_pool().await;
+        let community = Uuid::new_v4();
+        let other_community = Uuid::new_v4();
+        let pubkey = test_pubkey();
+        let other_pubkey = test_pubkey();
+        // Evaluate the exact production predicate over one synthetic row.
+        // This fixture does not create a membership or issue any DELETE.
+        let predicate = REMOVE_RELAY_MEMBER_IF_ROLE_SQL
+            .strip_prefix("DELETE FROM relay_members WHERE ")
+            .expect("conditional removal statement prefix");
+        let probe = format!(
+            "SELECT ({predicate}) FROM \
+             (SELECT $4::uuid AS community_id, $5::text AS pubkey, $6::text AS role) candidate"
+        );
+        for role in ["owner", "admin", "member"] {
+            for expected_role in ["owner", "admin", "member", "unknown"] {
+                for (row_community, row_pubkey, same_scope) in [
+                    (community, &pubkey, true),
+                    (other_community, &pubkey, false),
+                    (community, &other_pubkey, false),
+                ] {
+                    let removable: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(probe.as_str()))
+                        .bind(community)
+                        .bind(&pubkey)
+                        .bind(expected_role)
+                        .bind(row_community)
+                        .bind(row_pubkey)
+                        .bind(role)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("evaluate read-only removal predicate");
+                    let expected = same_scope
+                        && matches!(
+                            (role, expected_role),
+                            ("admin", "admin") | ("member", "member")
+                        );
+                    assert_eq!(
+                        removable, expected,
+                        "role={role}, expected_role={expected_role}, same_scope={same_scope}"
+                    );
+                }
+            }
+        }
+        pool.close().await;
     }
 
     #[tokio::test]
