@@ -929,8 +929,30 @@ mod postgres_tests {
         assert!(migrations[32].sql.as_str().contains("kind = 30179"));
         assert!(migrations[32].sql.as_str().contains("search_tsv"));
         assert!(!migrations[0].sql.as_str().contains("30179"));
-        assert!(include_str!("../../../../schema/schema.sql")
-            .contains("kind IN (1059, 30179, 30300, 30350, 30622, 44100, 44101, 44200)"));
+        // Desired-state FTS follows the final migration-0008 allowlist with
+        // the 0014/0033 exclusions wrapped in their original order.
+        let desired_schema = include_str!("../../../../schema/schema.sql")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let desired_fts = desired_schema
+            .split_once("search_tsv TSVECTOR GENERATED ALWAYS AS (")
+            .expect("desired generated FTS column")
+            .1
+            .split_once(") STORED")
+            .expect("stored generated FTS expression")
+            .0;
+        let managed_agent_guard = desired_fts
+            .find("kind = 30179 THEN NULL::tsvector")
+            .unwrap();
+        let lease_guard = desired_fts
+            .find("kind = 30350 THEN NULL::tsvector")
+            .unwrap();
+        let public_kinds = desired_fts
+            .find("kind IN (0, 9, 40002, 45001, 45003)")
+            .unwrap();
+        assert!(managed_agent_guard < lease_guard && lease_guard < public_kinds);
+        assert!(desired_fts[public_kinds..].contains("ELSE NULL::tsvector"));
 
         // Public push-gateway authority is intentionally deployment-global and
         // durable: immediate revocation and hostile-relay admission cannot be

@@ -358,9 +358,9 @@ fn parse_message_kinds(kinds: &str) -> Result<Vec<u64>, CliError> {
         .split(',')
         .map(|kind| {
             let kind = kind.trim();
-            kind.parse::<u64>().map_err(|_| {
+            kind.parse::<u16>().map(u64::from).map_err(|_| {
                 CliError::Usage(format!(
-                    "invalid --kinds token {kind:?}: expected an unsigned 64-bit integer"
+                    "invalid --kinds token {kind:?}: expected a kind in 0..=65535"
                 ))
             })
         })
@@ -1173,10 +1173,10 @@ mod tests {
     const PK_VALID_C: &str = "f4a42a97e594b77bdbd8ee35191c8b28a94a4cb871d96f32921558275421fb68";
 
     #[test]
-    fn message_kinds_preserve_order_duplicates_whitespace_and_u64_values() {
+    fn message_kinds_preserve_order_duplicates_whitespace_and_u16_boundaries() {
         assert_eq!(
-            parse_message_kinds(" 9, 40002,9, 18446744073709551615 ").unwrap(),
-            vec![9, 40002, 9, u64::MAX]
+            parse_message_kinds(" 0, 9, 40002,9, 65535 ").unwrap(),
+            vec![0, 9, 40002, 9, u16::MAX as u64]
         );
     }
 
@@ -1192,6 +1192,9 @@ mod tests {
             ",9",
             "9,,40002",
             "-1",
+            "65536",
+            "9,65536",
+            "18446744073709551615",
             "18446744073709551616",
         ] {
             let error = parse_message_kinds(input).expect_err(input);

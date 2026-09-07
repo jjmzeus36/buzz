@@ -320,6 +320,26 @@ fn extract_buzz_channel(raw: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+/// Preserve bridge-only extension fields alongside the typed Nostr filter.
+fn parse_bridge_filters(
+    body: &[u8],
+) -> Result<(Vec<Value>, Vec<nostr::Filter>), (StatusCode, Json<Value>)> {
+    let raw_filters: Vec<Value> = serde_json::from_slice(body)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+    let filters: Vec<nostr::Filter> = raw_filters
+        .iter()
+        .map(|value| serde_json::from_value(value.clone()))
+        .collect::<Result<_, _>>()
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+    Ok((raw_filters, filters))
+}
+
+fn apply_buzz_channel_to_query(query: &mut buzz_db::EventQuery, raw: &Value) {
+    if let Some(channel) = extract_buzz_channel(raw) {
+        query.custom_tag = Some(("buzz-channel".into(), channel.into()));
+    }
+}
+
 /// True when the raw filter opts into a bridge extension flag (`top_level`,
 /// `include_summaries`, `include_aux`). Absent or non-boolean = false.
 fn extension_flag(raw: &Value, key: &str) -> bool {
@@ -1921,15 +1941,8 @@ async fn query_events_authed(
     )
     .await?;
 
-    // Two-pass parse: preserve raw JSON for custom extension fields (before_id,
-    // depth_limit, feed_types) that nostr::Filter silently drops.
-    let raw_filters: Vec<Value> = serde_json::from_slice(body)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
-    let filters: Vec<nostr::Filter> = raw_filters
-        .iter()
-        .map(|v| serde_json::from_value(v.clone()))
-        .collect::<Result<_, _>>()
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+    // Keep extension fields and typed filters paired identically to /count.
+    let (raw_filters, filters) = parse_bridge_filters(body)?;
     crate::handlers::req::extract_channel_ids_from_filters_limited(&filters)
         .map_err(|()| api_error(StatusCode::BAD_REQUEST, "too many explicit channels"))?;
 
@@ -2238,9 +2251,7 @@ async fn query_events_authed(
             extract_channel_from_filter(filter),
             &accessible_channels,
         );
-        if let Some(channel) = extract_buzz_channel(raw) {
-            query.custom_tag = Some(("buzz-channel".into(), channel.into()));
-        }
+        apply_buzz_channel_to_query(&mut query, raw);
         // Shared-gated visibility pushdown: must mirror WS REQ so that a page of
         // newer private events does not starve older shared ones off the page.
         if crate::handlers::req::filter_can_match_shared_gated_kinds(filter) {
@@ -2462,8 +2473,7 @@ async fn count_events_authed(
     )
     .await?;
 
-    let filters: Vec<nostr::Filter> = serde_json::from_slice(body)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+    let (raw_filters, filters) = parse_bridge_filters(body)?;
     crate::handlers::req::extract_channel_ids_from_filters_limited(&filters)
         .map_err(|()| api_error(StatusCode::BAD_REQUEST, "too many explicit channels"))?;
 
@@ -2503,7 +2513,7 @@ async fn count_events_authed(
     .await?;
 
     let mut total: u64 = 0;
-    for filter in &filters {
+    for (raw, filter) in raw_filters.iter().zip(filters.iter()) {
         let needs_author_only_filtering =
             crate::handlers::req::filter_can_match_author_only_kinds(filter);
         // Same result-gated guard as the WS COUNT handler: force the per-event
@@ -2544,6 +2554,7 @@ async fn count_events_authed(
                 tenant.community(),
             )
             .await;
+            apply_buzz_channel_to_query(&mut query, raw);
             crate::handlers::req::apply_channel_scope_to_query(
                 &mut query,
                 filter,
@@ -2618,6 +2629,7 @@ async fn count_events_authed(
                 tenant.community(),
             )
             .await;
+            apply_buzz_channel_to_query(&mut query, raw);
             query.channel_ids = Some(accessible_channels.to_vec());
             // Shared-gated visibility pushdown: pre-filter before ORDER/LIMIT on
             // the fallback query_events path.
@@ -4348,6 +4360,31 @@ mod postgres_tests {
             search_hit_accepted(&filter, &stored, &[scoped_channel], &reader),
             "channel-scoped hit must be accepted when caller has access to that channel"
         );
+    }
+
+    #[test]
+    fn bridge_filter_pair_preserves_buzz_channel_for_query_and_count() {
+        let body = br##"[{"kinds":[9],"#buzz-channel":["channel-a"]},{"kinds":[40002]}]"##;
+        let (raw_filters, filters) = parse_bridge_filters(body).unwrap();
+        assert_eq!(raw_filters.len(), 2);
+        assert_eq!(filters.len(), 2);
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
+        for (index, raw) in raw_filters.iter().enumerate() {
+            let mut query = buzz_db::EventQuery::for_community(community);
+            apply_buzz_channel_to_query(&mut query, raw);
+            let expected = (index == 0).then(|| ("buzz-channel".into(), "channel-a".into()));
+            assert_eq!(query.custom_tag, expected);
+            assert_eq!(query.community_id, community);
+        }
+        assert_eq!(filters[0].kinds.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bridge_filter_pair_rejects_invalid_json_and_typed_filters() {
+        for body in [b"{".as_slice(), b"{}", br#"[{"kinds":["invalid"]}]"#] {
+            let error = parse_bridge_filters(body).unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        }
     }
 
     #[test]
