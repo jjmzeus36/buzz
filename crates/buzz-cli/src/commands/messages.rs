@@ -353,39 +353,64 @@ fn format_events(normalized: &str, format: &crate::OutputFormat) -> String {
     }
 }
 
-pub async fn cmd_get_messages(
-    client: &BuzzClient,
-    channel_id: &str,
-    limit: Option<u32>,
-    before: Option<i64>,
-    since: Option<i64>,
-    kinds: Option<&str>,
-    format: &crate::OutputFormat,
-) -> Result<(), CliError> {
-    validate_uuid(channel_id)?;
-    let limit = limit.unwrap_or(50).min(200);
+/// Channel-scoped message query and its optional composite history cursor.
+#[derive(Clone, Copy)]
+pub struct GetMessagesParams<'a> {
+    pub channel_id: &'a str,
+    pub limit: Option<u32>,
+    pub before: Option<i64>,
+    pub before_id: Option<&'a str>,
+    pub since: Option<i64>,
+    pub kinds: Option<&'a str>,
+}
 
+fn get_messages_query(params: &GetMessagesParams<'_>) -> Result<serde_json::Value, CliError> {
+    let GetMessagesParams {
+        channel_id,
+        limit,
+        before,
+        before_id,
+        since,
+        kinds,
+    } = *params;
+    validate_uuid(channel_id)?;
+    if let Some(id) = before_id {
+        if before.is_none() {
+            return Err(CliError::Usage("--before-id requires --before".into()));
+        }
+        validate_hex64(id)?;
+    }
+    let limit = limit.unwrap_or(50).min(200);
     let mut filter = serde_json::json!({
         "kinds": [9, 40002, 40008, 45001, 45003],
         "#h": [channel_id],
         "limit": limit
     });
-
-    // If specific kinds requested, override
     if let Some(k) = kinds {
         let kind_list: Vec<u64> = k.split(',').filter_map(|s| s.trim().parse().ok()).collect();
         if !kind_list.is_empty() {
             filter["kinds"] = serde_json::json!(kind_list);
         }
     }
-
     if let Some(b) = before {
         filter["until"] = serde_json::json!(b);
+    }
+    if let Some(id) = before_id {
+        filter["before_id"] = serde_json::json!(id);
     }
     if let Some(s) = since {
         filter["since"] = serde_json::json!(s);
     }
+    Ok(filter)
+}
 
+/// Retrieve one bounded page through the authenticated relay query path.
+pub async fn cmd_get_messages(
+    client: &BuzzClient,
+    params: GetMessagesParams<'_>,
+    format: &crate::OutputFormat,
+) -> Result<(), CliError> {
+    let filter = get_messages_query(&params)?;
     let resp = client.query(&filter).await?;
     let mut events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
     events.sort_by_key(|e| e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0));
@@ -1013,16 +1038,20 @@ pub async fn dispatch(
             channel,
             limit,
             before,
+            before_id,
             since,
             kinds,
         } => {
             cmd_get_messages(
                 client,
-                &channel,
-                limit,
-                before,
-                since,
-                kinds.as_deref(),
+                GetMessagesParams {
+                    channel_id: &channel,
+                    limit,
+                    before,
+                    before_id: before_id.as_deref(),
+                    since,
+                    kinds: kinds.as_deref(),
+                },
                 format,
             )
             .await
@@ -1085,10 +1114,11 @@ pub async fn dispatch(
 mod tests {
     use super::{
         channel_id_from_event, cmd_get_thread, cmd_send_message, event_mention_pubkeys,
-        find_root_from_tags, format_events, match_profiles_by_name, merge_message_mentions,
-        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
-        resolve_names_to_pubkeys, resolve_thread_target, thread_ref_from_event,
-        thread_ref_from_parent_tags, BuzzClient, CliError, Uuid,
+        find_root_from_tags, format_events, get_messages_query, GetMessagesParams,
+        match_profiles_by_name, merge_message_mentions, missing_members,
+        normalize_explicit_mentions, parse_member_pubkeys, resolve_names_to_pubkeys,
+        resolve_thread_target, thread_ref_from_event, thread_ref_from_parent_tags, BuzzClient,
+        CliError, Uuid,
     };
     use buzz_sdk::mentions::{
         extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
@@ -1105,6 +1135,123 @@ mod tests {
     const PK_VALID_A: &str = "35c18ae273fccfaf80d629e20e7f8721b90499379addff533054acc2504c12b4";
     const PK_VALID_B: &str = "c6237ef84fa537c78dcee78efd2d4e59f728859c7f194da42ac51ededfa0be05";
     const PK_VALID_C: &str = "f4a42a97e594b77bdbd8ee35191c8b28a94a4cb871d96f32921558275421fb68";
+
+    #[test]
+    fn message_get_cursor_argument_contract() {
+        use clap::Parser;
+
+        let channel = "123e4567-e89b-12d3-a456-426614174000";
+        for id in [ID_A.to_owned(), ID_A.to_uppercase()] {
+            let cli = crate::Cli::try_parse_from([
+                "buzz",
+                "messages",
+                "get",
+                "--channel",
+                channel,
+                "--before",
+                "123",
+                "--before-id",
+                id.as_str(),
+            ])
+            .unwrap();
+            assert!(matches!(cli.command,
+                crate::Cmd::Messages(crate::MessagesCmd::Get {
+                    before: Some(123), before_id: Some(actual), ..
+                }) if actual == id
+            ));
+        }
+        let orphan = crate::Cli::try_parse_from([
+            "buzz",
+            "messages",
+            "get",
+            "--channel",
+            channel,
+            "--before-id",
+            ID_A,
+        ])
+        .err()
+        .expect("ID without time must be refused");
+        assert_eq!(
+            orphan.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        for invalid in [
+            "".to_owned(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+            "é".repeat(32),
+            format!(" {ID_A}"),
+        ] {
+            let error = crate::Cli::try_parse_from([
+                "buzz",
+                "messages",
+                "get",
+                "--channel",
+                channel,
+                "--before",
+                "123",
+                "--before-id",
+                invalid.as_str(),
+            ])
+            .err()
+            .expect("malformed ID must be refused by argument parsing");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+    }
+
+    #[test]
+    fn message_get_cursor_query_binds_before_id_and_refuses_unpaired_id() {
+        let channel = "123e4567-e89b-12d3-a456-426614174000";
+        let composite = get_messages_query(&GetMessagesParams {
+            channel_id: channel,
+            limit: Some(500),
+            before: Some(123),
+            before_id: Some(ID_B),
+            since: Some(10),
+            kinds: Some("9,40002"),
+        })
+        .unwrap();
+        assert_eq!(
+            composite,
+            json!({"kinds": [9, 40002], "#h": [channel], "limit": 200,
+                "until": 123, "before_id": ID_B, "since": 10})
+        );
+        let time_only = get_messages_query(&GetMessagesParams {
+            channel_id: channel,
+            limit: None,
+            before: Some(123),
+            before_id: None,
+            since: None,
+            kinds: None,
+        })
+        .unwrap();
+        assert_eq!(
+            time_only,
+            json!({"kinds": [9, 40002, 40008, 45001, 45003], "#h": [channel],
+                "limit": 50, "until": 123})
+        );
+        let unpaired = get_messages_query(&GetMessagesParams {
+            channel_id: channel,
+            limit: None,
+            before: None,
+            before_id: Some(ID_A),
+            since: None,
+            kinds: None,
+        })
+        .unwrap_err();
+        assert!(matches!(unpaired, CliError::Usage(_)));
+        let malformed = get_messages_query(&GetMessagesParams {
+            channel_id: channel,
+            limit: None,
+            before: Some(123),
+            before_id: Some("not-hex"),
+            since: None,
+            kinds: None,
+        })
+        .unwrap_err();
+        assert!(matches!(malformed, CliError::Usage(_)));
+    }
 
     #[test]
     fn compact_event_format_remains_the_three_key_contract() {

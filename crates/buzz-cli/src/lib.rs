@@ -370,6 +370,11 @@ buzz agents archived"
     Archived,
 }
 
+fn parse_message_cursor_id(value: &str) -> Result<String, String> {
+    validate::validate_hex64(value).map_err(|error| error.to_string())?;
+    Ok(value.to_owned())
+}
+
 #[derive(Subcommand)]
 pub enum MessagesCmd {
     /// Send a message to a channel
@@ -473,9 +478,12 @@ pub enum MessagesCmd {
         /// Maximum number of results to return
         #[arg(long)]
         limit: Option<u32>,
-        /// Unix timestamp — return messages before this time
+        /// Unix timestamp — upper time bound (inclusive without --before-id)
         #[arg(long)]
         before: Option<i64>,
+        /// 64-char hex event ID — continue before (timestamp, ID); requires --before
+        #[arg(long, requires = "before", value_parser = parse_message_cursor_id)]
+        before_id: Option<String>,
         /// Unix timestamp — return messages after this time
         #[arg(long)]
         since: Option<i64>,
