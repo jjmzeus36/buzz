@@ -815,8 +815,9 @@ pub async fn reap_expired_ephemeral_channels(pool: &PgPool) -> Result<Vec<Reaped
 
 impl Db {
     /// Atomically update a topic with live member authority and persist its
-    /// relay-signed notification. Channel/member locks serialize removal and
-    /// archival against authorization; a failed event insert rolls back the topic.
+    /// relay-signed notification. Channel/member and moderation/owner-mapping locks
+    /// serialize revocation against authorization through source commit; a failed
+    /// event insert rolls back the topic.
     pub async fn set_topic_with_member_event(
         &self,
         community_id: CommunityId,
@@ -858,6 +859,8 @@ impl Db {
                 "topic requires current membership in an active channel".into(),
             ));
         }
+        super::channel_topic_authority::lock_unrestricted_principal(&mut tx, community_id, actor)
+            .await?;
         sqlx::query(
             "UPDATE channels SET topic = $3, topic_set_by = $4, topic_set_at = NOW() \
              WHERE community_id = $1 AND id = $2",

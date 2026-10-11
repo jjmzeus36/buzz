@@ -327,6 +327,16 @@ async fn resumed_actions_recheck_authority_after_an_earlier_action() {
         sent: Mutex<Vec<String>>,
     }
     impl crate::ActionSink for DisablingSink {
+        fn set_channel_topic(
+            &self,
+            _: CommunityId,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), crate::ActionSinkError>> + Send + '_>> {
+            Box::pin(async { panic!("approval fixture does not execute topic actions") })
+        }
+
         fn send_message(
             &self,
             _: CommunityId,

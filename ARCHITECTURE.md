@@ -555,7 +555,12 @@ Note: Both `TriggerDef` and `ActionDef` use serde internally-tagged enums. Trigg
 **Topic updates:** `set_channel_topic` requires a channel-scoped workflow. Its
 `topic` field supports templates; an empty value clears the topic. The relay
 rechecks the owner's current moderation restrictions and membership in the active
-channel, atomically saves the topic and an attributed, relay-signed system event,
+channel after its lifecycle and TTL waits. The source transaction stabilizes the
+persisted owner mapping and locks the principal and human-owner restriction rows
+through commit; inherited bans apply, while timeouts apply only to the principal.
+Missing users get the canonical minimal user row, and absent restriction rows get
+inactive sentinels so a first moderation INSERT also serializes with the action.
+It atomically saves the topic and an attributed, relay-signed system event,
 then persists the NIP-29 discovery metadata before dispatching the notice.
 Metadata capture and replacement share a lock, so a stale capture cannot replace
 a newer topic. Trigger input cannot select a different channel. A system-event

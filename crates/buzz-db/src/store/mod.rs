@@ -14,6 +14,7 @@ pub mod channel;
 pub mod channel_members;
 /// Locked relay-authored channel metadata snapshots.
 pub mod channel_metadata;
+mod channel_topic_authority;
 /// Community lifecycle and host-map persistence.
 pub mod community;
 /// Durable whole-community deletion lifecycle and PostgreSQL adapter.

@@ -1543,8 +1543,8 @@ void main() {
     expect(channels.map((channel) => channel.id), [_channelA, _channelB]);
     expect(channels.first.isMember, isTrue);
     expect(channels.last.isMember, isFalse);
-    await _waitUntil(() => session.subscribeFilters.length == 1);
-    expect(session.subscribeFilters, hasLength(1));
+    await _waitUntil(() => session.subscribeFilters.length == 2);
+    expect(session.subscribeFilters, hasLength(2));
   });
 
   test(
@@ -2008,14 +2008,14 @@ void main() {
 
       final initial = await container.read(channelsProvider.future);
       expect(initial.single.name, 'general');
-      await _waitUntil(() => session.subscribeFilters.length == 1);
-      expect(session.subscribeFilters, hasLength(1));
+      await _waitUntil(() => session.subscribeFilters.length == 2);
+      expect(session.subscribeFilters, hasLength(2));
 
       session.setStatus(SessionStatus.reconnecting);
       final reconnecting = await container.read(channelsProvider.future);
 
       expect(reconnecting.single.name, 'general');
-      expect(session.subscribeFilters, hasLength(1));
+      expect(session.subscribeFilters, hasLength(2));
       expect(session.unsubscribeCount, 0);
     },
   );
@@ -2109,8 +2109,8 @@ void main() {
     );
 
     // And one live subscription on the resulting channel.
-    await _waitUntil(() => session.subscribeFilters.length == 1);
-    expect(session.subscribeFilters, hasLength(1));
+    await _waitUntil(() => session.subscribeFilters.length == 2);
+    expect(session.subscribeFilters, hasLength(2));
   });
 }
 
@@ -2294,6 +2294,9 @@ class _FakeRelaySession extends RelaySessionNotifier {
   int unsubscribeCount = 0;
   int totalSubscribeCount = 0;
   int subscribeFailures = 0;
+  int metadataSubscribeFailures = 0;
+  bool _pauseMetadataSubscribe = false;
+  Future<List<NostrEvent>> Function(String channelId)? detailHistoryOverride;
   int successfulSubscribesBeforeFailure = 0;
 
   Set<String> get activeChannels => {
@@ -2311,7 +2314,8 @@ class _FakeRelaySession extends RelaySessionNotifier {
     await started.future;
   }
 
-  void pauseNextSubscribe() {
+  void pauseNextSubscribe({bool metadata = false}) {
+    _pauseMetadataSubscribe = metadata;
     if (_pausedSubscribe != null) {
       throw StateError('A subscription is already paused');
     }
@@ -2534,6 +2538,9 @@ class _FakeRelaySession extends RelaySessionNotifier {
       return huddleStarts;
     }
     if (filter.kinds.contains(39000)) {
+      if (filter.limit == 1 && detailHistoryOverride != null) {
+        return detailHistoryOverride!(filter.tags['#d']!.single);
+      }
       final ids = filter.tags['#d']?.toSet();
       if (ids == null) {
         throw StateError('Directory queries must use the HTTP query bridge');
@@ -2669,19 +2676,27 @@ class _FakeRelaySession extends RelaySessionNotifier {
   }) async {
     totalSubscribeCount++;
     subscribeFilters.add(filter);
+    final metadata = filter.kinds.contains(39000);
     final paused = _pausedSubscribe;
-    if (paused != null) {
+    if (paused != null && metadata == _pauseMetadataSubscribe) {
       _subscribeStarted!.complete();
       await paused.future;
       _pausedSubscribe = null;
       _subscribeStarted = null;
     }
-    if (subscribeFailures > 0 && successfulSubscribesBeforeFailure == 0) {
-      subscribeFailures--;
+    if ((!metadata &&
+            subscribeFailures > 0 &&
+            successfulSubscribesBeforeFailure == 0) ||
+        (metadata && metadataSubscribeFailures > 0)) {
+      if (metadata) {
+        metadataSubscribeFailures--;
+      } else {
+        subscribeFailures--;
+      }
       subscribeFilters.remove(filter);
       throw StateError('live subscription failed');
     }
-    if (successfulSubscribesBeforeFailure > 0) {
+    if (!metadata && successfulSubscribesBeforeFailure > 0) {
       successfulSubscribesBeforeFailure--;
     }
     final subscriptionKey = ++_nextSubscriptionKey;
@@ -2694,9 +2709,15 @@ class _FakeRelaySession extends RelaySessionNotifier {
     };
   }
 
-  void closeSubscriptionContaining(String channelId, String message) {
+  void closeSubscriptionContaining(
+    String channelId,
+    String message, {
+    bool metadata = false,
+  }) {
     final entry = _subscriptions.entries.singleWhere(
-      (entry) => entry.value.$1.tags['#h']?.contains(channelId) ?? false,
+      (entry) =>
+          entry.value.$1.tags[metadata ? '#d' : '#h']?.contains(channelId) ??
+          false,
     );
     _subscriptions.remove(entry.key);
     subscribeFilters.remove(entry.value.$1);

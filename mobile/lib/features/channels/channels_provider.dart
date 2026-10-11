@@ -645,9 +645,9 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
         final payload = jsonDecode(event.content);
         if (payload is Map<String, dynamic> &&
             payload['type'] == 'topic_changed') {
-          // The relay publishes the notice after the new kind:39000 metadata.
-          // Detail and list caches are independent; both must converge before
-          // merging details into the channel displayed by the header.
+          // Workflow metadata already precedes its notice. Ordinary edits can
+          // publish it later; the separate canonical metadata subscription
+          // refreshes these caches again when that replacement arrives.
           ref.invalidate(channelDetailsProvider(channelId));
           unawaited(_backstopRefresh());
         }
@@ -695,6 +695,14 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
 
       return updated;
     });
+  }
+
+  void _handleChannelMetadata(NostrEvent event) {
+    if (event.kind != 39000) return;
+    final channelId = event.getTagValue('d');
+    if (channelId == null) return;
+    ref.invalidate(channelDetailsProvider(channelId));
+    unawaited(_backstopRefresh());
   }
 
   Set<String> _mutedChannelIds() => {

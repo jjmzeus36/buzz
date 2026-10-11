@@ -97,46 +97,57 @@ extension _ChannelsNotifierLiveSubscriptions on ChannelsNotifier {
       final subscription = _LiveChunkSubscription(generation);
       _liveSubscriptionsByChunk[chunkKey] = subscription;
       try {
-        final unsubscribe = await session.subscribe(
-          NostrFilter(
-            kinds: EventKind.channelEventKinds,
-            tags: {'#h': chunk},
-            limit: 0,
-          ),
-          (event) {
-            // Superseded chunks can overlap during replacement or recovery.
-            // Deliver only the current scope's still-desired channels; duplicate
-            // events are already idempotent in the unread/timestamp stores.
-            if (!_lifecycleRef.mounted ||
-                _refreshCoordinator.currentScope() != fence.scope ||
-                !_desiredLiveChannelIds.contains(event.channelId)) {
-              return;
-            }
-            _handleLiveEvent(event);
-          },
-          onClosed: (message) =>
-              _handleLiveChunkClosed(chunkKey, generation, message),
-        );
-        subscription.unsubscribe = unsubscribe;
-        if (!_lifecycleRef.mounted || !fence.isCurrent) {
-          _liveSubscriptionsByChunk.remove(chunkKey);
-          unsubscribe();
-          if (!fence.isCurrent) throw const _StaleChannelRefresh();
-          return;
-        }
-        if (subscriptionVersion != _subscriptionVersion ||
-            _lifecycleRef.read(relaySessionProvider).status !=
-                SessionStatus.connected ||
-            _lifecycleRef.read(relayConfigProvider).baseUrl != relayBaseUrl ||
-            _subscriptionRelayBaseUrl != relayBaseUrl ||
-            !chunk.every(_desiredLiveChannelIds.contains)) {
-          _liveSubscriptionsByChunk.remove(chunkKey);
-          unsubscribe();
-          return;
-        }
-        if (_liveSubscriptionsByChunk[chunkKey] != subscription) {
-          unsubscribe();
-          continue;
+        for (final metadata in [false, true]) {
+          final unsubscribe = await session.subscribe(
+            NostrFilter(
+              kinds: metadata ? [39000] : EventKind.channelEventKinds,
+              tags: {(metadata ? '#d' : '#h'): chunk},
+              limit: 0,
+            ),
+            (event) {
+              // Superseded chunks can overlap during replacement or recovery.
+              // Deliver only the current scope's still-desired channels; duplicate
+              // events are already idempotent in the unread/timestamp stores.
+              final channelId = metadata
+                  ? event.getTagValue('d')
+                  : event.channelId;
+              if (!_lifecycleRef.mounted ||
+                  _liveSubscriptionsByChunk[chunkKey] != subscription ||
+                  _refreshCoordinator.currentScope() != fence.scope ||
+                  !chunk.contains(channelId) ||
+                  !_desiredLiveChannelIds.contains(channelId)) {
+                return;
+              }
+              if (metadata) {
+                _handleChannelMetadata(event);
+              } else {
+                _handleLiveEvent(event);
+              }
+            },
+            onClosed: (message) =>
+                _handleLiveChunkClosed(chunkKey, generation, message),
+          );
+          subscription.addUnsubscribe(unsubscribe);
+          if (!_lifecycleRef.mounted || !fence.isCurrent) {
+            _liveSubscriptionsByChunk.remove(chunkKey);
+            subscription.dispose();
+            if (!fence.isCurrent) throw const _StaleChannelRefresh();
+            return;
+          }
+          if (subscriptionVersion != _subscriptionVersion ||
+              _lifecycleRef.read(relaySessionProvider).status !=
+                  SessionStatus.connected ||
+              _lifecycleRef.read(relayConfigProvider).baseUrl != relayBaseUrl ||
+              _subscriptionRelayBaseUrl != relayBaseUrl ||
+              !chunk.every(_desiredLiveChannelIds.contains)) {
+            _liveSubscriptionsByChunk.remove(chunkKey);
+            subscription.dispose();
+            return;
+          }
+          if (_liveSubscriptionsByChunk[chunkKey] != subscription) {
+            subscription.dispose();
+            break;
+          }
         }
       } on _StaleChannelRefresh {
         rethrow;
@@ -144,6 +155,7 @@ extension _ChannelsNotifierLiveSubscriptions on ChannelsNotifier {
         if (_liveSubscriptionsByChunk[chunkKey] == subscription) {
           _liveSubscriptionsByChunk.remove(chunkKey);
         }
+        subscription.dispose();
         if (!_lifecycleRef.mounted) return;
         debugPrint(
           '[ChannelsNotifier] live subscription failed for '
@@ -174,6 +186,7 @@ extension _ChannelsNotifierLiveSubscriptions on ChannelsNotifier {
     final subscription = _liveSubscriptionsByChunk[chunkKey];
     if (subscription == null || subscription.generation != generation) return;
     _liveSubscriptionsByChunk.remove(chunkKey);
+    subscription.dispose();
     // RelaySession calls onClosed only for terminal admission failures. Its
     // transient/rate-limit retries have their own backoff. Do not turn a
     // terminal rejection into a fresh membership/history/REQ loop here.
@@ -224,13 +237,13 @@ extension _ChannelsNotifierLiveSubscriptions on ChannelsNotifier {
     for (final entry in _liveSubscriptionsByChunk.entries.toList()) {
       if (retainedKeys.contains(entry.key)) continue;
       _liveSubscriptionsByChunk.remove(entry.key);
-      entry.value.unsubscribe?.call();
+      entry.value.dispose();
     }
   }
 
   void _clearRetainedLiveChunks() {
     for (final subscription in _liveSubscriptionsByChunk.values) {
-      subscription.unsubscribe?.call();
+      subscription.dispose();
     }
     _liveSubscriptionsByChunk.clear();
   }
@@ -270,5 +283,23 @@ class _LiveChunkSubscription {
   _LiveChunkSubscription(this.generation);
 
   final int generation;
-  void Function()? unsubscribe;
+  final List<void Function()> _unsubscribers = [];
+  bool _disposed = false;
+
+  void addUnsubscribe(void Function() unsubscribe) {
+    if (_disposed) {
+      unsubscribe();
+    } else {
+      _unsubscribers.add(unsubscribe);
+    }
+  }
+
+  void dispose() {
+    _disposed = true;
+    final unsubscribers = List.of(_unsubscribers);
+    _unsubscribers.clear();
+    for (final unsubscribe in unsubscribers) {
+      unsubscribe();
+    }
+  }
 }

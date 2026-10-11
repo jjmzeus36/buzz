@@ -5,6 +5,8 @@ use buzz_core::kind::KIND_SYSTEM_MESSAGE;
 use buzz_core::TenantContext;
 
 #[cfg(test)]
+mod authority_postgres_tests;
+#[cfg(test)]
 mod governance_postgres_tests;
 #[cfg(test)]
 mod persistence_postgres_tests;
@@ -12,6 +14,8 @@ mod persistence_postgres_tests;
 mod postgres_tests;
 #[cfg(test)]
 mod race_postgres_tests;
+#[cfg(test)]
+mod restriction_race_postgres_tests;
 
 impl RelayActionSink {
     pub(super) async fn set_channel_topic_impl(
