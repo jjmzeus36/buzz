@@ -27,6 +27,13 @@ public key. Every approver must also be a current member of the workflow channel
 Role names and display-name mentions fail explicitly. Approval durations range
 from one second to thirty days; the default is twenty-four hours. These fields
 are validated after template substitution.
+Unsupported literal roles and mentions are rejected when saving the definition,
+before earlier steps can execute. Template selectors are checked after resolution.
+
+Pass the `approval_ref` from the approval read response directly to the CLI:
+`buzz workflows approve --approval-ref <64hex>`. Add `--approved false` to deny
+or `--note "reviewed"` to record a note. `--token` remains an alias, and legacy
+raw UUID tokens are hashed once; read references are not hashed again.
 
 Grant and deny commands use the existing approval-reference `d` tag (or `e` tag)
 and kinds 46030/46031. The command event and decision commit together. A rejected
