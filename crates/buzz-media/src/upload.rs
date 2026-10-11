@@ -17,6 +17,41 @@ use crate::validation::{
     validate_video_file,
 };
 
+/// Object-safe async admission result.
+pub type AdmissionFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, MediaError>> + Send + 'a>>;
+
+/// Durable accounting seam after validation, before reads or writes to storage.
+/// Dropping an upload never refunds a reservation. Successful completion is
+/// recorded only after publication (including the idempotent storage path).
+pub trait UploadAdmission: Send + Sync {
+    /// Reserve actual bytes; None means an already charged owner/hash.
+    fn reserve<'a>(&'a self, hash: &'a str, size: u64) -> AdmissionFuture<'a, Option<String>>;
+    /// Finalize this exact reservation token, retaining the charge.
+    fn complete<'a>(&'a self, hash: &'a str, token: String) -> AdmissionFuture<'a, ()>;
+}
+
+async fn admit(
+    admission: Option<&dyn UploadAdmission>,
+    hash: &str,
+    size: u64,
+) -> Result<Option<String>, MediaError> {
+    match admission {
+        Some(admission) => admission.reserve(hash, size).await,
+        None => Ok(None),
+    }
+}
+async fn complete(
+    admission: Option<&dyn UploadAdmission>,
+    hash: &str,
+    token: Option<String>,
+) -> Result<(), MediaError> {
+    if let (Some(admission), Some(token)) = (admission, token) {
+        admission.complete(hash, token).await?;
+    }
+    Ok(())
+}
+
 /// Shared buffered-upload pipeline for the image and generic-file paths.
 ///
 /// Both paths are identical except for two steps, which are injected:
@@ -49,6 +84,7 @@ struct BufferedUploadInput<'a> {
     auth_event: &'a nostr::Event,
     body: Bytes,
     attribution: Option<UploadAttribution>,
+    admission: Option<&'a dyn UploadAdmission>,
 }
 
 async fn process_buffered_upload<V, M, Fut>(
@@ -68,6 +104,7 @@ where
         auth_event,
         body,
         attribution,
+        admission,
     } = input;
 
     // CPU-bound: validate content, compute hash, verify auth.
@@ -88,6 +125,7 @@ where
     .await
     .map_err(|_| MediaError::Internal)??;
 
+    let reservation = admit(admission, &sha256, body.len() as u64).await?;
     let key = format!("{sha256}.{ext}");
     let meta_key = MediaStorage::ctx_sidecar_key(ctx, &sha256);
 
@@ -117,6 +155,7 @@ where
             )
             .await?;
         }
+        complete(admission, &sha256, reservation).await?;
         return Ok(build_descriptor(
             config,
             &sha256,
@@ -176,6 +215,7 @@ where
         .await?;
     }
     storage.put_sidecar(ctx, &sha256, &meta).await?;
+    complete(admission, &sha256, reservation).await?;
 
     Ok(build_descriptor(
         config,
@@ -212,6 +252,19 @@ pub async fn process_upload(
     body: Bytes,
     attribution: Option<UploadAttribution>,
 ) -> Result<BlobDescriptor, MediaError> {
+    process_upload_admitted(storage, config, ctx, auth_event, body, attribution, None).await
+}
+
+/// Upload with optional durable admission before publication.
+pub async fn process_upload_admitted(
+    storage: &MediaStorage,
+    config: &MediaConfig,
+    ctx: &TenantContext,
+    auth_event: &nostr::Event,
+    body: Bytes,
+    attribution: Option<UploadAttribution>,
+    admission: Option<&dyn UploadAdmission>,
+) -> Result<BlobDescriptor, MediaError> {
     process_buffered_upload(
         BufferedUploadInput {
             storage,
@@ -220,6 +273,7 @@ pub async fn process_upload(
             auth_event,
             body,
             attribution,
+            admission,
         },
         |bytes, cfg| {
             let mime = validate_content(bytes, cfg)?;
@@ -250,6 +304,19 @@ pub async fn process_file_upload(
     body: Bytes,
     attribution: Option<UploadAttribution>,
 ) -> Result<BlobDescriptor, MediaError> {
+    process_file_upload_admitted(storage, config, ctx, auth_event, body, attribution, None).await
+}
+
+/// Upload with optional durable admission before publication.
+pub async fn process_file_upload_admitted(
+    storage: &MediaStorage,
+    config: &MediaConfig,
+    ctx: &TenantContext,
+    auth_event: &nostr::Event,
+    body: Bytes,
+    attribution: Option<UploadAttribution>,
+    admission: Option<&dyn UploadAdmission>,
+) -> Result<BlobDescriptor, MediaError> {
     process_buffered_upload(
         BufferedUploadInput {
             storage,
@@ -258,6 +325,7 @@ pub async fn process_file_upload(
             auth_event,
             body,
             attribution,
+            admission,
         },
         |bytes, cfg| validate_file_content(bytes, cfg),
         |input| async move {
@@ -297,6 +365,31 @@ pub async fn process_video_upload(
     body_stream: impl futures_core::Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
     content_length: Option<u64>,
     attribution: Option<UploadAttribution>,
+) -> Result<BlobDescriptor, MediaError> {
+    process_video_upload_admitted(
+        storage,
+        config,
+        ctx,
+        auth_event,
+        body_stream,
+        content_length,
+        attribution,
+        None,
+    )
+    .await
+}
+
+/// Upload with optional durable admission before publication.
+#[allow(clippy::too_many_arguments)]
+pub async fn process_video_upload_admitted(
+    storage: &MediaStorage,
+    config: &MediaConfig,
+    ctx: &TenantContext,
+    auth_event: &nostr::Event,
+    body_stream: impl futures_core::Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
+    content_length: Option<u64>,
+    attribution: Option<UploadAttribution>,
+    admission: Option<&dyn UploadAdmission>,
 ) -> Result<BlobDescriptor, MediaError> {
     // --- 1. Stream body to temp file, compute SHA-256 incrementally ---
     let tmp = tempfile::NamedTempFile::new().map_err(|e| MediaError::Io(e.to_string()))?;
@@ -422,6 +515,7 @@ pub async fn process_video_upload(
             .await
             .map_err(|_| MediaError::Internal)??;
 
+    let reservation = admit(admission, &sha256_hex, file_size).await?;
     let ext = "mp4";
     let key = format!("{sha256_hex}.{ext}");
     let meta_key = MediaStorage::ctx_sidecar_key(ctx, &sha256_hex);
@@ -449,6 +543,7 @@ pub async fn process_video_upload(
             )
             .await?;
         }
+        complete(admission, &sha256_hex, reservation).await?;
         return Ok(build_descriptor(
             config,
             &sha256_hex,
@@ -496,6 +591,7 @@ pub async fn process_video_upload(
         .await?;
     }
     storage.put_sidecar(ctx, &sha256_hex, &meta).await?;
+    complete(admission, &sha256_hex, reservation).await?;
 
     Ok(build_descriptor(
         config,

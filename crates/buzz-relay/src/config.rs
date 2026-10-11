@@ -298,6 +298,8 @@ pub struct Config {
     pub media_max_concurrent_uploads_per_pubkey: u32,
     /// Maximum media upload starts accepted from one pubkey per minute.
     pub media_uploads_per_minute: u32,
+    /// Disabled unless both an explicit byte limit and verified baseline epoch are supplied.
+    pub media_quota: Option<buzz_db::media_quota::QuotaPolicy>,
 
     /// Whether tamper-evident event/media audit logging is enabled. Defaults to true.
     /// This does not control the separate `moderation_actions` audit trail.
@@ -893,6 +895,9 @@ impl Config {
                 .filter(|&v| v > 0)
                 .unwrap_or(2)
                 .min(u32::try_from(media_max_concurrent_uploads).unwrap_or(u32::MAX));
+        let quota_bytes = media_quota_env("BUZZ_MEDIA_QUOTA_BYTES")?;
+        let quota_epoch = media_quota_env("BUZZ_MEDIA_QUOTA_BASELINE_ID")?;
+        let media_quota = parse_media_quota(quota_bytes.as_deref(), quota_epoch.as_deref())?;
         let media_uploads_per_minute: u32 = std::env::var("BUZZ_MEDIA_UPLOADS_PER_MINUTE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1238,6 +1243,7 @@ impl Config {
             media_max_concurrent_uploads,
             media_max_concurrent_uploads_per_pubkey,
             media_uploads_per_minute,
+            media_quota,
             audit_enabled,
             ephemeral_ttl_override,
             git_repo_path,
@@ -1279,7 +1285,7 @@ mod tests {
     // Mutex to serialize tests that mutate environment variables.
     // Parallel env-var mutation causes `defaults_are_valid` to see the invalid
     // value set by `invalid_bind_addr_returns_error`, causing a flaky failure.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Look up against a fixed set, standing in for process env.
     fn env_of<'a>(set: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + use<'a> {
@@ -2374,5 +2380,124 @@ mod tests {
             matches!(result, Err(ConfigError::InvalidValue(ref msg)) if msg.contains("BUZZ_GIT_REPO_PATH")),
             "expected InvalidValue mentioning BUZZ_GIT_REPO_PATH, got {result:?}"
         );
+    }
+}
+
+fn media_quota_env(name: &str) -> Result<Option<String>, ConfigError> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidValue(format!(
+            "{name} must contain valid UTF-8"
+        ))),
+    }
+}
+
+fn parse_media_quota(
+    bytes: Option<&str>,
+    epoch: Option<&str>,
+) -> Result<Option<buzz_db::media_quota::QuotaPolicy>, ConfigError> {
+    match (bytes, epoch) {
+        (None, None) => Ok(None),
+        (Some(bytes), Some(epoch)) => {
+            let limit = bytes
+                .parse::<i64>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| {
+                    ConfigError::InvalidValue(
+                        "BUZZ_MEDIA_QUOTA_BYTES must be a positive BIGINT".into(),
+                    )
+                })?;
+            let baseline_id = uuid::Uuid::parse_str(epoch)
+                .ok()
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| {
+                    ConfigError::InvalidValue(
+                        "BUZZ_MEDIA_QUOTA_BASELINE_ID must be a non-nil UUID".into(),
+                    )
+                })?;
+            Ok(Some(buzz_db::media_quota::QuotaPolicy {
+                limit,
+                baseline_id,
+            }))
+        }
+        _ => Err(ConfigError::InvalidValue(
+            "media quota requires both byte limit and verified baseline ID".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod media_quota_tests {
+    use super::parse_media_quota;
+    #[cfg(unix)]
+    use super::{Config, ConfigError};
+    #[test]
+    fn disabled_default_and_invalid_policy_fail_closed() {
+        let epoch = "11111111-1111-4111-8111-111111111111";
+        assert!(parse_media_quota(None, None).unwrap().is_none());
+        for (bytes, id) in [
+            (Some("0"), Some(epoch)),
+            (Some("-1"), Some(epoch)),
+            (Some("9223372036854775808"), Some(epoch)),
+            (Some("1"), None),
+            (None, Some(epoch)),
+            (Some("1"), Some("")),
+            (Some(""), Some(epoch)),
+        ] {
+            assert!(parse_media_quota(bytes, id).is_err());
+        }
+        assert_eq!(
+            parse_media_quota(Some("1"), Some(epoch))
+                .unwrap()
+                .unwrap()
+                .limit,
+            1
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_unicode_quota_environment_rejects_production_config() {
+        use std::os::unix::ffi::OsStringExt;
+        let _guard = super::tests::ENV_MUTEX.lock().unwrap();
+        let keys = ["BUZZ_MEDIA_QUOTA_BYTES", "BUZZ_MEDIA_QUOTA_BASELINE_ID"];
+        let previous = keys.map(std::env::var_os);
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        let disabled = Config::from_env();
+        let mut results = Vec::new();
+        for (index, malformed) in keys.into_iter().enumerate() {
+            for with_partner in [false, true] {
+                for key in keys {
+                    std::env::remove_var(key);
+                }
+                if with_partner {
+                    let value = if index == 0 {
+                        "11111111-1111-4111-8111-111111111111"
+                    } else {
+                        "10"
+                    };
+                    std::env::set_var(keys[1 - index], value);
+                }
+                std::env::set_var(malformed, std::ffi::OsString::from_vec(vec![0xff]));
+                results.push((malformed, Config::from_env()));
+            }
+        }
+        for (key, value) in keys.into_iter().zip(previous) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert!(disabled.unwrap().media_quota.is_none());
+        for (name, result) in results {
+            assert!(
+                matches!(result, Err(ConfigError::InvalidValue(message)) if message == format!("{name} must contain valid UTF-8")),
+                "malformed quota environment must not disable accounting"
+            );
+        }
     }
 }

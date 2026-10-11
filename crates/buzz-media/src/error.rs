@@ -58,6 +58,12 @@ pub enum MediaError {
     CommunityWriteFenced,
     #[error("media service temporarily unavailable")]
     ServiceUnavailable,
+    /// Operator-supplied cumulative logical storage quota was exhausted.
+    #[error("media storage quota exceeded")]
+    QuotaExceeded,
+    /// Unknown historical baseline, pending reservation, or unavailable ledger.
+    #[error("media quota accounting requires reconciliation")]
+    QuotaUnavailable,
     #[error("token revoked")]
     TokenRevoked,
     #[error("pubkey mismatch")]
@@ -147,6 +153,8 @@ impl IntoResponse for MediaError {
             Self::RelayMembershipRequired | Self::CommunityWriteFenced => {
                 (StatusCode::FORBIDDEN, self.to_string())
             }
+            Self::QuotaExceeded => (StatusCode::PAYLOAD_TOO_LARGE, self.to_string()),
+            Self::QuotaUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Self::ServiceUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Self::UploadRateLimitExceeded | Self::UploadConcurrencyLimitReached => {
                 (StatusCode::TOO_MANY_REQUESTS, self.to_string())
