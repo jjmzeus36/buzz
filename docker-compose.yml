@@ -147,8 +147,11 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >-
-        aws --endpoint-url http://minio:9000 s3api head-bucket --bucket buzz-media
-        || aws --endpoint-url http://minio:9000 s3api create-bucket --bucket buzz-media
+        set -eu;
+        if ! aws --endpoint-url http://minio:9000 s3api head-bucket --bucket buzz-media; then
+          aws --endpoint-url http://minio:9000 s3api create-bucket --bucket buzz-media;
+        fi;
+        aws --endpoint-url http://minio:9000 s3api delete-bucket-policy --bucket buzz-media
     labels:
       com.buzz.service: "minio-init"
       com.buzz.env: "dev"
