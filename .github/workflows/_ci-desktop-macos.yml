@@ -33,20 +33,16 @@ jobs:
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
-          workspaces: desktop/src-tauri
+          workspaces: |
+            .
+            desktop/src-tauri
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Install desktop dependencies
         run: just desktop-install-ci
-      - name: Create sidecar placeholders
+      - name: Build sidecars
         run: |
-          TARGET=$(rustc -vV | sed -n 's|host: ||p')
-          mkdir -p desktop/src-tauri/binaries
-          touch "desktop/src-tauri/binaries/buzz-acp-$TARGET"
-          touch "desktop/src-tauri/binaries/buzz-agent-$TARGET"
-          touch "desktop/src-tauri/binaries/buzz-backend-kubernetes-$TARGET"
-          touch "desktop/src-tauri/binaries/buzz-dev-mcp-$TARGET"
-          touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET"
-          touch "desktop/src-tauri/binaries/buzz-$TARGET"
+          cargo build --locked --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+          ./scripts/bundle-sidecars.sh
       # Mesh rev is derived from Cargo.lock so a dependency bump needs no
       # lockstep edit here; the cache key tracks it automatically.
       - name: Resolve mesh-llm rev
