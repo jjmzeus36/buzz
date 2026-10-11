@@ -137,14 +137,33 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
     assert!(event_write_transaction.contains("acquire_writer_with_legacy_metrics("));
 
     let migration = include_str!("../src/runtime/migration.rs");
-    let migration_lock = migration
+    let migration_production = migration
+        .split_once("mod postgres_tests {")
+        .expect("migration production helpers must precede focused PostgreSQL tests")
+        .0;
+    let migration_lock = migration_production
         .split_once("pub(crate) async fn with_exclusive_schema_destruction_lock")
         .expect("migration must expose the schema-safety acquisition seam")
         .1
-        .split_once("async fn reject_legacy_nip_rs_cardinality_ambiguity")
-        .expect("schema-safety acquisition must precede migration validation")
+        .split_once("async fn migrate_legacy_nip_rs_through_0007(")
+        .expect("schema-safety acquisition must precede the legacy migration helper")
         .0;
-    assert!(migration_lock.contains("acquire_writer_with_legacy_metrics("));
+    let migration_acquisition = migration_lock
+        .split_once("crate::observability::observe_advisory_lock(")
+        .expect("schema-safety acquisition must precede advisory-lock observation")
+        .0
+        .split_once("crate::observability::acquire_writer_with_legacy_metrics(")
+        .expect("schema-safety acquisition must use the attributed writer checkout")
+        .1
+        .split_once(')')
+        .expect("schema-safety writer checkout must expose its operation argument")
+        .0
+        .split_whitespace()
+        .collect::<String>();
+    assert_eq!(
+        migration_acquisition, "pool,crate::observability::WriterOperation::Bootstrap,",
+        "schema-safety acquisition must pair the writer pool with Bootstrap"
+    );
 
     let allowlist = include_str!("../src/store/allowlist.rs");
     assert!(allowlist.contains("WriterOperation::Authentication"));
