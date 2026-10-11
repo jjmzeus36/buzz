@@ -19,8 +19,16 @@ steps:
   - id: publish
     if: steps_review_output_approved == true
     action: send_message
-    text: "Approved: {{trigger.text}}"
+    text: "Approved: {{trigger.announcement}}"
 ```
+
+For this example, send a webhook JSON body:
+
+```json
+{"announcement": "The release is ready."}
+```
+
+After approval, the publish step sends `Approved: The release is ready.`.
 
 `from` supports `any`, an empty restriction, or an exact 64-character hexadecimal
 public key. Every approver must also be a current member of the workflow channel.
