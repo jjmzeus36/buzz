@@ -93,9 +93,12 @@ jobs:
             -p buzz-pubsub \
             -p buzz-relay \
             -p buzz-test-client \
+            -p buzz-media \
             --lib \
             --test e2e_event_reminder \
             --test semantic_intent_once \
+            --test static_creds_minio \
+            --test versioned_minio \
             --archive-file target/ci/backend-integration-tests.tar.zst
           postgres_package_args=()
           while IFS= read -r package; do
@@ -525,6 +528,38 @@ jobs:
         with:
           name: desktop-e2e-relay
           path: target/ci
+      - name: S3 fixture compatibility
+        env:
+          BUZZ_S3_ENDPOINT: http://127.0.0.1:9000
+          BUZZ_S3_ACCESS_KEY: buzz_dev
+          BUZZ_S3_SECRET_KEY: buzz_dev_secret
+          BUZZ_S3_REGION: us-east-1
+          BUZZ_S3_BUCKET: buzz-media
+        run: |
+          # An initializer failure must fail this gate even when the server is healthy.
+          test "$(docker wait buzz-minio-init)" = 0
+          # Use the same pinned official administration client as Compose. The
+          # wrapper needs no host installation and receives only fixture credentials.
+          export BUZZ_S3_ADMIN_IMAGE
+          BUZZ_S3_ADMIN_IMAGE=$(docker compose config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["minio-init"]["image"])')
+          mkdir -p "$RUNNER_TEMP/s3-cli"
+          cat > "$RUNNER_TEMP/s3-cli/aws" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec docker run --rm --network host \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_EC2_METADATA_DISABLED \
+            "${BUZZ_S3_ADMIN_IMAGE:?}" "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/s3-cli/aws"
+          export PATH="$RUNNER_TEMP/s3-cli:$PATH"
+          for selector in \
+            'binary(static_creds_minio) and test(=static_creds_round_trip_against_minio)' \
+            'binary(versioned_minio) and test(=never_versioned_bucket_lists_null_versions_and_exact_delete_empties_listing)' \
+            'binary(versioned_minio) and test(=versioned_bucket_exact_version_delete_reaches_final_list_versions_emptiness)'; do
+            cargo nextest run \
+              --archive-file target/ci/backend-integration-tests.tar.zst \
+              -E "$selector" --run-ignored ignored-only --no-tests=fail
+          done
       - name: Apply schema and seed deployment community
         # MT: the relay resolves each request's tenant from the communities host
         # map and fails closed on an unmapped host. The reminder scheduler binds
