@@ -113,6 +113,7 @@ jobs:
         run: |
           scripts/test-oss-desktop-promotion.sh
           scripts/test-oss-desktop-promotion-behavior.sh
+          python3 scripts/test-promote-manifest.py
       - name: Mobile release contract
         run: |
           scripts/test-mobile-release-contract.sh
