@@ -694,6 +694,7 @@ pub(crate) mod tests {
             channel_ids: None,
             auth_method: AuthMethod::Nip42,
             agent_owner_pubkey: None,
+            moderation_owner_pubkey: None,
         })
     }
 

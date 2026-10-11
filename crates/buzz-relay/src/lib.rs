@@ -4,6 +4,7 @@
 
 mod admission;
 mod build_info;
+mod moderation;
 mod rejection;
 
 /// REST API route handlers.

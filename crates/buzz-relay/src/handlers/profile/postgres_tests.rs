@@ -23,6 +23,7 @@ async fn ingest_profile_rolls_back_failed_projection_and_retries_signed_event() 
     let tenant = TenantContext::resolved(community, &host);
     let keys = Keys::generate();
     let auth = || IngestAuth::Nip42 {
+        moderation_owner: None,
         pubkey: keys.public_key(),
         scopes: Scope::all_non_admin(),
         channel_ids: None,

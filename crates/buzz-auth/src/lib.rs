@@ -90,6 +90,9 @@ pub struct AuthContext {
     /// `None` for direct relay members or non-NIP-OA auth paths.
     /// Set by the relay membership gate when NIP-OA fallback succeeds.
     pub agent_owner_pubkey: Option<nostr::PublicKey>,
+    /// Cryptographically proven owner used only to restrict moderation access.
+    /// Retained even if optional owner materialization fails; never grants rights.
+    pub moderation_owner_pubkey: Option<nostr::PublicKey>,
 }
 
 impl AuthContext {
@@ -152,6 +155,7 @@ impl AuthService {
             channel_ids: None,
             auth_method: AuthMethod::Nip42,
             agent_owner_pubkey: None, // Set later by relay membership gate if NIP-OA
+            moderation_owner_pubkey: None,
         })
     }
 }
@@ -204,6 +208,7 @@ mod tests {
             channel_ids: None,
             auth_method: AuthMethod::Nip42,
             agent_owner_pubkey: None,
+            moderation_owner_pubkey: None,
         };
         assert!(ctx.has_scope(&Scope::MessagesRead));
         assert!(!ctx.has_scope(&Scope::MessagesWrite));

@@ -219,6 +219,8 @@ pub enum IngestAuth {
     Nip42 {
         /// The authenticated Nostr public key.
         pubkey: nostr::PublicKey,
+        /// Owner proven at transport authentication, used only for moderation.
+        moderation_owner: Option<nostr::PublicKey>,
         /// Permission scopes granted to this connection.
         scopes: Vec<Scope>,
         /// Token-level channel restriction, if the WebSocket auth used an API token.
@@ -230,6 +232,8 @@ pub enum IngestAuth {
     Http {
         /// The authenticated Nostr public key.
         pubkey: nostr::PublicKey,
+        /// Owner proven at transport authentication, used only for moderation.
+        moderation_owner: Option<nostr::PublicKey>,
         /// Permission scopes granted to this request.
         scopes: Vec<Scope>,
         /// How the HTTP request was authenticated.
@@ -242,6 +246,18 @@ impl IngestAuth {
     pub fn pubkey(&self) -> &nostr::PublicKey {
         match self {
             Self::Nip42 { pubkey, .. } | Self::Http { pubkey, .. } => pubkey,
+        }
+    }
+
+    /// Self-proving owner retained only for moderation restrictions.
+    pub fn moderation_owner(&self) -> Option<&nostr::PublicKey> {
+        match self {
+            Self::Nip42 {
+                moderation_owner, ..
+            }
+            | Self::Http {
+                moderation_owner, ..
+            } => moderation_owner.as_ref(),
         }
     }
 
@@ -3613,6 +3629,32 @@ async fn ingest_event_inner(
     let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
     let now = chrono::Utc::now().timestamp();
 
+    if kind_u32 != KIND_REPORT {
+        let proven_owner = auth.moderation_owner().copied().or_else(|| {
+            keyed_early
+                .as_deref()
+                .and_then(|early| early.verified_owner)
+        });
+        keyed_early_io(
+            keyed_early.as_deref(),
+            crate::moderation::check_read(
+                state,
+                tenant.community(),
+                auth.pubkey(),
+                proven_owner.as_ref(),
+            ),
+        )
+        .await
+        .map_err(IngestInnerOutcome::from)?
+        .map_err(|reason| {
+            if reason == crate::moderation::BANNED {
+                IngestError::AuthFailed(reason.into())
+            } else {
+                IngestError::Internal(reason.into())
+            }
+        })?;
+    }
+
     // Command kinds are routed AFTER signature verification, timestamp check,
     // pubkey/auth match, and scope validation — never before.
     if buzz_core::kind::is_command_kind(kind_u32) {
@@ -3689,16 +3731,8 @@ async fn ingest_event_inner(
     // durable ban inside `relay_admin::handle_relay_admin_event`. Any kind added
     // to this exemption owes the same handler-local ban check.
     //
-    // Scope: this gate checks the *authoring* pubkey only, with no NIP-OA
-    // owner→agent cascade. That cascade lives at the auth seam for bans, where
-    // it is structural: an agent whose owner is banned can never authenticate,
-    // so its socket never exists to reach ingest. Timeout has no auth-seam
-    // presence (it is write-block-only), so an owner-timeout does not cascade to
-    // the owner's agents — a deliberate Phase-1 asymmetry. `IngestAuth` does not
-    // carry the self-proving auth tag, so resolving the owner here would mean
-    // plumbing it through the whole transport boundary; the follow-up shape is
-    // the restriction-state cache (see should-fix), which can fold in owner
-    // resolution without a per-write DB round-trip.
+    // Direct timeouts remain write-only and do not cascade from owner to agent.
+    // Bans (including trusted owner bans) were checked before command dispatch.
     if !buzz_core::kind::is_moderation_command_kind(kind_u32) && !is_relay_admin_kind(kind_u32) {
         match keyed_early_io(
             keyed_early.as_deref(),
@@ -5330,6 +5364,7 @@ mod tests {
         .sign_with_keys(&keys)
         .expect("sign feedback");
         let auth = IngestAuth::Http {
+            moderation_owner: None,
             pubkey: keys.public_key(),
             scopes: vec![Scope::MessagesWrite],
             auth_method: HttpAuthMethod::Nip98,
@@ -5743,6 +5778,7 @@ mod tests {
         let principal = nostr::Keys::generate();
         let envelope_signer = nostr::Keys::generate();
         let auth = IngestAuth::Nip42 {
+            moderation_owner: None,
             pubkey: principal.public_key(),
             scopes: vec![],
             channel_ids: None,
@@ -5761,6 +5797,7 @@ mod tests {
         use crate::handlers::ingest::{HttpAuthMethod, IngestAuth};
         let keys = nostr::Keys::generate();
         let http_auth = IngestAuth::Http {
+            moderation_owner: None,
             pubkey: keys.public_key(),
             scopes: vec![],
             auth_method: HttpAuthMethod::Nip98,
@@ -5776,6 +5813,7 @@ mod tests {
         use crate::handlers::ingest::IngestAuth;
         let keys = nostr::Keys::generate();
         let ws_auth = IngestAuth::Nip42 {
+            moderation_owner: None,
             pubkey: keys.public_key(),
             scopes: vec![],
             channel_ids: None,
@@ -5883,6 +5921,7 @@ mod tests {
 
     fn keyed_http_auth(pubkey: nostr::PublicKey) -> IngestAuth {
         IngestAuth::Http {
+            moderation_owner: None,
             pubkey,
             scopes: Scope::all_known(),
             auth_method: HttpAuthMethod::Nip98,
@@ -6098,6 +6137,7 @@ mod tests {
         let event = signed_kind9(&keys, "fresh", Vec::new());
 
         let http_auth = IngestAuth::Http {
+            moderation_owner: None,
             pubkey: keys.public_key(),
             scopes: vec![Scope::MessagesWrite],
             auth_method: HttpAuthMethod::DevPubkey,
@@ -6108,6 +6148,7 @@ mod tests {
         assert!(matches!(
             http_proof.auth(),
             IngestAuth::Http {
+                moderation_owner: None,
                 pubkey,
                 scopes,
                 auth_method: HttpAuthMethod::DevPubkey,
@@ -6118,6 +6159,7 @@ mod tests {
         let channel_ids = vec![Uuid::from_u128(7)];
         let conn_id = Uuid::from_u128(11);
         let ws_auth = IngestAuth::Nip42 {
+            moderation_owner: None,
             pubkey: keys.public_key(),
             scopes: vec![Scope::MessagesWrite],
             channel_ids: Some(channel_ids.clone()),
@@ -6129,6 +6171,7 @@ mod tests {
         assert!(matches!(
             ws_proof.auth(),
             IngestAuth::Nip42 {
+                moderation_owner: None,
                 pubkey,
                 scopes,
                 channel_ids: Some(ids),
@@ -6163,6 +6206,7 @@ mod tests {
         let keys = nostr::Keys::generate();
         let http_auth = http_auth_for(&keys);
         let ws_auth = IngestAuth::Nip42 {
+            moderation_owner: None,
             pubkey: keys.public_key(),
             scopes: Scope::all_known(),
             channel_ids: None,
@@ -6191,6 +6235,7 @@ mod tests {
         );
         let http_auth = http_auth_for(&keys);
         let ws_auth = IngestAuth::Nip42 {
+            moderation_owner: None,
             pubkey: keys.public_key(),
             scopes: Scope::all_known(),
             channel_ids: None,
@@ -6216,6 +6261,7 @@ mod tests {
         );
         let http_auth = http_auth_for(&keys);
         let ws_auth = IngestAuth::Nip42 {
+            moderation_owner: None,
             pubkey: keys.public_key(),
             scopes: Scope::all_known(),
             channel_ids: None,
@@ -6245,6 +6291,7 @@ mod tests {
         );
         let http_auth = http_auth_for(&keys);
         let ws_auth = IngestAuth::Nip42 {
+            moderation_owner: None,
             pubkey: keys.public_key(),
             scopes: Scope::all_known(),
             channel_ids: None,
@@ -6273,6 +6320,7 @@ mod tests {
         );
         let http_auth = http_auth_for(&keys);
         let ws_auth = IngestAuth::Nip42 {
+            moderation_owner: None,
             pubkey: keys.public_key(),
             scopes: Scope::all_known(),
             channel_ids: None,
