@@ -30,11 +30,11 @@ pub fn is_admin_kind(kind: u32) -> bool {
 
 /// Check if a kind triggers side effects after storage.
 ///
-/// NOTE: kind:7 (reaction) is intentionally excluded — dedup and DB writes are
-/// handled in `ingest_event()` before storage so we can short-circuit on
-/// duplicates without storing the event at all.
+/// Profiles (kind:0) and reactions (kind:7) persist their required database
+/// mutations atomically with event storage in `ingest_event()`. They must not
+/// run a second post-commit projection here.
 pub fn is_side_effect_kind(kind: u32) -> bool {
-    matches!(kind, 0 | 5 | 9000..=9022 | KIND_GIT_REPO_ANNOUNCEMENT | KIND_AGENT_PROFILE | 41001..=41003 | 40099)
+    matches!(kind, 5 | 9000..=9022 | KIND_GIT_REPO_ANNOUNCEMENT | KIND_AGENT_PROFILE | 41001..=41003 | 40099)
 }
 
 async fn evict_live_channel_subscriptions(
@@ -200,7 +200,6 @@ pub async fn handle_side_effects(
     state: &Arc<AppState>,
 ) -> anyhow::Result<()> {
     match kind {
-        0 => handle_kind0_profile(tenant, event, state).await,
         5 => handle_standard_deletion_event(tenant, event, state).await,
         9000 => handle_put_user(tenant, event, state).await,
         9001 => handle_remove_user(tenant, event, state).await,
@@ -1195,97 +1194,6 @@ async fn handle_agent_profile(
         .await?;
 
     info!(pubkey = %hex::encode(&pubkey_bytes), policy, "kind:10100 channel_add_policy updated");
-    Ok(())
-}
-
-/// Kind:0 (NIP-01 profile metadata) side effect — sync profile fields to users table.
-async fn handle_kind0_profile(
-    tenant: &TenantContext,
-    event: &Event,
-    state: &Arc<AppState>,
-) -> anyhow::Result<()> {
-    let content: serde_json::Value = serde_json::from_str(&event.content)
-        .map_err(|e| anyhow::anyhow!("kind:0 content parse error: {e}"))?;
-
-    // Kind:0 is absolute state (NIP-01 replaceable event). Fields present in the
-    // event are set; fields absent are cleared. We use Some("") to clear absent
-    // fields, since update_user_profile only writes Some values.
-    let display_name = content
-        .get("display_name")
-        .or_else(|| content.get("name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let avatar_url = content
-        .get("picture")
-        .or_else(|| content.get("image"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let about = content.get("about").and_then(|v| v.as_str()).unwrap_or("");
-
-    // Validate NIP-05 handle: must be user@domain where domain matches the
-    // bound tenant host. Invalid or off-domain handles are silently cleared
-    // (treated as absent) rather than stored, since the event is already
-    // persisted and can't be rejected.
-    let nip05_owned = content
-        .get("nip05")
-        .and_then(|v| v.as_str())
-        .and_then(|raw| crate::api::nip05::canonicalize_nip05(raw, tenant.host()).ok());
-    let nip05_handle = nip05_owned.as_deref().unwrap_or("");
-
-    let pubkey_bytes = event.pubkey.to_bytes().to_vec();
-
-    if state
-        .db
-        .ensure_user(tenant.community(), &pubkey_bytes)
-        .await?
-    {
-        metrics::counter!(
-            "buzz_users_created_total",
-            "community" => tenant.host().to_owned()
-        )
-        .increment(1);
-    }
-
-    // Pass all fields as Some — empty string clears the field in the DB.
-    // This ensures kind:0 is treated as absolute state, not a partial update.
-    // If the NIP-05 handle collides with another user's UNIQUE constraint, retry
-    // without it so display_name/about/avatar_url are still written.
-    let result = state
-        .db
-        .update_user_profile(
-            tenant.community(),
-            &pubkey_bytes,
-            Some(display_name),
-            Some(avatar_url),
-            Some(about),
-            Some(nip05_handle),
-        )
-        .await;
-
-    if let Err(ref e) = result {
-        let msg = format!("{e}");
-        if msg.contains("duplicate key value") || msg.contains("23505") {
-            warn!(pubkey = %hex::encode(&pubkey_bytes),
-                "kind:0 NIP-05 handle contested, syncing profile without it");
-            state
-                .db
-                .update_user_profile(
-                    tenant.community(),
-                    &pubkey_bytes,
-                    Some(display_name),
-                    Some(avatar_url),
-                    Some(about),
-                    None, // skip contested NIP-05
-                )
-                .await?;
-        } else {
-            result?;
-        }
-    }
-
-    info!(pubkey = %hex::encode(&pubkey_bytes), "kind:0 profile synced to users table");
     Ok(())
 }
 
