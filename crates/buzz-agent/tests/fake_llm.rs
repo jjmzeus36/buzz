@@ -1497,7 +1497,7 @@ async fn steer_rejected_on_empty_prompt() {
     .await;
     let mut h = Harness::spawn(&url).await;
     let sid = init_session(&mut h).await;
-    let p_id = h
+    let _p_id = h
         .send(
             "session/prompt",
             json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
@@ -1515,10 +1515,12 @@ async fn steer_rejected_on_empty_prompt() {
         let v = h.recv().await;
         if v["id"] == json!(s_id) {
             assert_eq!(v["error"]["code"], -32602, "empty prompt must be rejected");
+            assert_eq!(v["error"]["message"], "steer: prompt must not be empty");
             saw_reject = true;
-        } else if v["id"] == json!(p_id) {
             break;
         }
+        // The original prompt may finish before the separate steer reply.
+        // Keep the existing bounded wait focused on the steer request ID.
     }
     assert!(saw_reject, "empty steer prompt was not rejected");
     h.shutdown().await;
