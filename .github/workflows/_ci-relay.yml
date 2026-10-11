@@ -99,6 +99,7 @@ jobs:
             --test semantic_intent_once \
             --test static_creds_minio \
             --test versioned_minio \
+            --test stream_errors \
             --archive-file target/ci/backend-integration-tests.tar.zst
           postgres_package_args=()
           while IFS= read -r package; do
@@ -528,6 +529,11 @@ jobs:
         with:
           name: desktop-e2e-relay
           path: target/ci
+      - name: Streamed S3 error regressions
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'binary(/^stream_errors$/)' --no-tests=fail
       - name: S3 fixture compatibility
         env:
           BUZZ_S3_ENDPOINT: http://127.0.0.1:9000

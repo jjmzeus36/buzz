@@ -43,6 +43,30 @@ for bin in "${bins[@]:0:5}"; do
     cmp "target/$target/release/$bin.exe" "desktop/src-tauri/binaries/$bin-$target.exe"
 done
 [[ ! -e "desktop/src-tauri/binaries/buzz-backend-kubernetes-$target.exe" ]]
+# Git Bash resolves suffixless -f/-s operands to .exe aliases. A Unix
+# target must reject .exe-only inputs before changing fresh or stale outputs.
+for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-musl; do
+    mkdir -p "target/$target/release"
+    for bin in "${bins[@]}"; do
+        printf 'wrong-platform-%s' "$bin" > "target/$target/release/$bin.exe"
+        if [[ "$target" == aarch64-unknown-linux-musl ]]; then
+            printf 'preserve-%s' "$bin" > "desktop/src-tauri/binaries/$bin-$target"
+        fi
+    done
+    if bash "$root/scripts/bundle-sidecars.sh" "$target" > error.log 2>&1; then
+        echo 'bundler accepted .exe-only sidecars for a Unix target' >&2; exit 1
+    fi
+    grep -q "missing or empty release binaries in target/$target/release" error.log
+    for bin in "${bins[@]}"; do
+        destination="desktop/src-tauri/binaries/$bin-$target"
+        if [[ "$target" == aarch64-unknown-linux-musl ]]; then
+            [[ $(cat "$destination") == "preserve-$bin" ]]
+        else
+            [[ ! -e "$destination" ]]
+        fi
+        [[ ! -e "$destination.exe" ]]
+    done
+done
 # Keep compile-only Rust stubs separate from the workflow that packages apps.
 ! grep -q 'Create sidecar placeholders' "$root/.github/workflows/_ci-desktop-macos.yml"
 grep -q './scripts/bundle-sidecars.sh' "$root/.github/workflows/_ci-desktop-macos.yml"

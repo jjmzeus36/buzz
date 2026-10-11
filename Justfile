@@ -370,6 +370,7 @@ test-unit:
         # already runs it.
         cargo test -p buzz-auth --doc
         cargo nextest run -p buzz-voice --lib
+        cargo nextest run -p buzz-media --test stream_errors --no-tests=fail
         cargo nextest run -p buzz-cli
         # buzz-acp owns the relay-to-agent trust boundary. Run its tests here so
         # forged relay events cannot regain a path into agent routing unnoticed.
