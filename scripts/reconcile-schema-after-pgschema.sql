@@ -24,6 +24,7 @@ BEGIN
         DROP TRIGGER IF EXISTS trg_events_guard_channel_roster_snapshot ON events_p_past;
         DROP TRIGGER IF EXISTS trg_events_nip_rs_watermark ON events_p_past;
         DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_nip_rs ON events_p_past;
+        DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_buzz_mesh_status ON events_p_past;
         DROP TRIGGER IF EXISTS trg_events_guard_nip_rs_hard_delete ON events_p_past;
         ALTER TABLE events ATTACH PARTITION events_p_past
             FOR VALUES FROM (MINVALUE) TO ('2026-01-01');
@@ -41,6 +42,7 @@ BEGIN
         DROP TRIGGER IF EXISTS trg_events_guard_channel_roster_snapshot ON events_p2026_01;
         DROP TRIGGER IF EXISTS trg_events_nip_rs_watermark ON events_p2026_01;
         DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_nip_rs ON events_p2026_01;
+        DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_buzz_mesh_status ON events_p2026_01;
         DROP TRIGGER IF EXISTS trg_events_guard_nip_rs_hard_delete ON events_p2026_01;
         ALTER TABLE events ATTACH PARTITION events_p2026_01
             FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
@@ -58,6 +60,7 @@ BEGIN
         DROP TRIGGER IF EXISTS trg_events_guard_channel_roster_snapshot ON events_p2026_02;
         DROP TRIGGER IF EXISTS trg_events_nip_rs_watermark ON events_p2026_02;
         DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_nip_rs ON events_p2026_02;
+        DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_buzz_mesh_status ON events_p2026_02;
         DROP TRIGGER IF EXISTS trg_events_guard_nip_rs_hard_delete ON events_p2026_02;
         ALTER TABLE events ATTACH PARTITION events_p2026_02
             FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
@@ -75,6 +78,7 @@ BEGIN
         DROP TRIGGER IF EXISTS trg_events_guard_channel_roster_snapshot ON events_p2026_03;
         DROP TRIGGER IF EXISTS trg_events_nip_rs_watermark ON events_p2026_03;
         DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_nip_rs ON events_p2026_03;
+        DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_buzz_mesh_status ON events_p2026_03;
         DROP TRIGGER IF EXISTS trg_events_guard_nip_rs_hard_delete ON events_p2026_03;
         ALTER TABLE events ATTACH PARTITION events_p2026_03
             FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
@@ -92,6 +96,7 @@ BEGIN
         DROP TRIGGER IF EXISTS trg_events_guard_channel_roster_snapshot ON events_p2026_04;
         DROP TRIGGER IF EXISTS trg_events_nip_rs_watermark ON events_p2026_04;
         DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_nip_rs ON events_p2026_04;
+        DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_buzz_mesh_status ON events_p2026_04;
         DROP TRIGGER IF EXISTS trg_events_guard_nip_rs_hard_delete ON events_p2026_04;
         ALTER TABLE events ATTACH PARTITION events_p2026_04
             FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
@@ -109,6 +114,7 @@ BEGIN
         DROP TRIGGER IF EXISTS trg_events_guard_channel_roster_snapshot ON events_p2026_05;
         DROP TRIGGER IF EXISTS trg_events_nip_rs_watermark ON events_p2026_05;
         DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_nip_rs ON events_p2026_05;
+        DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_buzz_mesh_status ON events_p2026_05;
         DROP TRIGGER IF EXISTS trg_events_guard_nip_rs_hard_delete ON events_p2026_05;
         ALTER TABLE events ATTACH PARTITION events_p2026_05
             FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
@@ -126,6 +132,7 @@ BEGIN
         DROP TRIGGER IF EXISTS trg_events_guard_channel_roster_snapshot ON events_p2026_06;
         DROP TRIGGER IF EXISTS trg_events_nip_rs_watermark ON events_p2026_06;
         DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_nip_rs ON events_p2026_06;
+        DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_buzz_mesh_status ON events_p2026_06;
         DROP TRIGGER IF EXISTS trg_events_guard_nip_rs_hard_delete ON events_p2026_06;
         ALTER TABLE events ATTACH PARTITION events_p2026_06
             FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
@@ -143,6 +150,7 @@ BEGIN
         DROP TRIGGER IF EXISTS trg_events_guard_channel_roster_snapshot ON events_p_future;
         DROP TRIGGER IF EXISTS trg_events_nip_rs_watermark ON events_p_future;
         DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_nip_rs ON events_p_future;
+        DROP TRIGGER IF EXISTS trg_events_purge_soft_deleted_buzz_mesh_status ON events_p_future;
         DROP TRIGGER IF EXISTS trg_events_guard_nip_rs_hard_delete ON events_p_future;
         ALTER TABLE events ATTACH PARTITION events_p_future
             FOR VALUES FROM ('2026-07-01') TO (MAXVALUE);
@@ -658,5 +666,28 @@ BEGIN
     ) THEN
         RAISE EXCEPTION
             'event_idempotency_keys community created_at index is missing after pgschema apply';
+    END IF;
+END $$;
+
+-- pgschema places the partition key first in the generated events PK, even
+-- though schema.sql and migrations lead with the tenant. After attaching all
+-- partitions, restore the declared order atomically. This is a no-op for an
+-- already-converged database; the known reordered shape has identical logical
+-- uniqueness, so rebuilding it cannot admit duplicate events.
+DO $$
+DECLARE
+    actual_columns text[];
+BEGIN
+    SELECT array_agg(a.attname::text ORDER BY k.ordinality)
+      INTO actual_columns
+      FROM pg_constraint c
+      CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, ordinality)
+      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+     WHERE c.conrelid = 'events'::regclass AND c.contype = 'p';
+    IF actual_columns = ARRAY['created_at', 'community_id', 'id']::text[] THEN
+        ALTER TABLE events DROP CONSTRAINT events_pkey,
+            ADD CONSTRAINT events_pkey PRIMARY KEY (community_id, created_at, id);
+    ELSIF actual_columns IS DISTINCT FROM ARRAY['community_id', 'created_at', 'id']::text[] THEN
+        RAISE EXCEPTION 'events primary key has an unexpected shape after pgschema apply: %', actual_columns;
     END IF;
 END $$;

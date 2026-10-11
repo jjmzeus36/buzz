@@ -2602,6 +2602,7 @@ mod postgres_tests {
                     "guard_nip_rs_watermark",
                     "guard_nip_rs_hard_delete",
                     "purge_soft_deleted_nip_rs",
+                    "purge_soft_deleted_buzz_mesh_status",
                     "guard_event_mention_live",
                 ][..],
             )
@@ -2610,6 +2611,7 @@ mod postgres_tests {
                     "trg_events_nip_rs_watermark",
                     "trg_events_guard_nip_rs_hard_delete",
                     "trg_events_purge_soft_deleted_nip_rs",
+                    "trg_events_purge_soft_deleted_buzz_mesh_status",
                     "trg_event_mentions_require_live_event",
                 ][..],
             )
@@ -3065,6 +3067,7 @@ mod postgres_tests {
             "relay_admin_actions",
             "relay_admin_outbox",
             "relay_operator_audit",
+            "events",
         ] {
             assert_eq!(
                 columns(&desired, table).await,
@@ -3089,11 +3092,11 @@ mod postgres_tests {
             let migrated_guards = nip_rs_guard_catalog(&migrated)
                 .await
                 .map_err(|error| format!("read migrated NIP-RS guards: {error}"))?;
-            // Four functions, three event triggers on the parent and eight
+            // Five functions, four event triggers on the parent and eight
             // partitions, and one event_mentions trigger. Reject empty parity.
-            if migrated_guards.len() != 32 {
+            if migrated_guards.len() != 42 {
                 return Err(format!(
-                    "expected 32 migrated NIP-RS guard catalog rows, got {}",
+                    "expected 42 migrated retention guard catalog rows, got {}",
                     migrated_guards.len()
                 ));
             }

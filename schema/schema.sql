@@ -286,6 +286,8 @@ CREATE INDEX idx_events_not_before ON events (community_id, not_before)
 -- stays a single-column GIN. The search lane confirms the final spelling with
 -- EXPLAIN before its work lands (Quinn option A; Max's index-spelling caveat).
 CREATE INDEX idx_events_search_tsv ON events USING GIN (search_tsv);
+-- NIP-10/e-tag containment uses the same index as migrated databases.
+CREATE INDEX idx_events_tags_gin ON events USING GIN (tags jsonb_path_ops);
 
 -- ── Event mentions ────────────────────────────────────────────────────────────
 -- Conformance: "Channel-less global events and DMs" (#p fan-out). The join to
@@ -2107,3 +2109,28 @@ CREATE INDEX idx_relay_operator_audit_target
 INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('relay_operator_audit', 'deployment-global append-only roster mutation audit trail; no community_id intentionally');
 
+
+-- Purge superseded mesh heartbeats, including older soft-delete writers.
+CREATE FUNCTION purge_soft_deleted_buzz_mesh_status() RETURNS trigger AS $$
+BEGIN
+    IF OLD.deleted_at IS NULL
+       AND NEW.deleted_at IS NOT NULL
+       AND NEW.kind = 30003
+       AND NEW.d_tag LIKE 'buzz-mesh-member-status:%'
+       AND NEW.tags @> '[["k", "buzz-mesh-status"]]'::jsonb THEN
+        DELETE FROM events
+        WHERE community_id = NEW.community_id
+          AND created_at = NEW.created_at
+          AND id = NEW.id;
+
+        DELETE FROM event_mentions
+        WHERE community_id = NEW.community_id AND event_id = NEW.id;
+    END IF;
+
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status
+    AFTER UPDATE OF deleted_at ON events
+    FOR EACH ROW EXECUTE FUNCTION purge_soft_deleted_buzz_mesh_status();
