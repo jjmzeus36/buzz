@@ -11,7 +11,6 @@ import {
 } from "@/features/messages/lib/threading";
 import { shouldNotifyForEvent } from "@/features/notifications/lib/shouldNotify";
 import { relayClient } from "@/shared/api/relayClient";
-import { MAX_EXPLICIT_CHANNEL_VALUES } from "@/shared/api/relayClientShared";
 import {
   CHANNEL_EVENT_KINDS,
   CHANNEL_MESSAGE_EVENT_KINDS,
@@ -23,6 +22,7 @@ import {
   type TrailingDebounce,
 } from "@/shared/lib/trailingDebounce";
 
+import { createChannelMetadataSubscriptions } from "./channelMetadataSubscriptions";
 import { isDmNotifiableKind } from "./isDmNotifiableKind";
 import { refreshChannelsWhenIdle } from "./refreshChannelsWhenIdle";
 
@@ -516,93 +516,28 @@ export function useLiveChannelUpdates(
     };
   }, [channelIdsKey]);
 
-  const metadataDisposeRef = React.useRef<(() => Promise<void>) | null>(null);
+  const metadataSubscriptionsRef = React.useRef<ReturnType<
+    typeof createChannelMetadataSubscriptions
+  > | null>(null);
   const metadataSyncQueueRef = React.useRef(Promise.resolve());
   React.useEffect(() => {
     let isCancelled = false;
-    let pendingDispose: (() => Promise<void>) | null = null;
     let retryTimeout: number | undefined;
     let retryAttempt = 0;
     const channelIds = channelIdsKey ? channelIdsKey.split(",") : [];
-    const chunks: string[][] = [];
-    for (
-      let start = 0;
-      start < channelIds.length;
-      start += MAX_EXPLICIT_CHANNEL_VALUES
-    ) {
-      chunks.push(channelIds.slice(start, start + MAX_EXPLICIT_CHANNEL_VALUES));
-    }
-
-    const syncMetadata = async () => {
-      const disposers: (() => Promise<void>)[] = [];
-      const admissionWaiters = new Set<(admitted: boolean) => void>();
-      let isRetired = false;
-      const dispose = async () => {
-        isRetired = true;
-        for (const resolve of admissionWaiters) resolve(false);
-        admissionWaiters.clear();
-        await Promise.allSettled(
-          disposers.splice(0).map((cleanup) => cleanup()),
-        );
-      };
-      pendingDispose = dispose;
-      let anyFailed = false;
-      await Promise.allSettled(
-        chunks.map(async (chunk) => {
-          const subscribedIds = new Set(chunk);
-          let resolveAdmission = (_admitted: boolean) => {};
-          const admission = new Promise<boolean>((resolve) => {
-            resolveAdmission = (admitted) => {
-              admissionWaiters.delete(resolveAdmission);
-              resolve(admitted);
-            };
-            admissionWaiters.add(resolveAdmission);
-          });
-          try {
-            const unsubscribe = await relayClient.subscribeLive(
-              { kinds: [CHANNEL_METADATA_KIND], "#d": chunk, limit: 0 },
-              (event) => {
-                if (!isRetired) handleChannelMetadata(event, subscribedIds);
-              },
-              (readiness) => {
-                if (readiness === "eose") resolveAdmission(true);
-                if (readiness === "closed") resolveAdmission(false);
-              },
-            );
-            disposers.push(unsubscribe);
-            if (isRetired) await dispose();
-            // The disposer promise also fulfills on CLOSED or a readiness
-            // timeout. Keep unknown admission pending until actual EOSE, CLOSED
-            // or cancellation; a fallback timer must not retire prior coverage.
-            if (!(await admission)) {
-              anyFailed = true;
-              await dispose();
-            }
-          } catch (error) {
-            anyFailed = true;
-            await dispose();
-            console.error("Failed to subscribe to channel metadata", error);
-          }
-        }),
+    const manager =
+      metadataSubscriptionsRef.current ??
+      createChannelMetadataSubscriptions(
+        (filter, onEvent, onReady) =>
+          relayClient.subscribeLive(filter, onEvent, onReady),
+        (event, ids) => handleChannelMetadata(event, ids),
       );
-      pendingDispose = null;
-      if (isCancelled || anyFailed) {
-        await dispose();
-        return !anyFailed;
-      }
-      // Replace the whole metadata generation only after every chunk is ready.
-      // A failed attempt retains the previous coverage and retires all partial
-      // additions, keeping overlap bounded to two generations.
-      const previous = metadataDisposeRef.current;
-      metadataDisposeRef.current = dispose;
-      await previous?.();
-      return true;
-    };
+    metadataSubscriptionsRef.current = manager;
     const runSync = async () => {
-      // Readiness can be pending when membership changes again. Serialize
-      // generations so retired requests finish closing before another set opens.
+      // Serialize cancellation and swaps so only one candidate consumes an
+      // overlap slot. Earlier admitted chunks survive a later failed swap.
       const sync = metadataSyncQueueRef.current.then(() =>
-        isCancelled ? true : syncMetadata(),
+        isCancelled ? true : manager.sync(channelIds, () => isCancelled),
       );
       metadataSyncQueueRef.current = sync.then(
         () => {},
@@ -621,7 +556,7 @@ export function useLiveChannelUpdates(
     void runSync();
     return () => {
       isCancelled = true;
-      void pendingDispose?.();
+      manager.cancelPending();
       if (retryTimeout !== undefined) window.clearTimeout(retryTimeout);
     };
   }, [channelIdsKey]);
@@ -733,8 +668,7 @@ export function useLiveChannelUpdates(
         void dispose().catch(() => {});
       }
       liveSubsRef.current.clear();
-      void metadataDisposeRef.current?.();
-      metadataDisposeRef.current = null;
+      void metadataSubscriptionsRef.current?.dispose();
 
       const subs = mentionSubsRef.current;
       for (const dispose of subs.values()) {

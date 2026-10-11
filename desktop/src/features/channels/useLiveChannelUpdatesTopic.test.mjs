@@ -12,6 +12,7 @@ import { channelsQueryKey, useChannelDetailsQuery } from "./hooks.ts";
 import { useLiveChannelUpdates } from "./useLiveChannelUpdates.ts";
 import { getChannels, fromRawChannelDetail } from "@/shared/api/tauriChannels";
 import { relayClient } from "@/shared/api/relayClient";
+import { mountMetadataBudgetHarness } from "./channelMetadataTestHarness.mjs";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
@@ -573,17 +574,17 @@ test("400 joined channels with AppShell mentions keep metadata REQs within the r
     await act(async () => {});
     assert.equal(subscriptions.length, 804);
     const oldMetadata = [...metadata()];
-    const remaining = channels.slice(128);
+    const remaining = channels.slice(1);
     replacementReady = deferred();
     view.rerender({ joined: remaining });
     await waitFor(() =>
       assert.equal(
         subscriptions.filter((entry) => entry.type === "metadata").length,
-        7,
+        5,
       ),
     );
     assert.ok(oldMetadata.every((entry) => entry.disposed === 0));
-    assert.equal(metadata().length, 7);
+    assert.equal(metadata().length, 5);
     assert.equal(
       active().filter((entry) => entry.type === "events").length,
       remaining.length,
@@ -598,7 +599,7 @@ test("400 joined channels with AppShell mentions keep metadata REQs within the r
     assert.equal(invalidations.length, 0);
     // The prior generation still covers remaining members while replacements wait.
     await act(async () =>
-      oldMetadata[1].onEvent(canonicalMetadata(remaining[0].id)),
+      oldMetadata[0].onEvent(canonicalMetadata(remaining[0].id)),
     );
     assert.deepEqual(
       invalidations.map((filter) => filter.queryKey),
@@ -608,19 +609,17 @@ test("400 joined channels with AppShell mentions keep metadata REQs within the r
     view.rerender({ joined: remaining.slice(1) });
     view.rerender({ joined: remaining });
     await act(async () => {});
-    assert.equal(metadata().length, 7);
+    assert.equal(metadata().length, 5);
     await act(async () => replacementReady.resolve());
-    await waitFor(() =>
-      assert.ok(oldMetadata.every((entry) => entry.disposed === 1)),
-    );
-    assert.equal(metadata().length, 3);
+    await waitFor(() => assert.equal(oldMetadata[0].disposed, 1));
+    assert.equal(metadata().length, 4);
     assert.deepEqual(
       new Set(metadata().flatMap((entry) => entry.filter["#d"])),
       new Set(remaining.map((channel) => channel.id)),
     );
     const beforeRetired = invalidations.length;
     await act(async () =>
-      oldMetadata[1].onEvent(canonicalMetadata(remaining[0].id)),
+      oldMetadata[0].onEvent(canonicalMetadata(remaining[0].id)),
     );
     assert.equal(invalidations.length, beforeRetired);
     // Removing every member retires both kinds of scoped filters and mentions.
@@ -634,7 +633,7 @@ test("400 joined channels with AppShell mentions keep metadata REQs within the r
     view.unmount();
     assert.ok(subscriptions.every((entry) => entry.disposed === 1));
     assert.ok(
-      peakActive <= 808,
+      peakActive <= 805,
       `peak ${peakActive} exceeds bounded metadata overlap`,
     );
     assert.ok(peakActive <= 1024, "exceeds relay persistent subscription cap");
@@ -645,7 +644,7 @@ test("400 joined channels with AppShell mentions keep metadata REQs within the r
   }
 });
 
-test("failed metadata generation retires partial chunks and preserves previous coverage", async () => {
+test("failed metadata replacement retires its candidate and preserves previous coverage", async () => {
   const { act, renderHook, waitFor } = await import("@testing-library/react");
   const channels = joinedChannels(129);
   const metadata = [];
@@ -661,8 +660,7 @@ test("failed metadata generation retires partial chunks and preserves previous c
       const entry = { filter, onEvent, disposed: 0 };
       metadata.push(entry);
       if (failReplacement) {
-        if (filter["#d"].length === 128) await ready.promise;
-        else throw new Error("replacement metadata admission failed");
+        throw new Error("replacement metadata admission failed");
       }
       onReady?.("eose");
       return async () => {
@@ -685,9 +683,8 @@ test("failed metadata generation retires partial chunks and preserves previous c
     await act(async () => {});
     failReplacement = true;
     view.rerender({ joined: [...channels, ...joinedChannels(130).slice(129)] });
-    await waitFor(() => assert.equal(metadata.length, 4));
+    await waitFor(() => assert.equal(metadata.length, 3));
     await act(async () => ready.resolve());
-    await waitFor(() => assert.equal(metadata[2].disposed, 1));
     assert.equal(metadata[0].disposed, 0);
     assert.equal(metadata[1].disposed, 0);
     await act(async () =>
@@ -721,28 +718,30 @@ async function mountProductionMetadataHarness(rejection) {
   const subscribeSpy = mock.method(relayClient, "subscribeLive");
   // Keep production subscribeLive, readiness, CLOSED policy, recovery timers,
   // event dispatch and disposers. Replace only connection establishment/wire.
-  mock.method(relayClient, "sendRawWithReconnectRetry", async (payload) => {
-    assert.equal(payload[0], "REQ");
-    const [, subId, filter] = payload;
-    if (filter.kinds.includes(39000)) {
-      const entry = { subId, filter, closed: 0 };
-      metadata.push(entry);
-      if (failReplacement && filter["#d"].length < 128) {
-        if (rejection !== "timeout") {
-          await relayClient.handleWsMessage(
-            JSON.stringify(["CLOSED", subId, rejection]),
-            relayClient.connectionGeneration,
-          );
+  mock.method(
+    relayClient,
+    "sendRawWithReconnectRetry",
+    async (subId, filter) => {
+      if (filter.kinds.includes(39000)) {
+        const entry = { subId, filter, closed: 0 };
+        metadata.push(entry);
+        if (failReplacement && filter["#d"].length < 128) {
+          if (rejection !== "timeout") {
+            await relayClient.handleWsMessage(
+              JSON.stringify(["CLOSED", subId, rejection]),
+              relayClient.connectionGeneration,
+            );
+          }
+          return;
         }
-        return;
       }
-    }
-    server.set(subId, filter);
-    await relayClient.handleWsMessage(
-      JSON.stringify(["EOSE", subId]),
-      relayClient.connectionGeneration,
-    );
-  });
+      server.set(subId, filter);
+      await relayClient.handleWsMessage(
+        JSON.stringify(["EOSE", subId]),
+        relayClient.connectionGeneration,
+      );
+    },
+  );
   mock.method(relayClient, "closeSubscription", async (subId) => {
     server.delete(subId);
     const entry = metadata.find((item) => item.subId === subId);
@@ -777,7 +776,7 @@ async function mountProductionMetadataHarness(rejection) {
     activeMetadata,
     emitCanonical,
     waitForDisposers: () =>
-      Promise.all(
+      Promise.allSettled(
         subscribeSpy.mock.calls
           .filter((call) => call.arguments[0].kinds.includes(39000))
           .map((call) => call.result),
@@ -806,7 +805,7 @@ async function mountProductionMetadataHarness(rejection) {
 
 for (const rejection of [
   "error: database error",
-  "restricted: too many subscriptions",
+  "error: too many subscriptions",
 ]) {
   test(`production metadata replacement ${rejection} retains prior coverage until fresh EOSE`, async () => {
     const { act, waitFor } = await import("@testing-library/react");
@@ -814,15 +813,28 @@ for (const rejection of [
     try {
       assert.equal(harness.activeMetadata().length, 2);
       harness.beginFailure();
-      await waitFor(() => assert.equal(harness.metadata.length, 4));
-      // One candidate really reached EOSE; the other fulfilled its disposer
-      // promise on production CLOSED.
-      await act(async () => harness.waitForDisposers());
+      await waitFor(() => assert.equal(harness.metadata.length, 3));
+      // CLOSED never admits the replacement. A terminal cap rejection removes
+      // its registry entry, so the session guard rejects that subscribe promise.
+      await act(async () => {
+        const results = await harness.waitForDisposers();
+        assert.equal(
+          results.at(-1).status,
+          rejection === "error: too many subscriptions"
+            ? "rejected"
+            : "fulfilled",
+        );
+      });
       assert.deepEqual(
         harness.old.map((entry) => entry.closed),
         [0, 0],
       );
-      await waitFor(() => assert.equal(harness.metadata[2].closed, 1));
+      await waitFor(() =>
+        assert.equal(
+          harness.metadata[2].closed,
+          rejection === "error: database error" ? 1 : 0,
+        ),
+      );
       assert.equal(harness.activeMetadata().length, 2);
       assert.ok(
         harness.metadata
@@ -837,14 +849,14 @@ for (const rejection of [
         "canonical updates remain covered during admission failure",
       );
       harness.recover();
-      await waitFor(
-        () => assert.ok(harness.old.every((entry) => entry.closed === 1)),
-        { timeout: 2000 },
-      );
-      assert.equal(harness.metadata.length, 6);
+      await waitFor(() => assert.equal(harness.old[1].closed, 1), {
+        timeout: 2000,
+      });
+      assert.equal(harness.old[0].closed, 0, "unchanged chunk is reused");
+      assert.equal(harness.metadata.length, 4);
       assert.equal(harness.activeMetadata().length, 2);
       assert.ok(
-        harness.metadata.slice(4).every((entry) => entry.filter.limit === 0),
+        harness.metadata.slice(3).every((entry) => entry.filter.limit === 0),
       );
       await act(async () => harness.emitCanonical(joinedChannels(130)[129].id));
       assert.equal(harness.invalidations.length, 2);
@@ -853,8 +865,8 @@ for (const rejection of [
         await relayClient.handleWsMessage(
           JSON.stringify([
             "EVENT",
-            harness.old[0].subId,
-            canonicalMetadata(harness.channels[0].id),
+            harness.old[1].subId,
+            canonicalMetadata(harness.channels[128].id),
           ]),
           relayClient.connectionGeneration,
         );
@@ -912,7 +924,7 @@ test("production readiness timeout retains previous chunks until late EOSE", asy
   const harness = await mountProductionMetadataHarness("timeout");
   try {
     harness.beginFailure();
-    await waitFor(() => assert.equal(harness.metadata.length, 4));
+    await waitFor(() => assert.equal(harness.metadata.length, 3));
     // Await the real subscribeLive promises, including its 250 ms fallback.
     // This is disposer availability, not confirmation that the REQ was admitted.
     await act(async () => harness.waitForDisposers());
@@ -920,21 +932,19 @@ test("production readiness timeout retains previous chunks until late EOSE", asy
       harness.old.map((entry) => entry.closed),
       [0, 0],
     );
-    assert.equal(harness.activeMetadata().length, 3);
+    assert.equal(harness.activeMetadata().length, 2);
     await act(async () => harness.emitCanonical(harness.channels[0].id));
-    assert.equal(harness.invalidations.length, 2);
+    assert.equal(harness.invalidations.length, 1);
     await act(async () => harness.admitPending());
-    await waitFor(() =>
-      assert.ok(harness.old.every((entry) => entry.closed === 1)),
-    );
+    await waitFor(() => assert.equal(harness.old[1].closed, 1));
     assert.equal(
       harness.metadata.length,
-      4,
+      3,
       "late EOSE admits the original candidates without a fresh generation",
     );
     assert.equal(harness.activeMetadata().length, 2);
     await act(async () => harness.emitCanonical(joinedChannels(130)[129].id));
-    assert.equal(harness.invalidations.length, 3);
+    assert.equal(harness.invalidations.length, 2);
   } finally {
     harness.close();
   }
@@ -945,7 +955,7 @@ test("unmount cancels an unknown production admission wait and both metadata gen
   const harness = await mountProductionMetadataHarness("timeout");
   try {
     harness.beginFailure();
-    await waitFor(() => assert.equal(harness.metadata.length, 4));
+    await waitFor(() => assert.equal(harness.metadata.length, 3));
     await act(async () => harness.waitForDisposers());
     assert.deepEqual(
       harness.old.map((entry) => entry.closed),
@@ -967,14 +977,20 @@ test("membership change cancels unknown admission before opening the next metada
   const harness = await mountProductionMetadataHarness("timeout");
   try {
     harness.beginFailure();
-    await waitFor(() => assert.equal(harness.metadata.length, 4));
+    await waitFor(() => assert.equal(harness.metadata.length, 3));
     await act(async () => harness.waitForDisposers());
     const cancelledGeneration = harness.metadata.slice(2);
     harness.recover();
     harness.view.rerender({ joined: harness.channels });
-    await waitFor(() => assert.equal(harness.metadata.length, 6));
-    await waitFor(() =>
-      assert.ok(harness.old.every((entry) => entry.closed === 1)),
+    await waitFor(() => assert.equal(cancelledGeneration[0].closed, 1));
+    assert.equal(
+      harness.metadata.length,
+      3,
+      "returning to admitted membership reuses both chunks",
+    );
+    assert.deepEqual(
+      harness.old.map((entry) => entry.closed),
+      [0, 0],
     );
     assert.ok(cancelledGeneration.every((entry) => entry.closed === 1));
     assert.equal(harness.activeMetadata().length, 2);
@@ -988,3 +1004,162 @@ test("membership change cancels unknown admission before opening the next metada
     harness.close();
   }
 });
+
+for (const addedId of [
+  "00000000-0000-3000-8000-ffffffffffff",
+  "ffffffff-ffff-4fff-8fff-ffffffffffff",
+]) {
+  test(`499 to 500 members cover ${addedId} within the global subscription cap`, async () => {
+    const { act } = await import("@testing-library/react");
+    const channels = joinedChannels(499);
+    const harness = await mountMetadataBudgetHarness(channels);
+    try {
+      const old = harness.metadata().map(([id]) => id);
+      const next = [...channels, { ...channels[0], id: addedId }];
+      await act(async () => harness.update(next));
+      await harness.settle(next);
+      const current = new Set(harness.metadata().map(([id]) => id));
+      assert.equal(old.filter((id) => current.has(id)).length, 3);
+      assert.equal(harness.server.size, 1021);
+      assert.ok(
+        harness.peak() <= 1022,
+        `global peak ${harness.peak()} exceeds one overlap slot`,
+      );
+      assert.equal(
+        harness.requests.filter(({ filter }) => filter.kinds.includes(39000))
+          .length,
+        5,
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+}
+
+for (const outcome of ["closed", "throw", "pending"]) {
+  test(`a later ${outcome} preserves earlier admitted swaps and surviving coverage`, async () => {
+    const { act, waitFor } = await import("@testing-library/react");
+    mock.method(console, "error", () => {});
+    const channels = joinedChannels(499);
+    const harness = await mountMetadataBudgetHarness(channels);
+    try {
+      const old = harness.metadata().map(([id]) => id);
+      let candidates = 0;
+      harness.control(() => (++candidates === 2 ? outcome : undefined));
+      const reduced = channels.filter(
+        (_, index) => index !== 0 && index !== 128,
+      );
+      await act(async () => harness.update(reduced));
+      await waitFor(() => assert.equal(candidates, 2));
+      await waitFor(() => assert.equal(harness.server.has(old[0]), false));
+      assert.equal(
+        harness.server.has(old[1]),
+        true,
+        "failed donor keeps its prior coverage",
+      );
+      const committed = harness
+        .metadata()
+        .find(([, filter]) => filter["#d"].length === 127);
+      assert.ok(committed, "first EOSE was promoted before the later failure");
+      assert.deepEqual(harness.coverageErrors, []);
+      harness.control(() => undefined);
+      if (outcome === "pending") {
+        // Cancel the pending effect after its earlier swap was committed.
+        const cancelled = harness.requests.at(-1);
+        await act(async () => {
+          harness.update(channels);
+          assert.equal(
+            harness.server.has(committed[0]),
+            true,
+            "effect cancellation cannot retire committed chunks",
+          );
+        });
+        await harness.settle(channels);
+        await act(async () => harness.eose(cancelled));
+        await harness.settle(channels);
+      } else {
+        await harness.settle(reduced);
+        assert.equal(
+          harness.server.has(committed[0]),
+          false,
+          "safe compaction eventually repacks sparse chunks",
+        );
+      }
+      assert.ok(harness.peak() <= 1022);
+    } finally {
+      await harness.close();
+    }
+  });
+}
+
+test("sparse chunk compaction admits each recipient before shrinking its donor", async () => {
+  const { act } = await import("@testing-library/react");
+  const channels = joinedChannels(384);
+  const harness = await mountMetadataBudgetHarness(channels);
+  try {
+    // Three 80-member groups cannot be compacted by pairwise whole unions.
+    const next = channels.filter((_, index) => index % 128 < 80);
+    await act(async () => harness.update(next));
+    await harness.settle(next);
+    assert.deepEqual(
+      harness.metadata().map(([, filter]) => filter["#d"].length),
+      [128, 112],
+    );
+    assert.deepEqual(harness.coverageErrors, []);
+  } finally {
+    await harness.close();
+  }
+});
+
+for (const readiness of ["pending", "eose"]) {
+  test(`membership cancellation waits for production CLOSE after ${readiness}`, async () => {
+    const { act, waitFor } = await import("@testing-library/react");
+    const channels = joinedChannels(499);
+    const harness = await mountMetadataBudgetHarness(channels);
+    const closeStarted = deferred();
+    const closeFinished = deferred();
+    let closingId = harness.metadata().at(-1)[0];
+    try {
+      harness.closeControl((id) => {
+        if (id !== closingId) return;
+        closeStarted.resolve();
+        return closeFinished.promise;
+      });
+      harness.control(() => (readiness === "pending" ? "pending" : undefined));
+      await act(async () => harness.update(joinedChannels(500)));
+      await waitFor(() => assert.equal(harness.metadata().length, 5));
+      await act(async () => harness.waitForDisposers());
+      const candidate = harness.requests.findLast(({ filter }) =>
+        filter.kinds.includes(39000),
+      );
+      if (readiness === "pending") closingId = candidate.subId;
+      harness.control(() => undefined);
+      await act(async () => harness.update(joinedChannels(501)));
+      await closeStarted.promise;
+      assert.ok(harness.server.has(closingId), "CLOSE is still in flight");
+      assert.equal(
+        harness.requests.filter(({ filter }) => filter.kinds.includes(39000))
+          .length,
+        5,
+        "the serialized manager must await the retiring wire subscription",
+      );
+      await act(async () => closeFinished.resolve());
+      await harness.settle(joinedChannels(501));
+      assert.equal(
+        candidate.closed,
+        1,
+        "dispose the superseded candidate once",
+      );
+      assert.equal(harness.server.size, 1023);
+      assert.ok(harness.peak() <= 1024);
+      assert.equal(
+        harness.requests.filter(({ filter }) => filter.kinds.includes(39000))
+          .length,
+        6,
+      );
+    } finally {
+      closeFinished.resolve();
+      await harness.close();
+    }
+  });
+}
