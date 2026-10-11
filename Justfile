@@ -156,6 +156,7 @@ desktop-tauri-fmt:
 
 # Check desktop Tauri Rust formatting
 desktop-tauri-fmt-check:
+    node scripts/verify-vendored-neteq.mjs
     cargo fmt --manifest-path {{desktop_tauri_manifest}} --all -- --check
 
 # Format all code (Rust + Tauri Rust + Dart)

@@ -6072,11 +6072,8 @@ dependencies = [
 [[package]]
 name = "neteq"
 version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57fbe9601485d95750187c92344fa056e75055027b00e375c53d9f4b8b883112"
 dependencies = [
  "log",
- "ringbuf",
  "serde",
  "thiserror 1.0.69",
  "web-time",
@@ -8670,15 +8667,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "ringbuf"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79abed428d1fd2a128201cec72c5f6938e2da607c6f3745f769fabea399d950a"
-dependencies = [
- "crossbeam-utils",
 ]
 
 [[package]]
