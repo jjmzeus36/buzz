@@ -83,8 +83,8 @@ fn read_element_text(
     reader: &mut Reader<&[u8]>,
     start: &BytesStart<'_>,
 ) -> Result<String, MediaError> {
-    reader
-        .read_text(start.to_end().name())
+    let text = reader.read_text(start.to_end().name()).map_err(xml_error)?;
+    text.decode()
         .map(|text| text.into_owned())
         .map_err(xml_error)
 }
