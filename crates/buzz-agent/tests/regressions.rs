@@ -3334,6 +3334,18 @@ async fn handoff_cap_resets_per_turn_not_per_session() {
 /// It drives via `fake-mcp` — the same binary used in other multi-round tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn handoff_cap_binds_within_a_single_turn() {
+    assert_handoff_cap_binds_within_a_single_turn(false).await;
+}
+
+/// Hold the independent stderr collector until stdout has completed. The cap
+/// diagnostic must still be awaited rather than read from an immediate snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handoff_cap_binds_within_a_single_turn_waits_for_delayed_stderr() {
+    assert_handoff_cap_binds_within_a_single_turn(true).await;
+}
+
+async fn assert_handoff_cap_binds_within_a_single_turn(delay_stderr: bool) {
+    let (release_stderr, stderr_gate) = tokio::sync::oneshot::channel();
     // LLM call sequence in turn 2 (turn 1 seeds the usage):
     //  req 1: turn 1 complete()            → usage=950 (over threshold=900)
     //  req 2: turn 2 round 0 summarize()   → summary (handoff_attempts: 0→1)
@@ -3347,7 +3359,9 @@ async fn handoff_cap_binds_within_a_single_turn() {
     // on round 1's preflight (without usage, last_request_input_tokens is None
     // after the handoff clears it, and the byte-fallback won't fire on tiny history).
     let tool_call_with_usage = {
-        let mut v = openai_tool_call("tc-1", "test_tool", json!({}));
+        // Call the tool registered by the cap_test MCP server. An unregistered
+        // name is rejected before permission and cannot provide this barrier.
+        let mut v = openai_tool_call("tc-1", "cap_test__tool_0", json!({}));
         v["usage"] = json!({
             "prompt_tokens": 950u64,
             "completion_tokens": 5,
@@ -3363,7 +3377,7 @@ async fn handoff_cap_binds_within_a_single_turn() {
     ])
     .await;
 
-    let mut h = Harness::spawn_with_env(
+    let mut h = Harness::spawn_with_stderr_gate(
         &llm.url,
         &[
             ("BUZZ_AGENT_MAX_CONTEXT_TOKENS", "1000"),
@@ -3374,6 +3388,7 @@ async fn handoff_cap_binds_within_a_single_turn() {
                 &(16 * 1024 * 1024).to_string(),
             ),
         ],
+        delay_stderr.then_some(stderr_gate),
     )
     .await;
 
@@ -3421,32 +3436,21 @@ async fn handoff_cap_binds_within_a_single_turn() {
         )
         .await;
 
-    // Drain until the final response, approving tool-permission requests,
-    // capturing the activeRunId once it is broadcast, sending one steer,
-    // and verifying that it is accepted in the live run.
+    // Hold the tool permission until the steer is acknowledged. This keeps the
+    // run active and queues the steer after the round-0 handoff but before the
+    // round-1 cap check, independent of subprocess scheduling.
     let mut run_id: Option<String> = None;
     let mut steer_id: i64 = -1;
     let mut steer_accepted = false;
-    loop {
+    let mut turn_completed = false;
+    let mut pending_permission: Option<Value> = None;
+    while !turn_completed || !steer_accepted {
         let v = h.recv().await;
 
-        // Capture the run id from the first session/update that carries it,
-        // then immediately queue a steer.  This must happen before round 1 so
-        // the steer text is present but the cap check still fires — proving
-        // the counter is not reset by the steer path.
+        // The run id is advertised before the agent requests tool permission.
         if run_id.is_none() {
             if let Some(rid) = v["params"]["update"]["_meta"]["goose"]["activeRunId"].as_str() {
                 run_id = Some(rid.to_owned());
-                steer_id = h
-                    .send(
-                        "_goose/unstable/session/steer",
-                        json!({
-                            "sessionId": sid,
-                            "expectedRunId": rid,
-                            "prompt": [{"type":"text","text":"STEER-CANARY: also consider the edge case"}],
-                        }),
-                    )
-                    .await;
             }
         }
 
@@ -3462,11 +3466,29 @@ async fn handoff_cap_binds_within_a_single_turn() {
                 "steer must reference the live run id"
             );
             steer_accepted = true;
+            let permission = pending_permission
+                .take()
+                .expect("tool permission must remain held until the steer acknowledgement");
+            h.write(approve_permission(&permission)).await;
             continue;
         }
 
         if v.get("method") == Some(&json!("session/request_permission")) {
-            h.write(approve_permission(&v)).await;
+            assert_eq!(steer_id, -1, "expected exactly one tool-permission request");
+            let rid = run_id
+                .as_deref()
+                .expect("the live run id must be advertised before tool permission");
+            steer_id = h
+                .send(
+                    "_goose/unstable/session/steer",
+                    json!({
+                        "sessionId": sid,
+                        "expectedRunId": rid,
+                        "prompt": [{"type":"text","text":"STEER-CANARY: also consider the edge case"}],
+                    }),
+                )
+                .await;
+            pending_permission = Some(v);
             continue;
         }
         if v["id"] == json!(p2) {
@@ -3474,7 +3496,7 @@ async fn handoff_cap_binds_within_a_single_turn() {
                 v.get("result").is_some(),
                 "turn 2 must succeed even when cap blocks round-1 handoff; got: {v}"
             );
-            break;
+            turn_completed = true;
         }
     }
 
@@ -3484,13 +3506,43 @@ async fn handoff_cap_binds_within_a_single_turn() {
     );
 
     // 4 LLM requests: seed + summarize + tool-call-with-usage + final-complete.
-    let count = llm.captured.lock().await.len();
+    let captured = llm.captured.lock().await;
+    let count = captured.len();
     assert_eq!(
         count, 4,
         "expected 4 LLM requests (seed + summarize + tool-call + final); got {count}"
     );
 
-    let stderr = h.stderr_text();
+    assert!(
+        captured[3]["messages"].as_array().is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "user"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("STEER-CANARY"))
+            })
+        }),
+        "the accepted steer must be folded into the final LLM request"
+    );
+    drop(captured);
+
+    let stderr = {
+        let wait = h.wait_for_stderr("handoff cap reached", Duration::from_secs(5));
+        tokio::pin!(wait);
+        if delay_stderr {
+            assert!(
+                !h.stderr_text().contains("handoff cap reached"),
+                "the old immediate snapshot must miss the held cap diagnostic"
+            );
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(wait.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            release_stderr.send(()).expect("release stderr collection");
+        }
+        wait.await
+    };
     assert!(
         stderr.contains("handoff cap reached"),
         "expected cap-reached WARN in stderr; got: {stderr}"
