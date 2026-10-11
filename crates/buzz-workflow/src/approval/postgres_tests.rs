@@ -489,6 +489,119 @@ async fn revoked_owner_or_edited_definition_cannot_execute_approved_work() {
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
+async fn restricted_owner_cannot_resume_or_authorize_a_new_run() {
+    for restriction in ["ban", "timeout", "inherited_ban", "archive"] {
+        let f = Fixture::new(false).await;
+        let approval = f.suspend().await;
+        f.decide(&approval, ApprovalStatus::Granted, &f.member)
+            .await
+            .unwrap();
+        match restriction {
+            "ban" => f
+                .engine
+                .db
+                .ban_community_member(f.community, &f.owner, &f.member, None, None)
+                .await
+                .unwrap(),
+            "timeout" => f
+                .engine
+                .db
+                .timeout_community_member(
+                    f.community,
+                    &f.owner,
+                    &f.member,
+                    Utc::now() + chrono::Duration::hours(1),
+                    None,
+                )
+                .await
+                .unwrap(),
+            "inherited_ban" => {
+                f.engine
+                    .db
+                    .set_agent_owner(f.community, &f.owner, &f.member)
+                    .await
+                    .unwrap();
+                f.engine
+                    .db
+                    .ban_community_member(f.community, &f.member, &f.member, None, None)
+                    .await
+                    .unwrap();
+            }
+            "archive" => f
+                .engine
+                .db
+                .archive_channel(f.community, f.channel)
+                .await
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        // Membership remains intact: restrictions must independently revoke authority.
+        assert!(f
+            .engine
+            .db
+            .get_member_role(f.community, f.channel, &f.owner)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            f.engine
+                .check_owner_authority(f.community, f.channel, &f.owner, &f.definition)
+                .await
+                .is_err(),
+            "{restriction} must deny a new run"
+        );
+        f.restart().resume_approval(f.community, f.run).await;
+        let run = f
+            .engine
+            .db
+            .get_workflow_run(f.community, f.run)
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Failed, "{restriction}");
+        assert_eq!(run.error_code.as_deref(), Some("owner_unauthorized"));
+        assert!(f.sink.0.lock().unwrap().is_empty(), "{restriction}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn expired_and_other_tenant_restrictions_do_not_block_approval_resume() {
+    let f = Fixture::new(false).await;
+    let approval = f.suspend().await;
+    f.decide(&approval, ApprovalStatus::Granted, &f.member)
+        .await
+        .unwrap();
+    let past = Utc::now() - chrono::Duration::hours(1);
+    f.engine
+        .db
+        .ban_community_member(f.community, &f.owner, &f.member, None, Some(past))
+        .await
+        .unwrap();
+    f.engine
+        .db
+        .timeout_community_member(f.community, &f.owner, &f.member, past, None)
+        .await
+        .unwrap();
+    let neighbor = Fixture::new(false).await;
+    neighbor
+        .engine
+        .db
+        .ban_community_member(neighbor.community, &f.owner, &neighbor.member, None, None)
+        .await
+        .unwrap();
+    f.restart().resume_approval(f.community, f.run).await;
+    let run = f
+        .engine
+        .db
+        .get_workflow_run(f.community, f.run)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(f.sink.0.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
 async fn failed_approval_insert_rolls_back_run_suspension() {
     let f = Fixture::new(false).await;
     let result =

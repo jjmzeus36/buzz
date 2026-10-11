@@ -46,8 +46,10 @@ one run each create a separate checkpoint.
 
 Resume checks the saved definition, channel, and owner against the current
 workflow and rechecks current owner authority before every remaining action.
-Edits, disabling, ownership changes, removal from the channel, or loss of the
-elevated role required for webhooks fail closed. A missing or malformed checkpoint
+Edits, disabling, ownership changes, removal from the channel, channel archival,
+active bans (including a persisted agent owner's ban), timeouts, or loss of the
+elevated role required for webhooks fail closed. Expired and other-community
+restrictions do not revoke authority. A missing or malformed checkpoint
 or trigger context fails visibly rather than substituting empty execution data.
 
 Recovery covers waiting gates and grants committed before execution is claimed.
