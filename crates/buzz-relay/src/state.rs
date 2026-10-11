@@ -687,12 +687,12 @@ pub struct AppState {
     /// cross-community non-interference violation. Entries expire after 60
     /// seconds via moka's TTL eviction — bounded regardless of subscriber health.
     pub local_event_ids: Arc<moka::sync::Cache<(CommunityId, [u8; 32]), ()>>,
-    /// Membership cache: (community_id, channel_id, pubkey_bytes) → is_member.
-    /// Short TTL (10s) — membership changes are rare but must propagate.
+    /// Legacy membership cache, retained for invalidation protocol compatibility.
+    /// Authorization never reads or fills it; stale positives cannot grant access.
     #[allow(clippy::type_complexity)]
     pub membership_cache: Arc<moka::sync::Cache<(CommunityId, Uuid, Vec<u8>), bool>>,
-    /// Accessible channel IDs cache: (community_id, pubkey_bytes) → channel UUIDs.
-    /// Short TTL (10s) — invalidated on membership or channel visibility changes.
+    /// Legacy accessible-channel cache, retained for invalidation compatibility.
+    /// Read scopes are resolved from the writer database, never from this cache.
     #[allow(clippy::type_complexity)]
     pub accessible_channels_cache: Arc<moka::sync::Cache<(CommunityId, Vec<u8>), Vec<Uuid>>>,
     /// Per-community channel visibility string, used to gate the private-channel fan-out
@@ -998,22 +998,19 @@ impl AppState {
             .insert((community, event_id.to_bytes()), ());
     }
 
-    /// Check channel membership with a 10-second cache. Falls back to DB on miss.
+    /// Check current membership on the writer database.
+    ///
+    /// Authorization cannot rely on a positive TTL cache: Redis invalidation is
+    /// lossy, and an older in-flight fill can finish after revocation. Keep the
+    /// historical API name while callers migrate, but never consult or populate
+    /// the membership cache for an authorization decision.
     pub async fn is_member_cached(
         &self,
         community_id: CommunityId,
         channel_id: Uuid,
         pubkey: &[u8],
     ) -> Result<bool, buzz_db::DbError> {
-        let key = (community_id, channel_id, pubkey.to_vec());
-        if let Some(cached) = self.membership_cache.get(&key) {
-            metrics::counter!("buzz_membership_cache_hits_total").increment(1);
-            return Ok(cached);
-        }
-        metrics::counter!("buzz_membership_cache_misses_total").increment(1);
-        let result = self.db.is_member(community_id, channel_id, pubkey).await?;
-        self.membership_cache.insert(key, result);
-        Ok(result)
+        self.db.is_member(community_id, channel_id, pubkey).await
     }
 
     /// Invalidate caches after a membership change (add/remove member).
@@ -1021,7 +1018,8 @@ impl AppState {
     /// Drops the local moka entries AND fire-and-forget publishes the same drop
     /// to every other pod over Redis (see [`apply_cache_invalidation`]). The
     /// publish is spawned, not awaited: the local drop is already done, and a
-    /// dropped publish is backstopped by the REQ denial-path DB confirmation.
+    /// dropped publish cannot authorize access: membership and access-list gates
+    /// always read the writer database.
     pub fn invalidate_membership(&self, tenant: &TenantContext, channel_id: Uuid, pubkey: &[u8]) {
         self.invalidate_membership_local(tenant.community(), channel_id, pubkey);
         self.spawn_cache_invalidation(
@@ -1135,8 +1133,8 @@ impl AppState {
     }
 
     /// Fire-and-forget publish of a cache-key drop to all other pods. Failures
-    /// are logged and swallowed — the REQ denial-path DB confirmation is the
-    /// backstop, so a missed publish degrades to a <=10s TTL wait, never a leak.
+    /// are logged. Authorization reads membership from the writer database;
+    /// these messages only expedite eviction of non-authoritative cache state.
     fn spawn_cache_invalidation(&self, tenant: &TenantContext, invalidation: CacheInvalidation) {
         let pubsub = Arc::clone(&self.pubsub);
         let tenant = tenant.clone();
@@ -1260,24 +1258,18 @@ impl AppState {
         closed
     }
 
-    /// Get accessible channel IDs with a 10-second cache. Falls back to DB on miss.
+    /// Read current accessible channels from the writer database.
+    ///
+    /// This list scopes historical reads, search and counts, so stale positive
+    /// entries are not safe even when explicit channel filters are absent.
     pub async fn get_accessible_channel_ids_cached(
         &self,
         community_id: CommunityId,
         pubkey: &[u8],
     ) -> Result<Vec<Uuid>, buzz_db::DbError> {
-        let key = (community_id, pubkey.to_vec());
-        if let Some(cached) = self.accessible_channels_cache.get(&key) {
-            metrics::counter!("buzz_accessible_channels_cache_hits_total").increment(1);
-            return Ok(cached);
-        }
-        metrics::counter!("buzz_accessible_channels_cache_misses_total").increment(1);
-        let result = self
-            .db
+        self.db
             .get_accessible_channel_ids(community_id, pubkey)
-            .await?;
-        self.accessible_channels_cache.insert(key, result.clone());
-        Ok(result)
+            .await
     }
 
     /// Channel visibility string. Caches only `private` (10s); never caches a
