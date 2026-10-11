@@ -26,6 +26,8 @@ pub mod feed;
 pub mod git_repo;
 /// Keyed kind:9 event reservation and insert (NIP-MI).
 pub mod idempotency;
+/// Verified media baselines and durable quota admission.
+pub mod media_quota;
 /// Community moderation: reports, bans/timeouts, audit actions.
 pub mod moderation;
 /// Monthly table partition management.

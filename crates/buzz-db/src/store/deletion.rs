@@ -67,6 +67,8 @@ pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
     "events",
     "git_repo_names",
     "join_policy_acceptances",
+    "media_quota_objects",
+    "media_quota_accounts",
     "moderation_actions",
     "moderation_reports",
     "parameterized_event_watermarks",
@@ -98,6 +100,8 @@ pub const PURGE_SCOPED_TABLES: &[&str] = &[
     "api_tokens",
     "channel_members",
     "thread_metadata",
+    "media_quota_objects",
+    "media_quota_accounts",
     "moderation_actions",
     "workflows",
     "event_mentions",
@@ -3610,11 +3614,15 @@ mod tests {
 }
 
 #[cfg(test)]
+#[path = "deletion_quota_tests.rs"]
+mod additional_postgres_tests;
+
+#[cfg(test)]
 mod postgres_tests {
     use super::*;
     use crate::{CreateCommunityWithOwnerResult, Db, DbConfig};
 
-    async fn store() -> (Db, DeletionStore) {
+    pub(super) async fn store() -> (Db, DeletionStore) {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1 -- local test-only credentials
@@ -3653,7 +3661,7 @@ mod postgres_tests {
         }
     }
 
-    async fn inventoried_request(
+    pub(super) async fn inventoried_request(
         db: &Db,
         store: &DeletionStore,
     ) -> (DeletionRequest, FrozenInventory) {

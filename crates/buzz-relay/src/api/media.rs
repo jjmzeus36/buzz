@@ -315,8 +315,7 @@ fn serving_lease_lost(error: anyhow::Error) -> MediaError {
 ///   - Raw binary body (the file bytes)
 ///
 /// Returns a [`BlobDescriptor`] JSON on success.
-// TODO(v2): Add persistent per-pubkey storage quotas. Admission limits below
-// bound active parser/storage work, but they do not cap durable bytes stored.
+// Optional logical-byte quota admission runs after validation and before publication.
 pub async fn upload_blob(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedUpload,
@@ -329,6 +328,16 @@ pub async fn upload_blob(
         buzz_deletion::acquire_serving_write(&state.db, auth.tenant.community(), "media_upload")
             .await
             .map_err(serving_write_error)?;
+    let quota = state.config.media_quota.map(|policy| MediaQuotaAdmission {
+        db: state.db.clone(),
+        community: auth.tenant.community(),
+        pubkey: auth.auth_event.pubkey.to_bytes(),
+        policy,
+        serving_lease: serving_write.lease().clone(),
+    });
+    let admission = quota
+        .as_ref()
+        .map(|q| q as &dyn buzz_media::upload::UploadAdmission);
 
     if auth.route_mode == UploadRouteMode::LegacyMedia {
         metrics::counter!("buzz_media_legacy_upload_route_total").increment(1);
@@ -365,7 +374,7 @@ pub async fn upload_blob(
                     .get("content-length")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<u64>().ok());
-                buzz_media::process_video_upload(
+                buzz_media::upload::process_video_upload_admitted(
                     &state.media_storage,
                     &state.config.media,
                     &auth.tenant,
@@ -373,6 +382,7 @@ pub async fn upload_blob(
                     replay,
                     content_length,
                     attribution,
+                    admission,
                 )
                 .await?
             } else {
@@ -397,13 +407,14 @@ pub async fn upload_blob(
                 );
 
                 if is_image {
-                    buzz_media::process_upload(
+                    buzz_media::upload::process_upload_admitted(
                         &state.media_storage,
                         &state.config.media,
                         &auth.tenant,
                         &auth.auth_event,
                         bytes,
                         attribution,
+                        admission,
                     )
                     .await?
                 } else if auth.route_mode == UploadRouteMode::LegacyMedia {
@@ -412,13 +423,14 @@ pub async fn upload_blob(
                         .unwrap_or_else(|| "application/octet-stream".to_string());
                     return Err(MediaError::DisallowedContentType(mime));
                 } else {
-                    buzz_media::process_file_upload(
+                    buzz_media::upload::process_file_upload_admitted(
                         &state.media_storage,
                         &state.config.media,
                         &auth.tenant,
                         &auth.auth_event,
                         bytes,
                         attribution,
+                        admission,
                     )
                     .await?
                 }
@@ -1007,6 +1019,66 @@ fn extract_blossom_auth(headers: &HeaderMap) -> Result<nostr::Event, MediaError>
 
     Ok(event)
 }
+
+struct MediaQuotaAdmission {
+    db: buzz_db::Db,
+    community: buzz_core::CommunityId,
+    pubkey: [u8; 32],
+    policy: buzz_db::media_quota::QuotaPolicy,
+    serving_lease: buzz_db::deletion::ServingWriteLease,
+}
+fn quota_error(error: buzz_db::media_quota::QuotaError) -> MediaError {
+    match error {
+        buzz_db::media_quota::QuotaError::Exceeded => MediaError::QuotaExceeded,
+        _ => MediaError::QuotaUnavailable,
+    }
+}
+impl buzz_media::upload::UploadAdmission for MediaQuotaAdmission {
+    fn reserve<'a>(
+        &'a self,
+        hash: &'a str,
+        size: u64,
+    ) -> buzz_media::upload::AdmissionFuture<'a, Option<String>> {
+        Box::pin(async move {
+            self.db
+                .reserve_media_quota_with_lease(
+                    self.community,
+                    &self.pubkey,
+                    hash,
+                    size,
+                    self.policy,
+                    Some(&self.serving_lease),
+                )
+                .await
+                .map(|token| token.map(|id| id.to_string()))
+                .map_err(quota_error)
+        })
+    }
+    fn complete<'a>(
+        &'a self,
+        hash: &'a str,
+        token: String,
+    ) -> buzz_media::upload::AdmissionFuture<'a, ()> {
+        Box::pin(async move {
+            let operation =
+                uuid::Uuid::parse_str(&token).map_err(|_| MediaError::QuotaUnavailable)?;
+            self.db
+                .finish_media_quota_with_lease(
+                    self.community,
+                    &self.pubkey,
+                    hash,
+                    operation,
+                    Some(&self.serving_lease),
+                )
+                .await
+                .map_err(quota_error)
+        })
+    }
+}
+
+#[cfg(test)]
+#[path = "media_quota_tests.rs"]
+mod postgres_tests;
 
 #[cfg(test)]
 mod tests {
