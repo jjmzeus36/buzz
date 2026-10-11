@@ -41,6 +41,7 @@ jobs:
               - 'crates/**'
               - 'migrations/**'
               - 'schema/**'
+              - 'docs/nips/NIP-MP.fixtures.json'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
@@ -59,6 +60,9 @@ jobs:
               - '.github/workflows/ci.yml'
               - '.github/workflows/_ci-*.yml'
               - 'scripts/run-tests.sh'
+              - 'docker-compose.yml'
+              - 'deploy/s3-fixture/**'
+              - 'scripts/test-s3-fixture-private.sh'
               - 'scripts/model-capabilities.json'
               - 'scripts/normative-corpus.json'
               - 'Justfile'
@@ -117,48 +121,61 @@ jobs:
           scripts/test-rust-cache-contract-regressions.sh
       - name: CI required-context isolation contract
         run: scripts/test-ci-required-context-isolation.sh
-      - name: Embedded pgschema reconciliation cache contract
-        # catalog-parity compile-embeds this SQL via include_str!. A script-only
-        # PR must select the rust/backend lane; a script-only push must miss the
-        # archived-test cache rather than restore a binary with stale SQL.
+      - name: Embedded test input cache contract
+        # The archived tests compile-embed SQL and protocol fixtures. Changes to
+        # these inputs must select rust/backend and miss the archived-test cache.
         # The rust filter must list the exact tracked path Justfile; dorny v4
         # picomatch is case-sensitive (nocase defaults false). Cache keys live
         # in _ci-relay.yml, not in this orchestration workflow.
         run: |
           required="scripts/reconcile-schema-after-pgschema.sql"
+          schema="schema/schema.sql"
+          fixture="docs/nips/NIP-MP.fixtures.json"
           justfile="Justfile"
           workflow=".github/workflows/ci.yml"
           relay=".github/workflows/_ci-relay.yml"
-          awk -v req="$required" -v justfile="$justfile" \
-              -v workflow="$workflow" -v relay="$relay" '
+          awk -v req="$required" -v schema="$schema" -v fixture="$fixture" \
+              -v justfile="$justfile" -v workflow="$workflow" -v relay="$relay" '
             BEGIN {
-              item = "              - \047" req "\047"
-              just_item = "              - \047" justfile "\047"
+              rust_paths[req] = 0
+              rust_paths["schema/**"] = 0
+              rust_paths[fixture] = 0
+              rust_paths[justfile] = 0
+              embeds[req] = 0
+              embeds[schema] = 0
+              embeds[fixture] = 0
             }
             FNR == 1 { in_rust = 0 }
             FILENAME == workflow {
               if ($0 == "            rust:") { in_rust=1; next }
               if (in_rust && $0 ~ /^            [A-Za-z0-9_-]+:/) { in_rust=0 }
-              if (in_rust && $0 == item) { rust_hit=1 }
-              if (in_rust && $0 == just_item) { just_hit=1 }
+              if (in_rust) {
+                for (path in rust_paths) {
+                  if ($0 == "              - \047" path "\047") { rust_paths[path]=1 }
+                }
+              }
             }
             FILENAME == relay {
-              if (index($0, "key: relay-artifacts-") && index($0, "\047" req "\047")) { hash_hits++ }
+              if (index($0, "key: relay-artifacts-") && index($0, "hashFiles(")) {
+                for (path in embeds) {
+                  if (index($0, "\047" path "\047")) { embeds[path]++ }
+                }
+              }
             }
             END {
-              if (!rust_hit) {
-                print "error: rust path filter omits " req > "/dev/stderr"
-                exit 1
+              for (path in rust_paths) {
+                if (!rust_paths[path]) {
+                  print "error: rust path filter omits " path > "/dev/stderr"
+                  exit 1
+                }
               }
-              if (!just_hit) {
-                print "error: rust path filter omits " justfile > "/dev/stderr"
-                exit 1
+              for (path in embeds) {
+                if (embeds[path] != 2) {
+                  print "error: expected 2 relay-artifacts hashFiles keys containing " path ", found " embeds[path] > "/dev/stderr"
+                  exit 1
+                }
               }
-              if (hash_hits != 2) {
-                print "error: expected 2 relay-artifacts hashFiles keys containing " req ", found " (hash_hits+0) > "/dev/stderr"
-                exit 1
-              }
-              print "ok: " req " selects rust/backend and busts the archived-test cache"
+              print "ok: embedded test inputs select rust/backend and bust the archived-test cache"
             }
           ' "$workflow" "$relay"
       - name: File size policy

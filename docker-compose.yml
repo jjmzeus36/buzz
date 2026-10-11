@@ -101,21 +101,23 @@ services:
     restart: unless-stopped
 
   minio:
-    image: minio/minio:latest
+    # Keep the service name for existing dev/CI commands; use a maintained S3
+    # backend and a separate volume so historical MinIO data is never re-read.
+    image: rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
     container_name: buzz-minio
-    command: server /data --console-address ":9001"
+    command: /data
     environment:
-      MINIO_ROOT_USER: buzz_dev
-      MINIO_ROOT_PASSWORD: buzz_dev_secret
+      RUSTFS_ACCESS_KEY: buzz_dev
+      RUSTFS_SECRET_KEY: buzz_dev_secret
     ports:
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:9001:9001"
     volumes:
-      - minio-data:/data
+      - s3-fixture-data:/data
     networks:
       - buzz-net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9000/health"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -123,26 +125,33 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256m
+          memory: 1g
     labels:
       com.buzz.service: "minio"
       com.buzz.env: "dev"
     restart: unless-stopped
 
   minio-init:
-    image: minio/mc:latest
+    image: amazon/aws-cli:2.37.12@sha256:ce44b800602264c12298bbf3399055a4cefdb9ed4a098abe564afe26e7071bce
     container_name: buzz-minio-init
     depends_on:
       minio:
         condition: service_healthy
     networks:
       - buzz-net
-    entrypoint: >
-      /bin/sh -c "
-        mc alias set local http://minio:9000 buzz_dev buzz_dev_secret &&
-        mc mb --ignore-existing local/buzz-media &&
-        mc anonymous set none local/buzz-media
-      "
+    environment:
+      AWS_ACCESS_KEY_ID: buzz_dev
+      AWS_SECRET_ACCESS_KEY: buzz_dev_secret
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        set -eu;
+        if ! aws --endpoint-url http://minio:9000 s3api head-bucket --bucket buzz-media; then
+          aws --endpoint-url http://minio:9000 s3api create-bucket --bucket buzz-media;
+        fi;
+        aws --endpoint-url http://minio:9000 s3api delete-bucket-policy --bucket buzz-media
     labels:
       com.buzz.service: "minio-init"
       com.buzz.env: "dev"
@@ -178,6 +187,10 @@ volumes:
     name: buzz-minio-data
     labels:
       com.buzz.volume: "minio"
+  s3-fixture-data:
+    name: buzz-s3-fixture-data
+    labels:
+      com.buzz.volume: "s3-fixture"
   prometheus-data:
     name: buzz-prometheus-data
     labels:

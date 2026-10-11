@@ -19,6 +19,19 @@ export PGUSER="${PGUSER:-buzz}"
 export PGPASSWORD="${PGPASSWORD:-buzz_dev}"
 export PGDATABASE="${PGDATABASE:-buzz}"
 
+if ! command -v aws >/dev/null 2>&1; then
+  echo "error: AWS CLI v2 is required to seed the local S3 fixture" >&2
+  exit 1
+fi
+
+s3_cli() {
+  AWS_ACCESS_KEY_ID="${BUZZ_S3_ACCESS_KEY:-buzz_dev}" \
+    AWS_SECRET_ACCESS_KEY="${BUZZ_S3_SECRET_KEY:-buzz_dev_secret}" \
+    AWS_SESSION_TOKEN="" AWS_EC2_METADATA_DISABLED=true \
+    aws --endpoint-url "${BUZZ_S3_ENDPOINT:-http://localhost:9000}" \
+    --region "${BUZZ_S3_REGION:-us-east-1}" --no-cli-pager "$@"
+}
+
 if command -v psql >/dev/null 2>&1; then
   run_psql() {
     PGPASSWORD="${PGPASSWORD}" psql -h "${PGHOST}" -p "${PGPORT}" \
@@ -69,11 +82,11 @@ upload_fixture() {
   size="$(fixture_size "${path}")"
   sidecar="$(printf '{"dim":"%s","blurhash":"","thumb_url":"","ext":"%s","mime_type":"%s","size":%s,"uploaded_at":0}' \
     "${dimensions}" "${extension}" "${mime}" "${size}")"
-  docker exec -i buzz-minio mc pipe --quiet --attr "Content-Type=${mime}" \
-    "local/${BUZZ_S3_BUCKET:-buzz-media}/${hash}.${extension}" < "${path}"
-  printf '%s' "${sidecar}" | docker exec -i buzz-minio mc pipe --quiet \
-    --attr "Content-Type=application/json" \
-    "local/${BUZZ_S3_BUCKET:-buzz-media}/_meta/${community_id}/${hash}.json"
+  s3_cli s3 cp "${path}" "s3://${BUZZ_S3_BUCKET:-buzz-media}/${hash}.${extension}" \
+    --content-type "${mime}" --no-progress --only-show-errors
+  printf '%s' "${sidecar}" | s3_cli s3 cp - \
+    "s3://${BUZZ_S3_BUCKET:-buzz-media}/_meta/${community_id}/${hash}.json" \
+    --content-type application/json --no-progress --only-show-errors
 }
 
 fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/buzz-admin-feedback.XXXXXX")"
@@ -96,9 +109,8 @@ quality_image_hash="$(fixture_hash "${quality_image}")"
 composer_diagnostics_hash="$(fixture_hash "${composer_diagnostics}")"
 workspace_diagnostics_hash="$(fixture_hash "${workspace_diagnostics}")"
 
-if ! docker exec buzz-minio mc alias set local http://localhost:9000 \
-  "${BUZZ_S3_ACCESS_KEY:-buzz_dev}" "${BUZZ_S3_SECRET_KEY:-buzz_dev_secret}" >/dev/null; then
-  echo "error: local MinIO is unavailable; run just setup first" >&2
+if ! s3_cli s3api head-bucket --bucket "${BUZZ_S3_BUCKET:-buzz-media}" >/dev/null; then
+  echo "error: local S3 fixture is unavailable; run just setup first" >&2
   exit 1
 fi
 

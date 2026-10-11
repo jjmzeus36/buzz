@@ -90,8 +90,8 @@ function BackendSupportHint({ action }: { action: StepFormState["action"] }) {
     case "request_approval":
       return (
         <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs text-amber-700">
-          Backend note: approval gates still stop runs with WF-08; approval
-          records are not persisted yet.
+          The run waits for an approval decision. Use the Buzz CLI to approve or
+          deny it.
         </p>
       );
     default:
