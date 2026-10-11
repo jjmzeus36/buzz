@@ -49,8 +49,11 @@ impl WorkflowEngine {
         run_id: Uuid,
         definition: &WorkflowDef,
     ) -> Result<WorkflowRecord, WorkflowError> {
-        let run = self.db.get_workflow_run(community, run_id).await?;
-        let workflow = self.db.get_workflow(community, run.workflow_id).await?;
+        let workflow_id = self
+            .db
+            .get_workflow_run_workflow_id(community, run_id)
+            .await?;
+        let workflow = self.db.get_workflow(community, workflow_id).await?;
         let stored: WorkflowDef = serde_json::from_value(workflow.definition.clone())
             .map_err(|e| WorkflowError::InvalidDefinition(e.to_string()))?;
         if !workflow.enabled

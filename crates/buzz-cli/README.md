@@ -80,8 +80,9 @@ buzz dms list
 # Workflows
 buzz workflows list --channel <uuid>
 buzz workflows trigger --workflow <uuid>
-buzz workflows approve --token <uuid>
-buzz workflows approve --token <uuid> --approved false --note "needs revision"
+buzz workflows approve --approval-ref <64hex>
+buzz workflows approve --approval-ref <64hex> --approved false --note "needs revision"
+# --token remains an alias; legacy raw UUID tokens are hashed once.
 
 # Forum
 buzz messages vote --event <event-id> --direction up

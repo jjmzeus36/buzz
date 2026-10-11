@@ -1858,16 +1858,8 @@ mod workflows {
     /// assertion goes RED. Restore the `community_id` argument → GREEN. This is
     /// the exact invariant commit `c81b89355` documents at that call site.
     ///
-    /// NOTE — approval-token isolation is a **separate, not-yet-wire-live**
-    /// obligation, deliberately left as a `pending_lane` below. The grant
-    /// handler (`get_approval_by_stored_hash(community, hash)`) is already
-    /// community-scoped, but nothing *mints* a pending approval over the wire:
-    /// the executor's approval gate is an explicit TODO
-    /// (`crates/buzz-workflow/src/lib.rs` — "approval gates not yet implemented,
-    /// see WF-08") and `create_approval` is only reached from unit tests. A
-    /// green end-to-end approval-isolation test therefore cannot be exercised
-    /// today; writing one would violate this file's contract (a green run can
-    /// never be faked by an empty/DB-only body). It lands with WF-08.
+    /// Approval-reference confinement is exercised separately below, using a
+    /// gate minted by the production executor and the public run read models.
     #[tokio::test]
     #[ignore]
     async fn workflow_trigger_is_community_confined() {
@@ -1925,26 +1917,254 @@ mod workflows {
         );
     }
 
-    /// Obligation (approval-token half): an approval token (its stored hash)
-    /// minted under community A cannot be satisfied by a grant on host B, and
-    /// vice versa. The grant resolution is already community-scoped
-    /// (`get_approval_by_stored_hash(community, hash)`), but this half is
-    /// **not wire-live**: nothing mints a pending approval over the wire yet —
-    /// the executor approval gate is an explicit TODO (WF-08), and
-    /// `create_approval` is reached only from unit tests. Left as a precise
-    /// `pending_lane` so the WF-08 owner fills in *their* row; a green run can
-    /// never be faked by a DB-only/empty body. Depends on WF-08 (approval
-    /// minting), **not** buzz-db — the scoping fence it will exercise is
-    /// already landed.
-    #[tokio::test]
-    #[ignore]
-    async fn approval_token_is_community_confined() {
-        pending_lane(
-            "WF-08 (approval minting)",
-            "an approval token minted under A cannot be satisfied by a grant on host B — \
-             blocked until the executor approval gate (WF-08) mints pending approvals over \
-             the wire; the get_approval_by_stored_hash(community, hash) fence is already landed",
+    /// Perform a bounded wire request without hiding HTTP failures as empty data.
+    async fn approval_request(
+        request: reqwest::RequestBuilder,
+    ) -> (reqwest::StatusCode, serde_json::Value) {
+        let response = request
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect("approval conformance request");
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .expect("approval conformance response body");
+        let body = serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("approval response is not JSON: {error}: {text}"));
+        (status, body)
+    }
+
+    /// Normalize the production bridge's command rejection into an OK-like body.
+    async fn submit_approval_event(
+        http_base: &str,
+        keys: &Keys,
+        event: &nostr::Event,
+    ) -> serde_json::Value {
+        let (status, body) = approval_request(
+            reqwest::Client::new()
+                .post(format!("{http_base}/events"))
+                .header("X-Pubkey", keys.public_key().to_hex())
+                .header("Content-Type", "application/json")
+                .body(serde_json::to_string(event).expect("serialize approval probe event")),
+        )
+        .await;
+        if status.is_success() {
+            body
+        } else if status == reqwest::StatusCode::BAD_REQUEST {
+            serde_json::json!({ "accepted": false, "message": body["error"] })
+        } else {
+            panic!("approval command returned unexpected HTTP {status}: {body}");
+        }
+    }
+
+    fn approval_response_field(body: &serde_json::Value, field: &str) -> String {
+        assert_eq!(
+            body["accepted"], true,
+            "approval setup command rejected: {body}"
         );
+        let message = body["message"].as_str().expect("command response message");
+        let data: serde_json::Value = serde_json::from_str(
+            message
+                .strip_prefix("response:")
+                .expect("structured command response"),
+        )
+        .expect("command response JSON");
+        data[field]
+            .as_str()
+            .expect("command response identifier")
+            .to_owned()
+    }
+
+    /// Read the exact run and approval through the authorized production endpoints.
+    async fn approval_state(
+        http_base: &str,
+        keys: &Keys,
+        workflow_id: &str,
+        run_id: &str,
+    ) -> serde_json::Value {
+        let client = reqwest::Client::new();
+        let (status, runs) = approval_request(
+            client
+                .get(format!("{http_base}/workflows/{workflow_id}/runs"))
+                .header("X-Pubkey", keys.public_key().to_hex()),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "read workflow runs failed: {status}: {runs}"
+        );
+        let run = runs["runs"]
+            .as_array()
+            .expect("workflow run array")
+            .iter()
+            .find(|run| run["id"] == run_id)
+            .expect("triggered run is exposed by its workflow")
+            .clone();
+        let (status, approvals) = approval_request(
+            client
+                .get(format!(
+                    "{http_base}/workflows/{workflow_id}/runs/{run_id}/approvals"
+                ))
+                .header("X-Pubkey", keys.public_key().to_hex()),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "read run approvals failed: {status}: {approvals}"
+        );
+        serde_json::json!({ "run": run, "approvals": approvals["approvals"] })
+    }
+
+    async fn wait_for_approval_state(
+        http_base: &str,
+        keys: &Keys,
+        workflow_id: &str,
+        run_id: &str,
+        approval_status: &str,
+        run_status: &str,
+    ) -> serde_json::Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = approval_state(http_base, keys, workflow_id, run_id).await;
+            if state["run"]["status"] == run_status
+                && state["approvals"]
+                    .as_array()
+                    .is_some_and(|rows| rows.len() == 1)
+                && state["approvals"][0]["status"] == approval_status
+            {
+                return state;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "approval state did not settle: {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Exact-id queries prove rejected decisions did not leave command events.
+    async fn approval_command_events(
+        http_base: &str,
+        keys: &Keys,
+        event_id: &str,
+    ) -> Vec<serde_json::Value> {
+        let filters =
+            serde_json::json!([{ "ids": [event_id], "kinds": [46030, 46031], "limit": 1 }]);
+        let (status, events) = approval_request(
+            reqwest::Client::new()
+                .post(format!("{http_base}/query"))
+                .header("X-Pubkey", keys.public_key().to_hex())
+                .header("Content-Type", "application/json")
+                .body(serde_json::to_string(&filters).expect("serialize command id filter")),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "read command events failed: {status}: {events}"
+        );
+        events.as_array().expect("event query array").clone()
+    }
+
+    /// An approval reference minted under one host cannot authorize a decision on
+    /// the other host. The same signer owns the same channel UUID in both tenants,
+    /// removing membership and identity as alternative causes of the rejection.
+    /// Both directions are exercised. A member who is not the designated approver
+    /// is rejected in the owning tenant too. Each rejection preserves the waiting
+    /// state and leaves no command event; the identical cross-host grant then works
+    /// in its own tenant, proving the gate and decision were otherwise valid.
+    #[tokio::test]
+    #[ignore = "requires a two-host relay with dev bridge authentication and open enrollment"]
+    async fn approval_token_is_community_confined() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let http_a = to_http(&url_a());
+            let http_b = to_http(&url_b());
+            let owner = Keys::generate();
+            let other_member = Keys::generate();
+            let channel_id = uuid::Uuid::new_v4();
+            for http_base in [&http_a, &http_b] {
+                create_open_channel(http_base, &owner, channel_id).await;
+                let join = buzz_sdk::build_join(channel_id)
+                    .expect("build member join")
+                    .sign_with_keys(&other_member)
+                    .expect("sign member join");
+                let response = submit_approval_event(http_base, &other_member, &join).await;
+                assert_eq!(response["accepted"], true, "join approval channel: {response}");
+            }
+
+            for (home, foreign) in [(&http_a, &http_b), (&http_b, &http_a)] {
+                let workflow_id = uuid::Uuid::new_v4();
+                let yaml = format!(
+                    "name: approval-conformance-{workflow_id}\ntrigger:\n  on: webhook\nsteps:\n  - id: review\n    action: request_approval\n    from: '{}'\n    message: 'Approve this synthetic tenant probe?'\n    timeout: 1h\n  - id: done\n    action: delay\n    duration: 0s\n",
+                    owner.public_key().to_hex(),
+                );
+                let definition = buzz_sdk::build_workflow_def(channel_id, workflow_id, &yaml)
+                    .expect("build approval workflow")
+                    .sign_with_keys(&owner)
+                    .expect("sign approval workflow");
+                let response = submit_approval_event(home, &owner, &definition).await;
+                assert_eq!(approval_response_field(&response, "workflow_id"), workflow_id.to_string());
+                let trigger = buzz_sdk::build_workflow_trigger(workflow_id)
+                    .expect("build approval trigger")
+                    .sign_with_keys(&owner)
+                    .expect("sign approval trigger");
+                let response = submit_approval_event(home, &owner, &trigger).await;
+                let run_id = approval_response_field(&response, "run_id");
+                let pending = wait_for_approval_state(
+                    home, &owner, &workflow_id.to_string(), &run_id, "pending", "waiting_approval",
+                ).await;
+                let approval_ref = pending["approvals"][0]["approval_ref"]
+                    .as_str().expect("public approval reference");
+                assert_eq!(approval_ref.len(), 64);
+                assert!(approval_ref.chars().all(|value| value.is_ascii_hexdigit()));
+                assert_eq!(pending["approvals"][0]["approver_spec"], owner.public_key().to_hex());
+
+                let (status, unavailable) = approval_request(
+                    reqwest::Client::new()
+                        .get(format!("{foreign}/workflows/{workflow_id}/runs/{run_id}/approvals"))
+                        .header("X-Pubkey", owner.public_key().to_hex()),
+                ).await;
+                assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "foreign approval read: {unavailable}");
+                assert_eq!(unavailable["error"], "workflow not found");
+
+                let grant = buzz_sdk::build_workflow_approval(approval_ref, true, "synthetic tenant grant")
+                    .expect("build grant")
+                    .sign_with_keys(&owner)
+                    .expect("sign grant");
+                let rejection = submit_approval_event(foreign, &owner, &grant).await;
+                assert_eq!(rejection["accepted"], false, "foreign tenant accepted grant: {rejection}");
+                assert_eq!(rejection["message"], "forbidden: approval unavailable or caller unauthorized");
+                assert_eq!(approval_state(home, &owner, &workflow_id.to_string(), &run_id).await, pending);
+                assert!(approval_command_events(foreign, &owner, &grant.id.to_hex()).await.is_empty());
+                assert!(approval_command_events(home, &owner, &grant.id.to_hex()).await.is_empty());
+
+                // This member can read the gate, but its key does not satisfy `from`.
+                assert_eq!(approval_state(home, &other_member, &workflow_id.to_string(), &run_id).await, pending);
+                let unauthorized = buzz_sdk::build_workflow_approval(approval_ref, false, "unauthorized tenant member")
+                    .expect("build unauthorized denial")
+                    .sign_with_keys(&other_member)
+                    .expect("sign unauthorized denial");
+                let rejection = submit_approval_event(home, &other_member, &unauthorized).await;
+                assert_eq!(rejection["accepted"], false, "undesignated member decided approval: {rejection}");
+                assert_eq!(rejection["message"], "forbidden: approval unavailable or caller unauthorized");
+                assert_eq!(approval_state(home, &owner, &workflow_id.to_string(), &run_id).await, pending);
+                assert!(approval_command_events(home, &owner, &unauthorized.id.to_hex()).await.is_empty());
+
+                let accepted = submit_approval_event(home, &owner, &grant).await;
+                assert_eq!(accepted["accepted"], true, "own tenant rejected valid grant: {accepted}");
+                let completed = wait_for_approval_state(
+                    home, &owner, &workflow_id.to_string(), &run_id, "granted", "completed",
+                ).await;
+                assert_eq!(completed["approvals"][0]["approval_ref"], approval_ref);
+                assert_eq!(completed["approvals"][0]["approver_pubkey"], owner.public_key().to_hex());
+                assert_eq!(completed["approvals"][0]["note"], "synthetic tenant grant");
+                let events = approval_command_events(home, &owner, &grant.id.to_hex()).await;
+                assert_eq!(events.len(), 1, "accepted grant must have exactly one command event");
+                assert_eq!(events[0]["id"], grant.id.to_hex());
+                assert!(approval_command_events(foreign, &owner, &grant.id.to_hex()).await.is_empty());
+            }
+        }).await.expect("approval tenant conformance must finish within 60 seconds");
     }
 }
 
