@@ -83,8 +83,8 @@ fn read_element_text(
     reader: &mut Reader<&[u8]>,
     start: &BytesStart<'_>,
 ) -> Result<String, MediaError> {
-    reader
-        .read_text(start.to_end().name())
+    let text = reader.read_text(start.to_end().name()).map_err(xml_error)?;
+    text.decode()
         .map(|text| text.into_owned())
         .map_err(xml_error)
 }
@@ -322,7 +322,10 @@ impl MediaStorage {
             .bucket
             .get_object_stream(key)
             .await
-            .map_err(|e| MediaError::StorageError(e.to_string()))?;
+            .map_err(|error| match error {
+                s3::error::S3Error::HttpFailWithBody(404, _) => MediaError::NotFound,
+                error => MediaError::StorageError(error.to_string()),
+            })?;
 
         if response.status_code == 404 {
             return Err(MediaError::NotFound);

@@ -32,11 +32,13 @@ release_assets="$(jq -r '.assets[].name' <<<"$release_json")"
 grep -Fxq "$CANDIDATE" <<<"$release_assets" || fail "$TAG has no $CANDIDATE asset"
 gh release download "$TAG" --repo "$REPOSITORY" --pattern "$CANDIDATE" --dir "$workdir"
 
-jq -e --arg version "$VERSION" --argjson expected "$EXPECTED_PLATFORMS" '
-  .version == $version and
-  (.platforms | keys == $expected) and
-  ([.platforms[] | (.signature | type == "string" and length > 0)] | all) and
-  ([.platforms[] | (.url | type == "string" and startswith("https://github.com/block/buzz/releases/download/desktop-v" + $version + "/"))] | all)
+jq -e -s --arg version "$VERSION" --argjson expected "$EXPECTED_PLATFORMS" '
+  length == 1 and (.[0] |
+    .version == $version and
+    (.platforms | keys == $expected) and
+    ([.platforms[] | (.signature | type == "string" and length > 0)] | all) and
+    ([.platforms[] | (.url | type == "string" and startswith("https://github.com/block/buzz/releases/download/desktop-v" + $version + "/"))] | all)
+  )
 ' "$candidate" >/dev/null || fail "$CANDIDATE failed version, platform, signature, or URL validation"
 
 while IFS= read -r url; do
