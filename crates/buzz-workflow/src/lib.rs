@@ -140,6 +140,8 @@ impl WorkflowEngine {
     /// owner's *current* channel authority immediately before creating a run:
     ///
     /// - the owner must still be an active member of the workflow's channel;
+    /// - the channel must be active and the owner must not be banned (including
+    ///   through a persisted agent owner) or currently timed out;
     /// - if the definition contains an exfiltration-capable action
     ///   (`call_webhook`), the owner must currently hold the `owner` or
     ///   `admin` role.
@@ -153,6 +155,34 @@ impl WorkflowEngine {
         owner_pubkey: &[u8],
         def: &WorkflowDef,
     ) -> Result<(), WorkflowError> {
+        let restriction = self
+            .db
+            .moderation_principal_restriction_state(community_id, owner_pubkey, None)
+            .await
+            .map_err(|e| {
+                WorkflowError::Unauthorized(format!(
+                    "owner moderation lookup failed (fail-closed): {e}"
+                ))
+            })?;
+        if restriction.banned || restriction.muted_until.is_some() {
+            return Err(WorkflowError::Unauthorized(
+                "workflow owner is banned or timed out".into(),
+            ));
+        }
+        let channel = self
+            .db
+            .get_channel_for_event_write(community_id, channel_id)
+            .await
+            .map_err(|e| {
+                WorkflowError::Unauthorized(format!(
+                    "owner channel lookup failed (fail-closed): {e}"
+                ))
+            })?;
+        if channel.archived_at.is_some() {
+            return Err(WorkflowError::Unauthorized(
+                "workflow channel is archived".into(),
+            ));
+        }
         let role = self
             .db
             .get_member_role(community_id, channel_id, owner_pubkey)

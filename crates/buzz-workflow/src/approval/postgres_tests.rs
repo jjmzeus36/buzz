@@ -210,6 +210,187 @@ impl Fixture {
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
+async fn templated_approval_inputs_suspend_with_resolved_deadline_and_reject_invalid_values() {
+    for (ttl, approver, succeeds) in [
+        ("1h", "any", true),
+        ("0s", "any", false),
+        ("2592001s", "any", false),
+        ("1h", "admin", false),
+    ] {
+        let mut f = Fixture::new(false).await;
+        if let crate::ActionDef::RequestApproval { from, timeout, .. } =
+            &mut f.definition.steps[1].action
+        {
+            *from = "{{trigger.approver}}".into();
+            *timeout = Some("{{trigger.ttl}}".into());
+        }
+        f.context.webhook_fields.insert("ttl".into(), ttl.into());
+        f.context
+            .webhook_fields
+            .insert("approver".into(), approver.into());
+        f.engine
+            .db
+            .update_workflow(
+                f.community,
+                f.workflow,
+                &f.definition.name,
+                &serde_json::to_string(&f.definition).unwrap(),
+                &[2; 32],
+            )
+            .await
+            .unwrap();
+        let before = Utc::now();
+        let result =
+            crate::executor::execute_run(&f.engine, f.community, f.run, &f.definition, &f.context)
+                .await;
+        f.engine
+            .finalize_run(f.community, f.run, result, None)
+            .await;
+        let after = Utc::now();
+        let run = f
+            .engine
+            .db
+            .get_workflow_run(f.community, f.run)
+            .await
+            .unwrap();
+        let approvals = f.approvals().await;
+        if succeeds {
+            assert_eq!(run.status, RunStatus::WaitingApproval);
+            assert_eq!(approvals.len(), 1);
+            assert_eq!(approvals[0].approver_spec, "any");
+            assert!(approvals[0].expires_at >= before + chrono::Duration::hours(1));
+            assert!(approvals[0].expires_at <= after + chrono::Duration::hours(1));
+            assert_eq!(run.execution_trace[1]["message"], "Approve saved trigger?");
+        } else {
+            assert_eq!(run.status, RunStatus::Failed, "{ttl}/{approver}");
+            assert!(approvals.is_empty());
+        }
+        assert!(f.sink.0.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn approval_authority_does_not_decode_trace_and_rechecks_current_workflow() {
+    let f = Fixture::new(false).await;
+    // Valid PostgreSQL JSON beyond serde_json's recursion limit makes a broad
+    // run read fail. Authority only needs the workflow ID, never this payload.
+    let trace = format!("{}0{}", "[".repeat(160), "]".repeat(160));
+    sqlx::query(
+        "UPDATE workflow_runs SET execution_trace = $3::jsonb WHERE community_id = $1 AND id = $2",
+    )
+    .bind(f.community.as_uuid())
+    .bind(f.run)
+    .bind(trace)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    assert!(f
+        .engine
+        .db
+        .get_workflow_run(f.community, f.run)
+        .await
+        .is_err());
+    assert_eq!(
+        f.engine
+            .approval_authority(f.community, f.run, &f.definition)
+            .await
+            .unwrap()
+            .id,
+        f.workflow
+    );
+    assert!(f
+        .engine
+        .approval_authority(CommunityId::from_uuid(Uuid::new_v4()), f.run, &f.definition)
+        .await
+        .is_err());
+    f.engine
+        .db
+        .set_workflow_enabled(f.community, f.workflow, false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.engine
+            .approval_authority(f.community, f.run, &f.definition)
+            .await,
+        Err(WorkflowError::Unauthorized(_))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn resumed_actions_recheck_authority_after_an_earlier_action() {
+    struct DisablingSink {
+        db: buzz_db::Db,
+        community: CommunityId,
+        workflow: Uuid,
+        sent: Mutex<Vec<String>>,
+    }
+    impl crate::ActionSink for DisablingSink {
+        fn send_message(
+            &self,
+            _: CommunityId,
+            _: &str,
+            text: &str,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, crate::ActionSinkError>> + Send + '_>>
+        {
+            self.sent.lock().unwrap().push(text.into());
+            Box::pin(async move {
+                self.db
+                    .set_workflow_enabled(self.community, self.workflow, false)
+                    .await
+                    .map_err(|e| crate::ActionSinkError::Database(e.to_string()))?;
+                Ok("test-event".into())
+            })
+        }
+    }
+    let mut f = Fixture::new(false).await;
+    let mut last = f.definition.steps[2].clone();
+    last.id = "last".into();
+    f.definition.steps.push(last);
+    f.engine
+        .db
+        .update_workflow(
+            f.community,
+            f.workflow,
+            &f.definition.name,
+            &serde_json::to_string(&f.definition).unwrap(),
+            &[2; 32],
+        )
+        .await
+        .unwrap();
+    let approval = f.suspend().await;
+    f.decide(&approval, ApprovalStatus::Granted, &f.member)
+        .await
+        .unwrap();
+    let sink = Arc::new(DisablingSink {
+        db: f.engine.db.clone(),
+        community: f.community,
+        workflow: f.workflow,
+        sent: Mutex::new(vec![]),
+    });
+    let engine = Arc::new(WorkflowEngine::new(
+        f.engine.db.clone(),
+        crate::WorkflowConfig::default(),
+    ));
+    engine.set_action_sink(sink.clone());
+    engine.resume_approval(f.community, f.run).await;
+    let run = f
+        .engine
+        .db
+        .get_workflow_run(f.community, f.run)
+        .await
+        .unwrap();
+    assert_eq!(sink.sent.lock().unwrap().len(), 1);
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.error_code.as_deref(), Some("owner_unauthorized"));
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
 async fn grant_survives_restart_preserves_context_and_supports_multiple_gates() {
     let f = Fixture::new(true).await;
     let approval = f.suspend().await;
@@ -495,6 +676,119 @@ async fn revoked_owner_or_edited_definition_cannot_execute_approved_work() {
         assert_eq!(run.error_code.as_deref(), Some("owner_unauthorized"));
         assert!(f.sink.0.lock().unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn restricted_owner_cannot_resume_or_authorize_a_new_run() {
+    for restriction in ["ban", "timeout", "inherited_ban", "archive"] {
+        let f = Fixture::new(false).await;
+        let approval = f.suspend().await;
+        f.decide(&approval, ApprovalStatus::Granted, &f.member)
+            .await
+            .unwrap();
+        match restriction {
+            "ban" => f
+                .engine
+                .db
+                .ban_community_member(f.community, &f.owner, &f.member, None, None)
+                .await
+                .unwrap(),
+            "timeout" => f
+                .engine
+                .db
+                .timeout_community_member(
+                    f.community,
+                    &f.owner,
+                    &f.member,
+                    Utc::now() + chrono::Duration::hours(1),
+                    None,
+                )
+                .await
+                .unwrap(),
+            "inherited_ban" => {
+                f.engine
+                    .db
+                    .set_agent_owner(f.community, &f.owner, &f.member)
+                    .await
+                    .unwrap();
+                f.engine
+                    .db
+                    .ban_community_member(f.community, &f.member, &f.member, None, None)
+                    .await
+                    .unwrap();
+            }
+            "archive" => f
+                .engine
+                .db
+                .archive_channel(f.community, f.channel)
+                .await
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        // Membership remains intact: restrictions must independently revoke authority.
+        assert!(f
+            .engine
+            .db
+            .get_member_role(f.community, f.channel, &f.owner)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            f.engine
+                .check_owner_authority(f.community, f.channel, &f.owner, &f.definition)
+                .await
+                .is_err(),
+            "{restriction} must deny a new run"
+        );
+        f.restart().resume_approval(f.community, f.run).await;
+        let run = f
+            .engine
+            .db
+            .get_workflow_run(f.community, f.run)
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Failed, "{restriction}");
+        assert_eq!(run.error_code.as_deref(), Some("owner_unauthorized"));
+        assert!(f.sink.0.lock().unwrap().is_empty(), "{restriction}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn expired_and_other_tenant_restrictions_do_not_block_approval_resume() {
+    let f = Fixture::new(false).await;
+    let approval = f.suspend().await;
+    f.decide(&approval, ApprovalStatus::Granted, &f.member)
+        .await
+        .unwrap();
+    let past = Utc::now() - chrono::Duration::hours(1);
+    f.engine
+        .db
+        .ban_community_member(f.community, &f.owner, &f.member, None, Some(past))
+        .await
+        .unwrap();
+    f.engine
+        .db
+        .timeout_community_member(f.community, &f.owner, &f.member, past, None)
+        .await
+        .unwrap();
+    let neighbor = Fixture::new(false).await;
+    neighbor
+        .engine
+        .db
+        .ban_community_member(neighbor.community, &f.owner, &neighbor.member, None, None)
+        .await
+        .unwrap();
+    f.restart().resume_approval(f.community, f.run).await;
+    let run = f
+        .engine
+        .db
+        .get_workflow_run(f.community, f.run)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(f.sink.0.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

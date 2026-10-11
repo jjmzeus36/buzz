@@ -27,6 +27,13 @@ public key. Every approver must also be a current member of the workflow channel
 Role names and display-name mentions fail explicitly. Approval durations range
 from one second to thirty days; the default is twenty-four hours. These fields
 are validated after template substitution.
+Unsupported literal roles and mentions are rejected when saving the definition,
+before earlier steps can execute. Template selectors are checked after resolution.
+
+Pass the `approval_ref` from the approval read response directly to the CLI:
+`buzz workflows approve --approval-ref <64hex>`. Add `--approved false` to deny
+or `--note "reviewed"` to record a note. `--token` remains an alias, and legacy
+raw UUID tokens are hashed once; read references are not hashed again.
 
 Grant and deny commands use the existing approval-reference `d` tag (or `e` tag)
 and kinds 46030/46031. The command event and decision commit together. A rejected
@@ -46,8 +53,10 @@ one run each create a separate checkpoint.
 
 Resume checks the saved definition, channel, and owner against the current
 workflow and rechecks current owner authority before every remaining action.
-Edits, disabling, ownership changes, removal from the channel, or loss of the
-elevated role required for webhooks fail closed. A missing or malformed checkpoint
+Edits, disabling, ownership changes, removal from the channel, channel archival,
+active bans (including a persisted agent owner's ban), timeouts, or loss of the
+elevated role required for webhooks fail closed. Expired and other-community
+restrictions do not revoke authority. A missing or malformed checkpoint
 or trigger context fails visibly rather than substituting empty execution data.
 
 Recovery covers waiting gates and grants committed before execution is claimed.

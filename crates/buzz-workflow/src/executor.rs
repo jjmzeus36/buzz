@@ -461,7 +461,7 @@ pub fn resolve_step_templates(
         } => Ok(RequestApproval {
             from: t(from)?,
             message: t(message)?,
-            timeout: timeout.clone(),
+            timeout: t_opt(timeout)?,
         }),
         Delay { duration } => Ok(Delay {
             duration: duration.clone(),
@@ -748,12 +748,7 @@ pub async fn dispatch_action(
                     let token = generate_approval_token(run_id, step_id);
 
                     let spec = from.trim();
-                    if !(spec.is_empty() || spec == "any" ||
-                        (spec.len() == 64 && spec.bytes().all(|b| b.is_ascii_hexdigit()))) {
-                        return Err(WorkflowError::InvalidDefinition(
-                            "approval from must be 'any' or a 64-character public key".into(),
-                        ));
-                    }
+                    crate::schema::validate_approval_from(spec)?;
                     let seconds = parse_duration_secs(timeout_str)?;
                     if seconds == 0 || seconds > 30 * 24 * 60 * 60 {
                         return Err(WorkflowError::InvalidDefinition(

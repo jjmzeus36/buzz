@@ -304,7 +304,7 @@ function StepConfigFields({
               onChange={(event) =>
                 onUpdate({ ...step, from: event.target.value })
               }
-              placeholder="Pubkey or role"
+              placeholder="any or 64-character hex public key"
               value={step.from ?? ""}
             />
           </div>

@@ -30,6 +30,7 @@ type RawWorkflowSaveResponse = RawWorkflow & {
 type RawTraceEntry = {
   step_id: string;
   status: string;
+  message?: string | null;
   output?: Record<string, unknown>;
   started_at?: number | null;
   completed_at?: number | null;
@@ -117,6 +118,7 @@ function fromRawTraceEntry(raw: RawTraceEntry): TraceEntry {
   return {
     stepId: raw.step_id,
     status: raw.status,
+    message: raw.message ?? null,
     output: raw.output ?? {},
     startedAt: raw.started_at ?? null,
     completedAt: raw.completed_at ?? null,
