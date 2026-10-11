@@ -19,6 +19,8 @@ use uuid::Uuid;
 use crate::handlers::event::dispatch_persistent_event;
 use crate::state::AppState;
 
+mod topic;
+
 /// Resolves `@Name` mentions in workflow message text to the pubkeys of the
 /// channel members they name, so the emitted kind:9 carries the `p` tags that
 /// ACP agent-wake (`event_mentions_agent`) is gated on.
@@ -203,6 +205,21 @@ impl RelayActionSink {
 }
 
 impl ActionSink for RelayActionSink {
+    fn set_channel_topic(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        topic: &str,
+        owner_pubkey: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ActionSinkError>> + Send + '_>> {
+        Box::pin(self.set_channel_topic_impl(
+            community_id,
+            channel_id.to_owned(),
+            topic.to_owned(),
+            owner_pubkey.to_owned(),
+        ))
+    }
+
     fn send_message(
         &self,
         community_id: CommunityId,
@@ -787,8 +804,11 @@ mod postgres_tests {
     use std::sync::Arc;
 
     /// Real-PG state mirroring `handlers::event::tests::test_state_with_redis_url`.
-    async fn test_state() -> Arc<AppState> {
+    pub(super) async fn test_state() -> Arc<AppState> {
         let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .expect("workflow sink tests require an explicit isolated test database URL");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");

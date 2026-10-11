@@ -44,6 +44,7 @@ export const SELECTABLE_ACTION_TYPES = [
   "send_message",
   "delay",
   "call_webhook",
+  "set_channel_topic",
 ] as const satisfies readonly ActionType[];
 
 export type TriggerConfig = {
@@ -190,7 +191,7 @@ function actionFieldsForStep(step: StepFormState): Record<string, unknown> {
       if (step.emoji) fields.emoji = step.emoji;
       break;
     case "set_channel_topic":
-      if (step.topic) fields.topic = step.topic;
+      fields.topic = step.topic ?? "";
       break;
   }
   return fields;
@@ -546,6 +547,14 @@ export function yamlToFormState(
       }
 
       for (const key of REQUIRED_ACTION_STRING_KEYS[action]) {
+        if (action === "set_channel_topic" && key === "topic") {
+          if (typeof step.topic !== "string")
+            return {
+              ok: false,
+              error: `Step ${number} topic must be a string`,
+            };
+          continue;
+        }
         const required = requireNonEmptyString(
           step,
           key,

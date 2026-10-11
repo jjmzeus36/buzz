@@ -14,6 +14,7 @@ import { relayClient } from "@/shared/api/relayClient";
 import {
   CHANNEL_EVENT_KINDS,
   CHANNEL_MESSAGE_EVENT_KINDS,
+  KIND_SYSTEM_MESSAGE,
 } from "@/shared/constants/kinds";
 import type { Channel, RelayEvent } from "@/shared/api/types";
 import {
@@ -21,6 +22,7 @@ import {
   type TrailingDebounce,
 } from "@/shared/lib/trailingDebounce";
 
+import { createChannelMetadataSubscriptions } from "./channelMetadataSubscriptions";
 import { isDmNotifiableKind } from "./isDmNotifiableKind";
 import { refreshChannelsWhenIdle } from "./refreshChannelsWhenIdle";
 
@@ -53,7 +55,7 @@ export type UseLiveChannelUpdatesOptions = {
   onThreadReplyCandidate?: (channelId: string, event: RelayEvent) => void;
   /**
    * Fired for replies in threads the user authored, participated in, or
-   * follows (non-DM channels only — the DM path owns those). Follows the DM
+   * follows (non-DM channels only â€” the DM path owns those). Follows the DM
    * active-channel rule: suppressed for the channel being viewed unless
    * notifyForActiveChannel opts in.
    */
@@ -76,6 +78,7 @@ const LIVE_SUBSCRIPTION_RETRY_MAX_MS = 30_000;
 // non-active channels arrives in bursts, so coalesce the refetch into a single
 // trailing invalidation instead of one per event.
 const CHANNELS_INVALIDATE_DEBOUNCE_MS = 500;
+const CHANNEL_METADATA_KIND = 39000;
 
 // Only "new content" kinds should bump unread state. Shared with the
 // catch-up query in useUnreadChannels so the two paths stay in lockstep.
@@ -152,9 +155,12 @@ export function useLiveChannelUpdates(
     channelsInvalidateRef.current = createTrailingDebounce(() => {
       refreshChannelsWhenIdle({
         isFetching: () =>
-          queryClient.isFetching({ queryKey: channelsQueryKey }),
+          queryClient.isFetching({ queryKey: channelsQueryKey, exact: true }),
         invalidate: () => {
-          void queryClient.invalidateQueries({ queryKey: channelsQueryKey });
+          void queryClient.invalidateQueries({
+            queryKey: channelsQueryKey,
+            exact: true,
+          });
         },
         reArm: () => channelsInvalidateRef.current?.trigger(),
       });
@@ -199,7 +205,7 @@ export function useLiveChannelUpdates(
         return;
       }
 
-      // Suppress backlog events that predate our subscription — these are
+      // Suppress backlog events that predate our subscription â€” these are
       // historical replays, not live messages.
       if (event.created_at < dmSubscriptionStartedAtRef.current) {
         return;
@@ -242,6 +248,18 @@ export function useLiveChannelUpdates(
       return;
     }
 
+    if (event.kind === KIND_SYSTEM_MESSAGE) {
+      try {
+        const payload = JSON.parse(event.content) as { type?: string };
+        if (payload.type === "topic_changed") {
+          refreshChannelDetails(channelId);
+          invalidateChannelsDebounced();
+        }
+      } catch {
+        // Plain-text system messages do not describe a metadata change.
+      }
+    }
+
     const isDmChannel = dmChannelMap.has(channelId);
     const isUnreadTriggerKind = isChannelUnreadTriggerKind(
       event.kind,
@@ -266,7 +284,7 @@ export function useLiveChannelUpdates(
     }
 
     // Notify the unread tracker. Restricted to human-visible message kinds
-    // and to events authored by someone other than the current user — your
+    // and to events authored by someone other than the current user â€” your
     // own outgoing messages should never make a channel unread, and
     // reactions / edits / system messages aren't "new content".
     const isExternalTriggerEvent =
@@ -338,6 +356,36 @@ export function useLiveChannelUpdates(
     );
   });
 
+  const refreshChannelDetails = React.useEffectEvent((channelId: string) => {
+    const filter = {
+      queryKey: ["channels", channelId, "detail"],
+      exact: true,
+    };
+    // invalidateQueries reuses an initial fetch with no cached data. Cancel it
+    // explicitly so its pre-change response cannot settle over fresh metadata.
+    void queryClient.cancelQueries(filter).then(() => {
+      void queryClient.invalidateQueries(filter);
+    });
+  });
+
+  const handleChannelMetadata = React.useEffectEvent(
+    (event: RelayEvent, subscribedChannelIds: ReadonlySet<string>) => {
+      const channelId = event.tags.find((tag) => tag[0] === "d")?.[1];
+      if (
+        event.kind !== CHANNEL_METADATA_KIND ||
+        !channelId ||
+        !subscribedChannelIds.has(channelId) ||
+        !liveChannelIds.has(channelId)
+      ) {
+        return;
+      }
+      // Ordinary edits may publish the notice before the canonical metadata.
+      // Its delivery is the reliable point to refresh both independent caches.
+      refreshChannelDetails(channelId);
+      invalidateChannelsDebounced();
+    },
+  );
+
   const handleMentionEvent = React.useEffectEvent((event: RelayEvent) => {
     if (!isExternalMentionEvent(event, normalizedCurrentPubkey)) {
       return;
@@ -367,6 +415,7 @@ export function useLiveChannelUpdates(
     let isCancelled = false;
     let retryTimeout: number | undefined;
     let retryAttempt = 0;
+    const pendingDisposers = new Set<() => Promise<void>>();
 
     const syncSubs = async (): Promise<boolean> => {
       const activeSubs = liveSubsRef.current;
@@ -389,29 +438,47 @@ export function useLiveChannelUpdates(
       const additions = Array.from(targetIds)
         .filter((channelId) => !activeSubs.has(channelId))
         .map(async (channelId) => {
+          const disposers: (() => Promise<void>)[] = [];
+          let isRetired = false;
+          const dispose = async () => {
+            isRetired = true;
+            await Promise.allSettled(
+              disposers.splice(0).map((cleanup) => cleanup()),
+            );
+          };
+          pendingDisposers.add(dispose);
           try {
-            const dispose = await relayClient.subscribeLive(
+            const disposeEvents = await relayClient.subscribeLive(
               {
                 kinds: [...CHANNEL_EVENT_KINDS],
                 "#h": [channelId],
                 limit: 1000,
                 since: Math.floor(Date.now() / 1_000),
               },
-              (event) =>
-                handleIncomingMessage(withChannelTagFallback(event, channelId)),
+              (event) => {
+                if (!isRetired) {
+                  handleIncomingMessage(
+                    withChannelTagFallback(event, channelId),
+                  );
+                }
+              },
             );
-            if (isCancelled) {
+            disposers.push(disposeEvents);
+            if (isCancelled || isRetired) {
               void dispose().catch(() => {});
               return;
             }
             activeSubs.set(channelId, dispose);
           } catch (err) {
+            await dispose();
             anyFailed = true;
             console.error(
               "Failed to subscribe to live channel updates",
               channelId,
               err,
             );
+          } finally {
+            pendingDisposers.delete(dispose);
           }
         });
       await Promise.allSettled(additions);
@@ -440,9 +507,57 @@ export function useLiveChannelUpdates(
 
     return () => {
       isCancelled = true;
+      for (const dispose of pendingDisposers) {
+        void dispose().catch(() => {});
+      }
       if (retryTimeout !== undefined) {
         window.clearTimeout(retryTimeout);
       }
+    };
+  }, [channelIdsKey]);
+
+  const metadataSubscriptionsRef = React.useRef<ReturnType<
+    typeof createChannelMetadataSubscriptions
+  > | null>(null);
+  const metadataSyncQueueRef = React.useRef(Promise.resolve());
+  React.useEffect(() => {
+    let isCancelled = false;
+    let retryTimeout: number | undefined;
+    let retryAttempt = 0;
+    const channelIds = channelIdsKey ? channelIdsKey.split(",") : [];
+    const manager =
+      metadataSubscriptionsRef.current ??
+      createChannelMetadataSubscriptions(
+        (filter, onEvent, onReady) =>
+          relayClient.subscribeLive(filter, onEvent, onReady),
+        (event, ids) => handleChannelMetadata(event, ids),
+      );
+    metadataSubscriptionsRef.current = manager;
+    const runSync = async () => {
+      // Serialize cancellation and swaps so only one candidate consumes an
+      // overlap slot. Earlier admitted chunks survive a later failed swap.
+      const sync = metadataSyncQueueRef.current.then(() =>
+        isCancelled ? true : manager.sync(channelIds, () => isCancelled),
+      );
+      metadataSyncQueueRef.current = sync.then(
+        () => {},
+        () => {},
+      );
+      const ok = await sync;
+      if (isCancelled || ok) return;
+      const delayMs = Math.min(
+        LIVE_SUBSCRIPTION_RETRY_BASE_MS * 2 ** retryAttempt++,
+        LIVE_SUBSCRIPTION_RETRY_MAX_MS,
+      );
+      retryTimeout = window.setTimeout(() => {
+        void runSync();
+      }, delayMs);
+    };
+    void runSync();
+    return () => {
+      isCancelled = true;
+      manager.cancelPending();
+      if (retryTimeout !== undefined) window.clearTimeout(retryTimeout);
     };
   }, [channelIdsKey]);
 
@@ -485,7 +600,7 @@ export function useLiveChannelUpdates(
       }
 
       let anyFailed = false;
-      // Pass handleMentionEvent directly — it's a stable useEffectEvent
+      // Pass handleMentionEvent directly â€” it's a stable useEffectEvent
       // callback. Do NOT wrap in an isCancelled check here: subs persist
       // across effect runs (that's the point of the diff manager), so a
       // stale isCancelled flag from a prior run would silently drop events
@@ -553,6 +668,7 @@ export function useLiveChannelUpdates(
         void dispose().catch(() => {});
       }
       liveSubsRef.current.clear();
+      void metadataSubscriptionsRef.current?.dispose();
 
       const subs = mentionSubsRef.current;
       for (const dispose of subs.values()) {

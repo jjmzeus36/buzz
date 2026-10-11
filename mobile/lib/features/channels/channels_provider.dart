@@ -374,16 +374,15 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
       return left.name.toLowerCase().compareTo(right.name.toLowerCase());
     });
 
-    // Invalidate `channelDetailsProvider` entries whose archived state flipped
+    // Invalidate `channelDetailsProvider` entries whose topic or archived state changed
     // since the last fetch. Required because `channelDetailsProvider` is a
     // separate Riverpod cache and `Channel.mergeDetails(details)` overwrites
     // archivedAt from the cached details — so an active-then-archived channel
     // (e.g. TTL auto-archive by the relay reaper) could keep showing compose
     // and manage actions in the detail view until the cache expired naturally.
     //
-    // Scoped narrowly to the archived flip — broader metadata staleness
-    // (renames, topic changes, etc.) is a separate, pre-existing concern that
-    // already affects this provider for other reasons.
+    // Topic changes also need this on reconnect/backstop refreshes, where the
+    // live topic notice may have been missed while the client was offline.
     // Re-check before the first write that other providers can observe. Every
     // await above is fenced, but the switch can also land in the synchronous
     // gap, so the guard sits immediately before the write rather than only
@@ -395,7 +394,9 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
     };
     for (final channel in channels) {
       final prev = prevById[channel.id];
-      if (prev != null && prev.isArchived != channel.isArchived) {
+      if (prev != null &&
+          (prev.isArchived != channel.isArchived ||
+              prev.topic != channel.topic)) {
         ref.invalidate(channelDetailsProvider(channel.id));
       }
     }
@@ -639,6 +640,22 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
     final channelId = event.channelId;
     if (channelId == null) return;
 
+    if (event.kind == EventKind.systemMessage) {
+      try {
+        final payload = jsonDecode(event.content);
+        if (payload is Map<String, dynamic> &&
+            payload['type'] == 'topic_changed') {
+          // Workflow metadata already precedes its notice. Ordinary edits can
+          // publish it later; the separate canonical metadata subscription
+          // refreshes these caches again when that replacement arrives.
+          ref.invalidate(channelDetailsProvider(channelId));
+          unawaited(_backstopRefresh());
+        }
+      } on FormatException {
+        // Plain-text system messages do not describe a metadata change.
+      }
+    }
+
     final myPk = ref.read(myPubkeyProvider);
     final mutedChannelIds = _mutedChannelIds();
 
@@ -678,6 +695,14 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
 
       return updated;
     });
+  }
+
+  void _handleChannelMetadata(NostrEvent event) {
+    if (event.kind != 39000) return;
+    final channelId = event.getTagValue('d');
+    if (channelId == null) return;
+    ref.invalidate(channelDetailsProvider(channelId));
+    unawaited(_backstopRefresh());
   }
 
   Set<String> _mutedChannelIds() => {
