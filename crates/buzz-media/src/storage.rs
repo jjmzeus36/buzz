@@ -322,7 +322,10 @@ impl MediaStorage {
             .bucket
             .get_object_stream(key)
             .await
-            .map_err(|e| MediaError::StorageError(e.to_string()))?;
+            .map_err(|error| match error {
+                s3::error::S3Error::HttpFailWithBody(404, _) => MediaError::NotFound,
+                error => MediaError::StorageError(error.to_string()),
+            })?;
 
         if response.status_code == 404 {
             return Err(MediaError::NotFound);
