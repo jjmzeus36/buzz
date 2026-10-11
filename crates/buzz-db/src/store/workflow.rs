@@ -21,6 +21,9 @@ use crate::error::{DbError, Result};
 use crate::Db;
 use buzz_datastore_tracing::datastore_span;
 
+mod approval;
+pub use approval::*;
+
 // -- Token hashing ------------------------------------------------------------
 
 /// Default maximum rows returned by list queries. Callers may request fewer.
