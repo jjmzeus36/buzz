@@ -664,10 +664,16 @@ pub async fn dispatch_action(
                     Err(WorkflowError::NotImplemented("SendDm".into()))
                 }
 
-                SetChannelTopic { topic: _ } => {
-                    warn!(run_id = %run_id, step = step_id, "SetChannelTopic not yet implemented");
-                    // TODO (WF-07): update channel topic via DB.
-                    Err(WorkflowError::NotImplemented("SetChannelTopic".into()))
+                SetChannelTopic { topic } => {
+                    let run = engine.db.get_workflow_run(community_id, run_id).await?;
+                    let workflow = engine.db.get_workflow(community_id, run.workflow_id).await?;
+                    let channel = workflow.channel_id.ok_or_else(|| WorkflowError::InvalidDefinition(
+                        "SetChannelTopic requires a channel-scoped workflow".into(),
+                    ))?;
+                    engine.action_sink()?.set_channel_topic(
+                        community_id, &channel.to_string(), topic, &hex::encode(&workflow.owner_pubkey),
+                    ).await?;
+                    Ok(StepResult::Completed(serde_json::json!({ "updated": true, "topic": topic })))
                 }
 
                 AddReaction { emoji } => {

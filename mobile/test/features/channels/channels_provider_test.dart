@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter/widgets.dart';
@@ -10,6 +11,7 @@ import 'package:buzz/shared/relay/relay.dart';
 
 part 'channels_provider_live_cases.dart';
 part 'channels_provider_terminal_cases.dart';
+part 'channels_provider_topic_cases.dart';
 
 /// Tests for [ChannelsNotifier] in the pure-Nostr world.
 ///
@@ -1582,6 +1584,7 @@ void main() {
   );
 
   _liveSubscriptionTests();
+  _topicRefreshTests();
   _terminalSubscriptionTests();
 
   test('retains channel-list member snapshots for immediate reuse', () async {
@@ -2164,6 +2167,7 @@ NostrEvent _meta({
   int createdAt = 1,
   int? ttlSeconds,
   bool archived = false,
+  String? topic,
 }) => NostrEvent(
   id: 'meta-$id',
   pubkey: 'creator',
@@ -2176,6 +2180,7 @@ NostrEvent _meta({
     [visibility == 'private' ? 'private' : 'public'],
     if (ttlSeconds != null) ['ttl', '$ttlSeconds'],
     if (archived) ['archived', 'true'],
+    if (topic != null && topic.isNotEmpty) ['topic', topic],
   ],
   content: '',
   sig: 'sig',

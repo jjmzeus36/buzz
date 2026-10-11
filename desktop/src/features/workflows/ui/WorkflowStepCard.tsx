@@ -87,13 +87,6 @@ function BackendSupportHint({ action }: { action: StepFormState["action"] }) {
           step.
         </p>
       );
-    case "set_channel_topic":
-      return (
-        <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs text-amber-700">
-          Backend note: `set_channel_topic` is not executed yet, so runs fail at
-          this step.
-        </p>
-      );
     case "request_approval":
       return (
         <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs text-amber-700">
@@ -364,7 +357,6 @@ function StepConfigFields({
     case "set_channel_topic":
       return (
         <div className="space-y-2">
-          <BackendSupportHint action={step.action} />
           <div className="space-y-1.5">
             <FieldLabel htmlFor={`${prefix}-topic`}>Topic</FieldLabel>
             <Input

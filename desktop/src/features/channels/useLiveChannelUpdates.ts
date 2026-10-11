@@ -14,6 +14,7 @@ import { relayClient } from "@/shared/api/relayClient";
 import {
   CHANNEL_EVENT_KINDS,
   CHANNEL_MESSAGE_EVENT_KINDS,
+  KIND_SYSTEM_MESSAGE,
 } from "@/shared/constants/kinds";
 import type { Channel, RelayEvent } from "@/shared/api/types";
 import {
@@ -152,9 +153,12 @@ export function useLiveChannelUpdates(
     channelsInvalidateRef.current = createTrailingDebounce(() => {
       refreshChannelsWhenIdle({
         isFetching: () =>
-          queryClient.isFetching({ queryKey: channelsQueryKey }),
+          queryClient.isFetching({ queryKey: channelsQueryKey, exact: true }),
         invalidate: () => {
-          void queryClient.invalidateQueries({ queryKey: channelsQueryKey });
+          void queryClient.invalidateQueries({
+            queryKey: channelsQueryKey,
+            exact: true,
+          });
         },
         reArm: () => channelsInvalidateRef.current?.trigger(),
       });
@@ -240,6 +244,24 @@ export function useLiveChannelUpdates(
         invalidateChannelsDebounced();
       }
       return;
+    }
+
+    if (event.kind === KIND_SYSTEM_MESSAGE) {
+      try {
+        const payload = JSON.parse(event.content) as { type?: string };
+        if (payload.type === "topic_changed") {
+          // The notice follows the relay's updated kind:39000 metadata. Refresh
+          // both caches: a cached detail can otherwise retain the old topic
+          // even after the channel list converges, including after a clear.
+          void queryClient.invalidateQueries({
+            queryKey: ["channels", channelId, "detail"],
+            exact: true,
+          });
+          invalidateChannelsDebounced();
+        }
+      } catch {
+        // Plain-text system messages do not describe a metadata change.
+      }
     }
 
     const isDmChannel = dmChannelMap.has(channelId);

@@ -7,6 +7,16 @@ use std::{future::Future, pin::Pin, sync::Mutex};
 struct Sink(Mutex<Vec<String>>);
 
 impl crate::ActionSink for Sink {
+    fn set_channel_topic(
+        &self,
+        _: CommunityId,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::ActionSinkError>> + Send + '_>> {
+        Box::pin(async { panic!("approval fixture does not execute topic actions") })
+    }
+
     fn send_message(
         &self,
         _: CommunityId,

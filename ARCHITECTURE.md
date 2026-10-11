@@ -546,11 +546,24 @@ Note: Both `TriggerDef` and `ActionDef` use serde internally-tagged enums. Trigg
 |--------|-------------|
 | `send_message` | Post to the workflow's channel (or override channel) |
 | `send_dm` | Direct message to a user (pubkey hex or `{{trigger.author}}`) |
-| `set_channel_topic` | Update channel topic |
+| `set_channel_topic` | Update the stored workflow channel topic using the owner's current membership |
 | `add_reaction` | React to the trigger message |
 | `call_webhook` | HTTP POST to external URL (SSRF-protected, redirects disabled, 1 MiB response cap) |
 | `request_approval` | Suspend execution; fields: `from`, `message`, `timeout` (default 24h) |
 | `delay` | Pause execution (max 300 seconds) |
+
+**Topic updates:** `set_channel_topic` requires a channel-scoped workflow. Its
+`topic` field supports templates; an empty value clears the topic. The relay
+rechecks the owner's current moderation restrictions and membership in the active
+channel, atomically saves the topic and an attributed, relay-signed system event,
+then persists the NIP-29 discovery metadata before dispatching the notice.
+Metadata capture and replacement share a lock, so a stale capture cannot replace
+a newer topic. Trigger input cannot select a different channel. A system-event
+insert failure rolls back the topic, actor, and timestamp. If metadata persistence
+fails after the source transaction commits, the run fails while the source topic
+and notice remain committed and the previous discovery head remains visible.
+This path does not retry the projection. Live delivery follows the relay's
+existing best-effort path.
 
 **Template variables:** `{{trigger.text}}`, `{{trigger.author}}`, `{{steps.ID.output.FIELD}}`. Single-pass resolution (not recursive). Unknown variables left as literal text.
 
@@ -831,4 +844,4 @@ These are verified gaps in the current implementation — not design aspirations
 | 3 | **No dedicated typing REST endpoint** | Typing indicators (kind 20002) are delivered via both local fan-out and Redis pub/sub (cross-node). There is no REST endpoint to query current typers — `/api/presence` returns online/away status only, not typing state. |
 | 4 | **Huddle recording/tracks not built** | Voice, room lifecycle, and join/leave/end events are wired (see Huddle Audio above). Recording and per-track publishing have reserved kinds but no producer yet. |
 | 5 | **Approval gates not wired end-to-end** | The executor returns `StepResult::Suspended` and the relay has grant/deny API endpoints with DB CRUD, but the engine intercepts before creating `WaitingApproval` rows — runs that hit an approval gate are marked as Failed (🚧 WF-08). |
-| 6 | **Workflow actions partially stubbed** | The `send_dm` and `set_channel_topic` workflow actions are in the schema but return `NotImplemented` — a run that reaches one fails at execution (🚧 WF-07). |
+| 6 | **Workflow actions partially stubbed** | The `send_dm` workflow action is in the schema but returns `NotImplemented` — a run that reaches it fails at execution (🚧 WF-07). |

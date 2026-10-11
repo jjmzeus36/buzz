@@ -944,8 +944,7 @@ async fn emit_addressable_discovery_event(
                 limit: Some(1),
                 ..buzz_db::event::EventQuery::for_community(tenant.community())
             })
-            .await
-            .unwrap_or_default();
+            .await?;
         existing
             .first()
             .map(|e| e.event.created_at.as_secs() + 1)
@@ -1039,6 +1038,115 @@ async fn dispatch_group_members_event(
     }
 }
 
+fn group_metadata_tags(
+    metadata_snapshot: &buzz_db::channel_metadata::LockedMetadataSnapshot,
+) -> anyhow::Result<Vec<Tag>> {
+    let channel = &metadata_snapshot.channel;
+    let group_id = channel.id.to_string();
+    let mut tags: Vec<Tag> = vec![Tag::parse(["d", &group_id])?];
+    tags.push(Tag::parse(["name", &channel.name])?);
+    if let Some(ref desc) = channel.description {
+        if !desc.is_empty() {
+            tags.push(Tag::parse(["about", desc])?);
+        }
+    }
+    if channel.visibility == "private" {
+        tags.push(Tag::parse(["private"])?);
+    } else {
+        // Explicit "public" tag complements NIP-29's absence-of-"private" convention,
+        // making channel visibility self-describing for clients.
+        tags.push(Tag::parse(["public"])?);
+    }
+    // NIP-29 hidden tag: hint to clients not to show DMs in public group lists.
+    // Not a security boundary — access control is handled by channel-scoped storage.
+    if channel.channel_type == "dm" {
+        tags.push(Tag::parse(["hidden"])?);
+        // Include participant pubkeys in kind:39000 for DMs so clients can
+        // resolve display names without a separate kind:39002 fetch.
+        for pubkey in &metadata_snapshot.participant_pubkeys {
+            let pubkey_hex = hex::encode(pubkey);
+            tags.push(Tag::parse(["p", &pubkey_hex])?);
+        }
+    }
+    // Buzz channels always require explicit membership
+    tags.push(Tag::parse(["closed"])?);
+    // Channel type tag so clients can distinguish stream/forum/dm without inference
+    tags.push(Tag::parse(["t", &channel.channel_type])?);
+    // Optional topic / purpose for richer client UX
+    if let Some(ref topic) = channel.topic {
+        if !topic.is_empty() {
+            tags.push(Tag::parse(["topic", topic])?);
+        }
+    }
+    if let Some(ref purpose) = channel.purpose {
+        if !purpose.is_empty() {
+            tags.push(Tag::parse(["purpose", purpose])?);
+        }
+    }
+    // Archived state — clients use this to hide channels from the sidebar.
+    if channel.archived_at.is_some() {
+        tags.push(Tag::parse(["archived", "true"])?);
+    }
+    // Ephemeral channel TTL — clients use this to show countdown timers.
+    if let Some(ttl) = channel.ttl_seconds {
+        tags.push(Tag::parse(["ttl", &ttl.to_string()])?);
+    }
+    if let Some(ref deadline) = channel.ttl_deadline {
+        tags.push(Tag::parse(["ttl_deadline", &deadline.to_rfc3339()])?);
+    }
+    Ok(tags)
+}
+
+/// Publish canonical NIP-29 metadata while its replacement and channel locks
+/// span capture, timestamp allocation, and storage. Dispatch follows commit.
+pub async fn emit_group_metadata_event(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+) -> anyhow::Result<()> {
+    let relay_pubkey = state.relay_keypair.public_key().to_bytes();
+    let mut metadata_snapshot = state
+        .db
+        .lock_metadata_snapshot(tenant.community(), channel_id, &relay_pubkey)
+        .await?;
+    let tags = group_metadata_tags(&metadata_snapshot)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ts = metadata_snapshot
+        .latest_metadata_event_timestamp()
+        .await?
+        .map(|timestamp| {
+            timestamp
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("metadata event timestamp overflow"))
+        })
+        .transpose()?
+        .unwrap_or(now)
+        .max(now);
+    let event = EventBuilder::new(Kind::Custom(KIND_NIP29_GROUP_METADATA as u16), "")
+        .tags(tags)
+        .allow_self_tagging()
+        .custom_created_at(nostr::Timestamp::from(ts))
+        .sign_with_keys(&state.relay_keypair)
+        .map_err(|error| anyhow::anyhow!("failed to sign metadata snapshot: {error}"))?;
+    let (stored, inserted) = metadata_snapshot.replace_metadata_event(&event).await?;
+    metadata_snapshot.release().await?;
+    if inserted {
+        dispatch_persistent_event(
+            tenant,
+            state,
+            &stored,
+            KIND_NIP29_GROUP_METADATA,
+            &hex::encode(relay_pubkey),
+            None,
+        )
+        .await;
+    }
+    Ok(())
+}
+
 /// Emit NIP-29 group discovery events (39000, 39001, 39002) signed by the relay keypair.
 /// Called after group creation, metadata changes, or membership changes.
 /// Events are stored channel-scoped (`channel_id = Some(...)`) so that existing
@@ -1052,10 +1160,7 @@ pub async fn emit_group_discovery_events(
     state: &Arc<AppState>,
     channel_id: Uuid,
 ) -> anyhow::Result<()> {
-    let channel = state
-        .db
-        .get_channel_for_event_write(tenant.community(), channel_id)
-        .await?;
+    emit_group_metadata_event(tenant, state, channel_id).await?;
     let members = state
         .db
         .get_members_for_event_write(tenant.community(), channel_id)
@@ -1063,69 +1168,6 @@ pub async fn emit_group_discovery_events(
 
     let relay_pubkey_hex = hex::encode(state.relay_keypair.public_key().to_bytes());
     let group_id = channel_id.to_string();
-
-    {
-        let mut tags: Vec<Tag> = vec![Tag::parse(["d", &group_id])?];
-        tags.push(Tag::parse(["name", &channel.name])?);
-        if let Some(ref desc) = channel.description {
-            if !desc.is_empty() {
-                tags.push(Tag::parse(["about", desc])?);
-            }
-        }
-        if channel.visibility == "private" {
-            tags.push(Tag::parse(["private"])?);
-        } else {
-            // Explicit "public" tag complements NIP-29's absence-of-"private" convention,
-            // making channel visibility self-describing for clients.
-            tags.push(Tag::parse(["public"])?);
-        }
-        // NIP-29 hidden tag: hint to clients not to show DMs in public group lists.
-        // Not a security boundary — access control is handled by channel-scoped storage.
-        if channel.channel_type == "dm" {
-            tags.push(Tag::parse(["hidden"])?);
-            // Include participant pubkeys in kind:39000 for DMs so clients can
-            // resolve display names without a separate kind:39002 fetch.
-            for m in &members {
-                let pubkey_hex = hex::encode(&m.pubkey);
-                tags.push(Tag::parse(["p", &pubkey_hex])?);
-            }
-        }
-        // Buzz channels always require explicit membership
-        tags.push(Tag::parse(["closed"])?);
-        // Channel type tag so clients can distinguish stream/forum/dm without inference
-        tags.push(Tag::parse(["t", &channel.channel_type])?);
-        // Optional topic / purpose for richer client UX
-        if let Some(ref topic) = channel.topic {
-            if !topic.is_empty() {
-                tags.push(Tag::parse(["topic", topic])?);
-            }
-        }
-        if let Some(ref purpose) = channel.purpose {
-            if !purpose.is_empty() {
-                tags.push(Tag::parse(["purpose", purpose])?);
-            }
-        }
-        // Archived state — clients use this to hide channels from the sidebar.
-        if channel.archived_at.is_some() {
-            tags.push(Tag::parse(["archived", "true"])?);
-        }
-        // Ephemeral channel TTL — clients use this to show countdown timers.
-        if let Some(ttl) = channel.ttl_seconds {
-            tags.push(Tag::parse(["ttl", &ttl.to_string()])?);
-        }
-        if let Some(ref deadline) = channel.ttl_deadline {
-            tags.push(Tag::parse(["ttl_deadline", &deadline.to_rfc3339()])?);
-        }
-        emit_addressable_discovery_event(
-            tenant,
-            state,
-            channel_id,
-            KIND_NIP29_GROUP_METADATA,
-            tags,
-            &relay_pubkey_hex,
-        )
-        .await?;
-    }
 
     {
         let mut tags: Vec<Tag> = vec![Tag::parse(["d", &group_id])?];
@@ -1148,8 +1190,8 @@ pub async fn emit_group_discovery_events(
     }
 
     // Re-capture membership behind the writer lock immediately before the
-    // authoritative 39002 replacement. Metadata/admin snapshots retain their
-    // existing behavior; only membership publication needs this freshness fence.
+    // authoritative 39002 replacement. Metadata has its own capture fence;
+    // admin snapshots retain their existing behavior.
     let relay_pubkey = state.relay_keypair.public_key().to_bytes();
     let mut member_snapshot = state
         .db
