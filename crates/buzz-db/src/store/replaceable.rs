@@ -377,6 +377,37 @@ impl Db {
         event: &nostr::Event,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
+        self.replace_addressable_event_inner(community_id, event, channel_id, None)
+            .await
+            .map(|(event, inserted, _)| (event, inserted))
+    }
+
+    /// Persist a kind:0 event and its user profile as one atomic replacement.
+    /// Stale/duplicate events cannot overwrite the winning profile projection.
+    /// Returns the stored event, whether it was inserted, and whether a user was created.
+    pub async fn replace_profile_event(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        profile: &crate::profile_event::ProfileMetadata,
+    ) -> Result<(StoredEvent, bool, bool)> {
+        if buzz_core::kind::event_kind_u32(event) != 0 {
+            return Err(DbError::InvalidData(
+                "profile event must have kind 0".to_string(),
+            ));
+        }
+        profile.validate()?;
+        self.replace_addressable_event_inner(community_id, event, None, Some(profile))
+            .await
+    }
+
+    async fn replace_addressable_event_inner(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        channel_id: Option<Uuid>,
+        profile: Option<&crate::profile_event::ProfileMetadata>,
+    ) -> Result<(StoredEvent, bool, bool)> {
         let kind_i32 = buzz_core::kind::event_kind_i32(event);
         let pubkey_bytes = event.pubkey.to_bytes();
         let created_at_secs = event.created_at.as_secs() as i64;
@@ -445,6 +476,7 @@ impl Db {
                                 false,
                             ),
                             false,
+                            false,
                         ));
                     }
                 }
@@ -501,6 +533,7 @@ impl Db {
                             false,
                         ),
                         false,
+                        false,
                     ));
                 }
 
@@ -510,11 +543,17 @@ impl Db {
                 crate::insert_mentions_in_transaction(&mut tx, community_id, event, channel_id)
                     .await?;
 
+                let user_created = if let Some(profile) = profile {
+                    crate::profile_event::project(&mut tx, community_id, event, profile).await?
+                } else {
+                    false
+                };
                 tx.commit().await?;
 
                 Ok((
                     StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
                     true,
+                    user_created,
                 ))
             })
             .await

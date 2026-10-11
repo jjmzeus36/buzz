@@ -315,24 +315,38 @@ pub(crate) async fn run_demo_echo(
     tracing::info!(%session_id, %peer, "mesh demo echo: session open");
     let mut drain_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     loop {
-        let frame = tokio::select! {
-            _ = drain_tick.tick() => {
-                if shutting_down.load(Ordering::Relaxed) {
-                    if let Some(community_id) = stream.community_id() {
-                        if let Err(e) = stream.send_goodbye(community_id, GoodbyeReason::Draining).await {
-                            tracing::warn!(%session_id, "mesh demo echo: draining goodbye failed: {e}");
-                        } else {
-                            tracing::info!(%session_id, "mesh demo echo: sent draining goodbye");
+        // Frame reads (including the Redis fence check after consuming bytes)
+        // are not cancellation-safe. Keep one receive alive across harmless
+        // drain ticks, and drop it only when this stream is actually closing.
+        let frame = {
+            let receive = stream.recv_validated(&directory);
+            tokio::pin!(receive);
+            loop {
+                tokio::select! {
+                    _ = drain_tick.tick() => {
+                        if shutting_down.load(Ordering::Relaxed) {
+                            break None;
                         }
-                    } else {
-                        let _ = stream.finish();
-                        tracing::info!(%session_id, "mesh demo echo: drain before community latch — closing");
                     }
-                    return;
+                    frame = &mut receive => break Some(frame),
                 }
-                continue;
             }
-            frame = stream.recv_validated(&directory) => frame,
+        };
+        let Some(frame) = frame else {
+            if let Some(community_id) = stream.community_id() {
+                if let Err(e) = stream
+                    .send_goodbye(community_id, GoodbyeReason::Draining)
+                    .await
+                {
+                    tracing::warn!(%session_id, "mesh demo echo: draining goodbye failed: {e}");
+                } else {
+                    tracing::info!(%session_id, "mesh demo echo: sent draining goodbye");
+                }
+            } else {
+                let _ = stream.finish();
+                tracing::info!(%session_id, "mesh demo echo: drain before community latch — closing");
+            }
+            return;
         };
         match frame {
             Ok(Some(ReliableFrame::Data(payload))) => {
@@ -753,5 +767,153 @@ mod tests {
             fence.check(session, 1),
             crate::audio::mesh::FenceVerdict::Accept { .. }
         ));
+    }
+
+    /// Holds progress inside the receive future, as the real framed reader and
+    /// the Redis validation await do. Dropping that future loses the release
+    /// receiver, so restarting the read cannot silently recover the payload.
+    struct ControlledRecv {
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+        started: Arc<tokio::sync::Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl StreamRecvHalf for ControlledRecv {
+        fn recv_frame(&mut self) -> BoxFuture<'_, Result<Option<MeshStreamFrame>, MeshError>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                let release = self.release.take();
+                self.started.notify_one();
+                if let Some(release) = release {
+                    release.await.expect("test releases the in-flight read");
+                } else {
+                    std::future::pending::<()>().await;
+                }
+                Ok(None)
+            })
+        }
+    }
+
+    struct FinishProbe(Arc<AtomicBool>);
+
+    impl StreamSendHalf for FinishProbe {
+        fn send_frame(&mut self, _frame: MeshStreamFrame) -> BoxFuture<'_, Result<(), MeshError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn finish(&mut self) -> Result<(), MeshError> {
+            self.0.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    struct EchoFixture {
+        directory: SessionDirectory,
+        inbound: ReliableInbound,
+        release: tokio::sync::oneshot::Sender<()>,
+        started: Arc<tokio::sync::Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        finished: Arc<AtomicBool>,
+    }
+
+    fn echo_fixture() -> EchoFixture {
+        // An EOF needs no Redis fence query. This fixture exercises the real
+        // run_demo_echo -> recv_validated -> MeshStream receive seam offline.
+        let pool = deadpool_redis::Config::from_url("redis://127.0.0.1:1")
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .unwrap();
+        let (release, receive_release) = tokio::sync::oneshot::channel();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let fenced = FencedHeader {
+            session_id: uuid::Uuid::new_v4(),
+            generation: 1,
+            owner_runtime_id: rid(9),
+        };
+        let stream = MeshStream::new(
+            Box::new(FinishProbe(Arc::clone(&finished))),
+            Box::new(ControlledRecv {
+                release: Some(receive_release),
+                started: Arc::clone(&started),
+                calls: Arc::clone(&calls),
+            }),
+        );
+        EchoFixture {
+            directory: SessionDirectory::new(pool),
+            inbound: ReliableInbound {
+                fenced,
+                from: rid(1),
+                stream: crate::tunnel::reliable::ReliableMeshStream::new_inbound(fenced, stream),
+            },
+            release,
+            started,
+            calls,
+            finished,
+        }
+    }
+
+    #[tokio::test]
+    async fn demo_echo_preserves_receive_across_drain_ticks() {
+        let EchoFixture {
+            directory,
+            inbound,
+            release,
+            started,
+            calls,
+            ..
+        } = echo_fixture();
+        let task = tokio::spawn(run_demo_echo(
+            directory,
+            inbound,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        started.notified().await;
+        // Span multiple ticks while one frame read remains unfinished.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "drain polling restarted the frame read"
+        );
+        release
+            .send(())
+            .expect("drain polling cancelled the frame read");
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("released read must complete")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn demo_echo_shutdown_cancels_pending_receive_and_finishes() {
+        let EchoFixture {
+            directory,
+            inbound,
+            release,
+            started,
+            finished,
+            ..
+        } = echo_fixture();
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(run_demo_echo(
+            directory,
+            inbound,
+            Arc::clone(&shutting_down),
+        ));
+        started.notified().await;
+        shutting_down.store(true, Ordering::Relaxed);
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("drain must interrupt a pending read")
+            .unwrap();
+        assert!(
+            release.is_closed(),
+            "shutdown must drop the pending receive"
+        );
+        assert!(
+            finished.load(Ordering::Relaxed),
+            "unlatched stream must be finished"
+        );
     }
 }

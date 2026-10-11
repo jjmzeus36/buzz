@@ -69,8 +69,14 @@ grep -Fq "inputs.lane == 'postgres'" "$relay_workflow" ||
   fail "PostgreSQL tests must be selected by their isolated lane"
 grep -Fq "inputs.lane == 'artifacts'" "$relay_workflow" ||
   fail "relay artifacts must be selected by their isolated lane"
-[[ "$relay_e2e_job" == *'cargo test -p buzz-test-client --test e2e_relay nip29_departure_wire -- --ignored --nocapture'* ]] ||
-  fail "Relay E2E must select the NIP-29 departure wire tests"
+# The same selector must be listed and executed; Cargo accepts an empty filter.
+[[ "$relay_e2e_job" == *'for selector in invite nip43_membership_snapshots_are_rejected nip29_departure_wire; do'* &&
+   "$relay_e2e_job" == *'test_args=(-p buzz-test-client --test e2e_relay "$selector" -- --ignored)'* &&
+   "$relay_e2e_job" == *'listing=$(cargo test "${test_args[@]}" --list --format terse)'* &&
+   "$relay_e2e_job" == *"if ! grep -qE ': test$'"* &&
+   "$relay_e2e_job" == *'exit 1'* &&
+   "$relay_e2e_job" == *'cargo test "${test_args[@]}" --nocapture'* ]] ||
+  fail "Relay E2E must list and run the required nonempty NIP-29 departure selector"
 grep -Fq "inputs.lane == 'mobile-swift'" "$clients_workflow" ||
   fail "Mobile Swift must be selected by its isolated lane"
 

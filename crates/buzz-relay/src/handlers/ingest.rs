@@ -4408,15 +4408,14 @@ async fn ingest_event_inner(
         None
     };
 
-    // Pre-validate kind:0 content before storage so we don't store an event
-    // whose profile sync will silently fail in the side-effect handler.
-    if kind_u32 == KIND_PROFILE
-        && serde_json::from_str::<serde_json::Value>(&event.content).is_err()
-    {
-        return Err(
-            IngestError::Rejected("invalid: kind:0 content must be valid JSON".into()).into(),
-        );
-    }
+    let profile = if kind_u32 == KIND_PROFILE {
+        Some(
+            super::profile::prepare(tenant, &event)
+                .map_err(|message| IngestError::Rejected(format!("invalid: {message}")))?,
+        )
+    } else {
+        None
+    };
 
     if kind_u32 == KIND_EMOJI_SET || kind_u32 == KIND_EMOJI_LIST {
         validate_custom_emoji_tags(&event)?;
@@ -4543,7 +4542,18 @@ async fn ingest_event_inner(
         });
     }
 
-    let (stored_event, was_inserted) = if buzz_core::kind::is_replaceable(kind_u32) {
+    let (stored_event, was_inserted) = if let Some(profile) = profile.as_ref() {
+        let (stored, inserted, user_created) = state
+            .db
+            .replace_profile_event(tenant.community(), &event, profile)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: {e}")))?;
+        if user_created {
+            metrics::counter!("buzz_users_created_total", "community" => tenant.host().to_owned())
+                .increment(1);
+        }
+        (stored, inserted)
+    } else if buzz_core::kind::is_replaceable(kind_u32) {
         // NIP-16 replaceable event — atomic replace with stale-write protection.
         // channel_id is None for global kinds (0, 1, 3) due to step 5b above.
         state

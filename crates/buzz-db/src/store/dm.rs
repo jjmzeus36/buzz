@@ -106,6 +106,25 @@ pub async fn create_dm(
     participants: &[&[u8]],
     created_by: &[u8],
 ) -> Result<ChannelRecord> {
+    create_dm_with_status(pool, community_id, participants, created_by)
+        .await
+        .map(|(channel, _)| channel)
+}
+
+async fn create_dm_with_status(
+    pool: &PgPool,
+    community_id: CommunityId,
+    participants: &[&[u8]],
+    created_by: &[u8],
+) -> Result<(ChannelRecord, bool)> {
+    let mut participants = participants.to_vec();
+    participants.sort_unstable();
+    participants.dedup();
+    if !participants.contains(&created_by) {
+        return Err(DbError::InvalidData(
+            "DM creator must be a participant".to_string(),
+        ));
+    }
     if participants.len() < 2 {
         return Err(DbError::InvalidData(
             "DM requires at least 2 participants".to_string(),
@@ -116,7 +135,7 @@ pub async fn create_dm(
             "DM supports at most 9 participants".to_string(),
         ));
     }
-    for pk in participants {
+    for pk in &participants {
         if pk.len() != 32 {
             return Err(DbError::InvalidData(format!(
                 "pubkey must be 32 bytes, got {}",
@@ -125,11 +144,19 @@ pub async fn create_dm(
         }
     }
 
-    let hash = compute_participant_hash(participants);
+    let hash = compute_participant_hash(&participants);
 
     let mut tx = pool.begin().await?;
 
-    // Idempotency check inside the transaction.
+    // Serialize the absence check and insert across all relay pods. Namespace
+    // and tenant are part of the key; hash collisions only cause extra waiting.
+    let lock_key = format!("buzz:dm:{community_id}:{}", hex::encode(hash));
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut *tx)
+        .await?;
+
+    // Idempotency check after acquiring the participant-set lock.
     let existing = sqlx::query(
         r#"
         SELECT id, name, channel_type::text AS channel_type, visibility::text AS visibility,
@@ -153,7 +180,7 @@ pub async fn create_dm(
 
     if let Some(row) = existing {
         tx.commit().await?;
-        return row_to_channel_record(row);
+        return Ok((row_to_channel_record(row)?, false));
     }
 
     // Name the DM based on participant count.
@@ -181,7 +208,7 @@ pub async fn create_dm(
     .await?;
 
     // Add all participants as members with role='member'.
-    for pk in participants {
+    for pk in &participants {
         sqlx::query(
             r#"
             INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by)
@@ -218,7 +245,7 @@ pub async fn create_dm(
 
     let record = row_to_channel_record(row)?;
     tx.commit().await?;
-    Ok(record)
+    Ok((record, true))
 }
 
 /// List all DM conversations for a given user, ordered by most recent activity.
@@ -367,6 +394,9 @@ pub async fn open_dm(
         all.push(created_by);
     }
 
+    all.sort_unstable();
+    all.dedup();
+
     // Enforce max before hitting the DB.
     if all.len() > 9 {
         return Err(DbError::InvalidData(
@@ -384,9 +414,11 @@ pub async fn open_dm(
     }
 
     // Create new DM.
-    let channel = create_dm(pool, community_id, &all, created_by).await?;
-
-    Ok((channel, true))
+    let (channel, created) = create_dm_with_status(pool, community_id, &all, created_by).await?;
+    if !created {
+        unhide_dm(pool, community_id, channel.id, created_by).await?;
+    }
+    Ok((channel, created))
 }
 
 // -- Hide / unhide ------------------------------------------------------------
@@ -640,3 +672,6 @@ mod tests {
         assert_eq!(h.len(), 32);
     }
 }
+
+#[cfg(test)]
+mod postgres_tests;

@@ -136,16 +136,9 @@ pub async fn handle_req(
         .ok()
         .map(|pk| crate::conformance::state_for_request(&conn.tenant, &pk));
 
-    // Confirm channel access up front so the repaired `accessible_channels`
-    // vector reaches every downstream consumer: the NIP-50 search branch
-    // below, subscription registration, historical delivery, and COUNT. A
-    // cache-negative may be a stale miss on a non-writer pod (member just added
-    // on the pod that processed the write, before the 10s TTL expires or the
-    // cross-pod invalidation lands), so on a miss we confirm uncached against
-    // the DB; a verified positive repairs the vector request-locally (see
-    // `resolve_request_local_access`). Running this ahead of the search branch
-    // is what fixes the search false-miss: a `#h=<just-added>` search would
-    // otherwise be scoped against the stale vector and return empty.
+    // Confirm explicit channels absent from the initial writer-database scope:
+    // membership can be added between the list query and this check. Repair the
+    // request-local vector before search, registration, historical reads and COUNT.
     if let Some(requested) = requested_channel_ids.as_ref() {
         for &ch_id in requested {
             let token_allows = token_channel_ids

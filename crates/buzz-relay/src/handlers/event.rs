@@ -202,23 +202,38 @@ pub async fn filter_fanout_by_access(
         }
     }
 
-    let mut allowed = Vec::with_capacity(matches.len());
-    for (conn_id, sub_id) in matches {
-        let Some(pubkey) = state.conn_manager.pubkey_for_conn(conn_id) else {
-            continue;
-        };
-        match state
-            .is_member_cached(community_id, channel_id, &pubkey)
-            .await
-        {
-            Ok(true) => allowed.push((conn_id, sub_id)),
-            Ok(false) => {}
-            Err(e) => {
-                warn!(%channel_id, "fan-out access filter: membership lookup failed: {e}");
-            }
+    // One primary-database authorization read for the entire recipient batch.
+    // Cached positives are unsafe after removal on another relay pod, even if
+    // Redis delivery resumes before a missed invalidation is noticed.
+    let candidates: Vec<_> = matches
+        .into_iter()
+        .filter_map(|(conn_id, sub_id)| {
+            state
+                .conn_manager
+                .pubkey_for_conn(conn_id)
+                .map(|pubkey| (conn_id, sub_id, pubkey))
+        })
+        .collect();
+    let pubkeys: Vec<_> = candidates.iter().map(|(_, _, key)| key.clone()).collect();
+    let members = match state
+        .db
+        .membership_pairs(community_id, &[channel_id], &pubkeys)
+        .await
+    {
+        Ok(pairs) => pairs
+            .into_iter()
+            .map(|(_, key)| key)
+            .collect::<std::collections::HashSet<_>>(),
+        Err(e) => {
+            warn!(%channel_id, "fan-out access filter: membership lookup failed: {e}");
+            return Vec::new();
         }
-    }
-    allowed
+    };
+    candidates
+        .into_iter()
+        .filter(|(_, _, key)| members.contains(key))
+        .map(|(conn_id, sub_id, _)| (conn_id, sub_id))
+        .collect()
 }
 
 /// Deliver one event to this relay's local subscribers through the access gate.
@@ -2090,6 +2105,106 @@ mod tests {
     }
 
     mod fanout_access {
+        mod postgres_tests {
+            use super::*;
+
+            #[tokio::test]
+            #[ignore = "requires Postgres"]
+            async fn private_fanout_and_reads_reject_revoked_cached_member() {
+                let state = test_state().await;
+                let pool = sqlx::PgPool::connect(&state.config.database_url)
+                    .await
+                    .expect("database");
+                let community = buzz_core::CommunityId::from_uuid(Uuid::new_v4());
+                sqlx::query("INSERT INTO communities (id,host) VALUES ($1,'fanout-probe.example') ON CONFLICT DO NOTHING")
+                    .bind(community.as_uuid()).execute(&pool).await.expect("community");
+                let channel = Uuid::new_v4();
+                let member_pk = vec![1u8; 32];
+                let outsider_pk = vec![2u8; 32];
+                sqlx::query("INSERT INTO channels (community_id,id,name,channel_type,visibility,created_by) VALUES ($1,$2,'private','stream','private',$3)")
+                    .bind(community.as_uuid()).bind(channel).bind(&member_pk).execute(&pool).await.expect("channel");
+                sqlx::query("INSERT INTO channel_members (community_id,channel_id,pubkey,role) VALUES ($1,$2,$3,'member')")
+                    .bind(community.as_uuid()).bind(channel).bind(&member_pk).execute(&pool).await.expect("membership");
+                state
+                    .channel_visibility_cache
+                    .insert((community, channel), "private".into());
+                let member = register_conn_in_community(&state, community, Some(member_pk.clone()));
+                let outsider = register_conn_in_community(&state, community, Some(outsider_pk));
+                let unknown = register_conn_in_community(&state, community, None);
+                let matches = vec![
+                    (member, "member".into()),
+                    (outsider, "outsider".into()),
+                    (unknown, "unknown".into()),
+                ];
+                let event = channel_event(Some(channel));
+                let threaded = crate::state::ThreadedChannelVisibility {
+                    community_id: community,
+                    channel_id: channel,
+                    visibility: "private".into(),
+                };
+                for visibility in [None, Some(&threaded)] {
+                    assert_eq!(
+                        filter_fanout_by_access(
+                            &state,
+                            community,
+                            &event,
+                            matches.clone(),
+                            visibility
+                        )
+                        .await,
+                        vec![(member, "member".into())]
+                    );
+                }
+                // Simulate a peer removing membership while this pod misses its
+                // invalidation; also model an in-flight fill completing afterward.
+                sqlx::query("UPDATE channel_members SET removed_at=NOW() WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3")
+                    .bind(community.as_uuid()).bind(channel).bind(&member_pk).execute(&pool).await.expect("revoke");
+                state
+                    .membership_cache
+                    .insert((community, channel, member_pk.clone()), true);
+                state
+                    .accessible_channels_cache
+                    .insert((community, member_pk.clone()), vec![channel]);
+                assert!(!state
+                    .is_member_cached(community, channel, &member_pk)
+                    .await
+                    .expect("fresh membership"));
+                assert!(!state
+                    .get_accessible_channel_ids_cached(community, &member_pk)
+                    .await
+                    .expect("fresh scope")
+                    .contains(&channel));
+                for visibility in [None, Some(&threaded)] {
+                    assert!(filter_fanout_by_access(
+                        &state,
+                        community,
+                        &event,
+                        matches.clone(),
+                        visibility
+                    )
+                    .await
+                    .is_empty());
+                }
+                sqlx::query("ALTER TABLE channel_members RENAME TO unavailable_membership_probe")
+                    .execute(&pool)
+                    .await
+                    .expect("inject authorization read failure");
+                assert!(state
+                    .is_member_cached(community, channel, &member_pk)
+                    .await
+                    .is_err());
+                assert!(
+                    filter_fanout_by_access(&state, community, &event, matches, None)
+                        .await
+                        .is_empty()
+                );
+                sqlx::query("ALTER TABLE unavailable_membership_probe RENAME TO channel_members")
+                    .execute(&pool)
+                    .await
+                    .expect("recover membership table");
+            }
+        }
+
         use std::collections::HashMap;
         use std::sync::atomic::AtomicU8;
         use std::sync::Arc;
@@ -2111,40 +2226,7 @@ mod tests {
         }
 
         pub(super) async fn test_state_with_redis_url(redis_url: &str) -> Arc<AppState> {
-            let mut config = test_config();
-            config.redis_url = redis_url.to_string();
-            let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
-            let db = buzz_db::Db::from_pool(pool.clone());
-            let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
-                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-                .expect("redis pool");
-            let pubsub = Arc::new(
-                buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
-                    .await
-                    .expect("pubsub manager"),
-            );
-            let audit = buzz_audit::AuditService::new(pool.clone());
-            let auth = buzz_auth::AuthService::new(config.auth.clone());
-            let search = buzz_search::SearchService::new(pool.clone());
-            let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
-                db.clone(),
-                buzz_workflow::WorkflowConfig::default(),
-            ));
-            let media_storage =
-                buzz_media::MediaStorage::new(&config.media).expect("media storage");
-            let (state, _audit_shutdown) = AppState::new(
-                config,
-                db,
-                redis_pool,
-                audit,
-                pubsub,
-                auth,
-                search,
-                workflow_engine,
-                Keys::generate(),
-                media_storage,
-            );
-            Arc::new(state)
+            crate::test_support::app_state(redis_url).await
         }
 
         pub(super) async fn test_state() -> Arc<AppState> {
@@ -2200,6 +2282,18 @@ mod tests {
         }
 
         fn register_conn(state: &AppState, pubkey: Option<Vec<u8>>) -> Uuid {
+            register_conn_in_community(
+                state,
+                buzz_core::CommunityId::from_uuid(Uuid::nil()),
+                pubkey,
+            )
+        }
+
+        fn register_conn_in_community(
+            state: &AppState,
+            community: buzz_core::CommunityId,
+            pubkey: Option<Vec<u8>>,
+        ) -> Uuid {
             let conn_id = Uuid::new_v4();
             let (tx, _rx) = mpsc::channel(1);
             let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
@@ -2209,7 +2303,7 @@ mod tests {
                 ctrl_tx,
                 None,
                 CancellationToken::new(),
-                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                community,
                 Arc::new(AtomicU8::new(0)),
                 Arc::new(Mutex::new(HashMap::new())),
                 3,
@@ -2264,44 +2358,6 @@ mod tests {
             )
             .await;
             assert_eq!(out, matches);
-        }
-
-        #[tokio::test]
-        async fn private_channel_keeps_member_drops_non_member_and_unknown() {
-            let state = test_state().await;
-            let channel_id = Uuid::new_v4();
-            let community_id = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
-            state
-                .channel_visibility_cache
-                .insert((community_id, channel_id), "private".to_string());
-
-            let member_pk = vec![1u8; 32];
-            let non_member_pk = vec![2u8; 32];
-            state
-                .membership_cache
-                .insert((community_id, channel_id, member_pk.clone()), true);
-            state
-                .membership_cache
-                .insert((community_id, channel_id, non_member_pk.clone()), false);
-
-            let member = register_conn(&state, Some(member_pk));
-            let non_member = register_conn(&state, Some(non_member_pk));
-            let unauthed = register_conn(&state, None);
-
-            let matches = vec![
-                (member, "m".to_string()),
-                (non_member, "n".to_string()),
-                (unauthed, "u".to_string()),
-            ];
-            let out = filter_fanout_by_access(
-                &state,
-                community_id,
-                &channel_event(Some(channel_id)),
-                matches,
-                None,
-            )
-            .await;
-            assert_eq!(out, vec![(member, "m".to_string())]);
         }
 
         #[tokio::test]
@@ -2384,43 +2440,6 @@ mod tests {
                 "mismatched threaded visibility must not be consulted; \
                  fresh lookup says private → unauthenticated conn dropped"
             );
-        }
-
-        /// Matching threaded `private` gates recipients without a DB read,
-        /// identically to the fresh-lookup private path.
-        #[tokio::test]
-        async fn threaded_visibility_private_filters_members_only() {
-            let state = test_state().await;
-            let channel_id = Uuid::new_v4();
-            let community_id = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
-
-            let member_pk = vec![1u8; 32];
-            let non_member_pk = vec![2u8; 32];
-            state
-                .membership_cache
-                .insert((community_id, channel_id, member_pk.clone()), true);
-            state
-                .membership_cache
-                .insert((community_id, channel_id, non_member_pk.clone()), false);
-
-            let threaded = crate::state::ThreadedChannelVisibility {
-                community_id,
-                channel_id,
-                visibility: "private".to_string(),
-            };
-
-            let member = register_conn(&state, Some(member_pk));
-            let non_member = register_conn(&state, Some(non_member_pk));
-            let matches = vec![(member, "m".to_string()), (non_member, "n".to_string())];
-            let out = filter_fanout_by_access(
-                &state,
-                community_id,
-                &channel_event(Some(channel_id)),
-                matches,
-                Some(&threaded),
-            )
-            .await;
-            assert_eq!(out, vec![(member, "m".to_string())]);
         }
 
         /// Matching threaded `open` passes recipients through with no

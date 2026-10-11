@@ -106,3 +106,42 @@ pub(crate) fn run_exact_test_child(test_name: &str, child_env: &str) {
         "exact selector did not run the intended test {test_name}:\n{output}"
     );
 }
+
+/// Build an isolated relay state for production-path database tests.
+pub(crate) async fn app_state(redis_url: &str) -> std::sync::Arc<crate::state::AppState> {
+    let mut config = crate::config::Config::from_env().expect("test config");
+    config.require_relay_membership = false;
+    config.database_url = database_url();
+    config.redis_url = redis_url.to_string();
+    let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+    let db = buzz_db::Db::from_pool(pool.clone());
+    let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+        .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+        .expect("redis pool");
+    let pubsub = std::sync::Arc::new(
+        buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+            .await
+            .expect("pubsub manager"),
+    );
+    let audit = buzz_audit::AuditService::new(pool.clone());
+    let auth = buzz_auth::AuthService::new(config.auth.clone());
+    let search = buzz_search::SearchService::new(pool.clone());
+    let workflow_engine = std::sync::Arc::new(buzz_workflow::WorkflowEngine::new(
+        db.clone(),
+        buzz_workflow::WorkflowConfig::default(),
+    ));
+    let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+    let (state, _audit_shutdown) = crate::state::AppState::new(
+        config,
+        db,
+        redis_pool,
+        audit,
+        pubsub,
+        auth,
+        search,
+        workflow_engine,
+        nostr::Keys::generate(),
+        media_storage,
+    );
+    std::sync::Arc::new(state)
+}
