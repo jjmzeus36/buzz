@@ -321,9 +321,9 @@ fn extract_buzz_channel(raw: &Value) -> Option<&str> {
 }
 
 /// Preserve bridge-only extension fields alongside the typed Nostr filter.
-fn parse_bridge_filters(
-    body: &[u8],
-) -> Result<(Vec<Value>, Vec<nostr::Filter>), (StatusCode, Json<Value>)> {
+type BridgeFilters = (Vec<Value>, Vec<nostr::Filter>);
+
+fn parse_bridge_filters(body: &[u8]) -> Result<BridgeFilters, (StatusCode, Json<Value>)> {
     let raw_filters: Vec<Value> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
     let filters: Vec<nostr::Filter> = raw_filters
