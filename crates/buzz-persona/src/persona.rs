@@ -41,7 +41,7 @@ pub enum PersonaError {
     TooLarge(String),
 
     #[error("failed to parse YAML frontmatter: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_saphyr::Error),
 
     #[error("missing required field: {0}")]
     MissingField(String),
@@ -215,7 +215,15 @@ pub fn parse_persona_md(content: &str) -> Result<PersonaConfig, PersonaError> {
         return Err(PersonaError::BodyTooLarge);
     }
 
-    let fm: Frontmatter = serde_yaml::from_str(fm_str)?;
+    let fm: Frontmatter = serde_saphyr::from_str_with_options(
+        fm_str,
+        serde_saphyr::options! {
+            strict_booleans: true,
+            with_snippet: false,
+            merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+            ignore_binary_tag_for_string: true,
+        },
+    )?;
 
     let name = fm.name.ok_or(PersonaError::MissingField("name".into()))?;
     let display_name = fm
@@ -337,12 +345,52 @@ mod tests {
     }
 
     #[test]
+    fn yaml12_scalars_aliases_and_empty_documents_keep_persona_contract() {
+        let input = "---\nname: &name bot\ndisplay_name: *name\ndescription: !!binary aGVsbG8=\nsubscribe: null\ntemperature: 0.25\nmax_context_tokens: 2048\nthread_replies: TRUE\nbroadcast_replies: false\n---\nPrompt";
+        let persona = parse_persona_md(input).unwrap();
+        assert_eq!(persona.display_name, "bot");
+        assert_eq!(persona.description, "aGVsbG8=");
+        assert_eq!(persona.subscribe, None);
+        assert_eq!(persona.temperature, Some(0.25));
+        assert_eq!(persona.max_context_tokens, Some(2048));
+        assert_eq!(persona.thread_replies, Some(true));
+        assert_eq!(persona.broadcast_replies, Some(false));
+        assert!(parse_persona_md("---\n\n---\n").is_err());
+        for legacy in ["yes", "no", "on", "off"] {
+            let yaml = format!("---\nname: bot\ndisplay_name: Bot\ndescription: Test\nthread_replies: {legacy}\n---\n");
+            assert!(parse_persona_md(&yaml).is_err(), "legacy boolean {legacy}");
+        }
+        assert!(parse_persona_md(
+            "---\nbase: &base {name: bot}\n<<: *base\ndisplay_name: Bot\ndescription: Test\n---\n"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn parse_minimal_valid() {
         let p = parse_persona_md(minimal()).unwrap();
         assert_eq!(p.name, "my-bot");
         assert_eq!(p.display_name, "My Bot");
         assert_eq!(p.description, "Does things.");
         assert_eq!(p.prompt, "");
+    }
+
+    #[test]
+    fn numeric_fields_respect_explicit_string_tags_and_yaml_digit_separators() {
+        for field in ["temperature", "max_context_tokens"] {
+            let yaml = format!(
+                "---\nname: bot\ndisplay_name: Bot\ndescription: Test\n{field}: !!str 42\n---\n"
+            );
+            assert!(
+                parse_persona_md(&yaml).is_err(),
+                "explicit string in {field}"
+            );
+        }
+        let yaml = "---\nname: bot\ndisplay_name: Bot\ndescription: Test\nmax_context_tokens: 1_000\n---\n";
+        assert_eq!(
+            parse_persona_md(yaml).unwrap().max_context_tokens,
+            Some(1000)
+        );
     }
 
     #[test]

@@ -105,7 +105,19 @@ pub fn plan(
                 // No server-assigned timestamp means no age proof. Skip.
                 continue;
             };
-            if (now - created.0).num_seconds() >= ORPHAN_SECRET_MIN_AGE_SECS {
+            // k8s-openapi uses Jiff; retain subsecond precision and pre-epoch
+            // instants when comparing with the HTTP Date clock from Chrono.
+            let nanos = created.0.as_nanosecond();
+            let (Ok(seconds), Ok(subsec)) = (
+                i64::try_from(nanos.div_euclid(1_000_000_000)),
+                u32::try_from(nanos.rem_euclid(1_000_000_000)),
+            ) else {
+                continue;
+            };
+            let Some(created) = DateTime::<Utc>::from_timestamp(seconds, subsec) else {
+                continue;
+            };
+            if (now - created).num_seconds() >= ORPHAN_SECRET_MIN_AGE_SECS {
                 plan.secrets.push(name.to_string());
             }
         }
@@ -176,10 +188,34 @@ mod tests {
                     .into_iter()
                     .collect::<BTreeMap<_, _>>(),
                 ),
-                creation_timestamp: Some(Time(now - chrono::Duration::seconds(age_secs))),
+                creation_timestamp: Some(Time(
+                    k8s_openapi::jiff::Timestamp::new(
+                        now.timestamp() - age_secs,
+                        now.timestamp_subsec_nanos() as i32,
+                    )
+                    .unwrap(),
+                )),
                 ..Default::default()
             },
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn jiff_conversion_preserves_orphan_age_threshold_and_pre_epoch_instants() {
+        for seconds in [1_700_000_000, -1_700_000_000] {
+            let now = DateTime::<Utc>::from_timestamp(seconds, 500_000_000).unwrap();
+            let id = identity();
+            let mut almost = secret_named(&id, "almost", ORPHAN_SECRET_MIN_AGE_SECS, now);
+            let created = almost.metadata.creation_timestamp.as_mut().unwrap();
+            created.0 =
+                k8s_openapi::jiff::Timestamp::from_nanosecond(created.0.as_nanosecond() + 1)
+                    .unwrap();
+            let exact = secret_named(&id, "exact", ORPHAN_SECRET_MIN_AGE_SECS, now);
+            assert_eq!(
+                plan(&id, &[], &[almost, exact], never, Some(now)).secrets,
+                vec!["exact"]
+            );
         }
     }
 

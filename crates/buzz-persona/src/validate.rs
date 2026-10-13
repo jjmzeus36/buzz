@@ -404,29 +404,42 @@ fn advisory_check_skill_names(
             None => continue,
         };
 
-        let yaml_val: serde_yaml::Value = match serde_yaml::from_str(fm_str) {
+        // Untagged buffering keeps numeric names non-string, while IgnoredAny
+        // accepts arbitrary YAML values in extension fields without a JSON DOM.
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum SkillField {
+            Text(String),
+            Other(serde::de::IgnoredAny),
+        }
+        #[derive(serde::Deserialize)]
+        struct SkillFrontmatter {
+            name: Option<SkillField>,
+        }
+        let mapping: SkillFrontmatter = match serde_saphyr::from_str_with_options(
+            fm_str,
+            serde_saphyr::options! {
+                strict_booleans: true,
+            with_snippet: false,
+                merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+                ignore_binary_tag_for_string: true,
+            },
+        ) {
             Ok(v) => v,
             Err(_) => continue,
         };
 
-        let mapping = match yaml_val.as_mapping() {
-            Some(m) => m,
-            None => continue,
-        };
-
-        if let Some(name_val) = mapping.get(serde_yaml::Value::String("name".into())) {
-            if let Some(name_str) = name_val.as_str() {
-                if let Some(dir_name) = skill_dir.file_name().and_then(|n| n.to_str()) {
-                    if name_str != dir_name {
-                        let label = skill_dir
-                            .strip_prefix(pack_dir)
-                            .unwrap_or(skill_dir)
-                            .display()
-                            .to_string();
-                        report.warn(format!(
+        if let Some(SkillField::Text(name_str)) = mapping.name.as_ref() {
+            if let Some(dir_name) = skill_dir.file_name().and_then(|n| n.to_str()) {
+                if name_str != dir_name {
+                    let label = skill_dir
+                        .strip_prefix(pack_dir)
+                        .unwrap_or(skill_dir)
+                        .display()
+                        .to_string();
+                    report.warn(format!(
                             "skill {label}: name \"{name_str}\" differs from directory name \"{dir_name}\""
                         ));
-                    }
                 }
             }
         }
@@ -783,6 +796,33 @@ mod tests {
         assert!(report.has_warnings(), "expected naming mismatch warning");
         let msg = format!("{report}");
         assert!(msg.contains("code_review"), "got: {msg}");
+    }
+
+    #[test]
+    fn skill_name_advisory_accepts_yaml_only_extension_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join(".plugin")).unwrap();
+        std::fs::create_dir_all(dir.join("agents")).unwrap();
+        std::fs::create_dir_all(dir.join("skills/code-review")).unwrap();
+        std::fs::write(
+            dir.join(".plugin/plugin.json"),
+            r#"{"id":"t","name":"T","version":"0.1.0","personas":["agents/t.persona.md"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("agents/t.persona.md"),
+            "---\nname: t\ndisplay_name: T\ndescription: T.\nskills: [skills/code-review]\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("skills/code-review/SKILL.md"),
+            "---\nname: code_review\nextra:\n  ? [a, b]\n  : 17\n---\nBody",
+        )
+        .unwrap();
+        let report = validate_pack(dir);
+        assert!(!report.has_errors(), "{report}");
+        assert!(format!("{report}").contains("code_review"), "{report}");
     }
 
     /// Zero personas in manifest → hard error.

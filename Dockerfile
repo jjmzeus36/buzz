@@ -63,6 +63,9 @@ RUN apt-get update \
 # locations. The normal runtime strips it below; runtime-debug retains it.
 ENV CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 COPY --from=planner /build/recipe.json recipe.json
+# The Git-source patch is excluded from workspace membership, so cargo-chef's
+# recipe does not recreate it. Keep its exact source available while cooking.
+COPY --from=planner /build/third_party/mesh-llm third_party/mesh-llm
 # Cook the full workspace recipe — relay deps include workspace siblings, so
 # scoping to -p buzz-relay misses transitive deps and re-builds them later.
 RUN cargo chef cook --release --recipe-path recipe.json

@@ -55,6 +55,7 @@ on:
       - "scripts/test-relay-image-eligibility-workflow.sh"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "third_party/mesh-llm/**"
       - "rust-toolchain.toml"
       - "crates/**"
       - "web/**"

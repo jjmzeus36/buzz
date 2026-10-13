@@ -59,7 +59,7 @@ jobs:
             target/ci/git-credential-nostr
             target/ci/backend-integration-tests.tar.zst
             target/ci/postgres-tests.tar.zst
-          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/schema.sql', 'docs/nips/NIP-MP.fixtures.json', 'scripts/reconcile-schema-after-pgschema.sql', 'Dockerfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.config/nextest.toml', 'scripts/postgres-test-*.sh', 'scripts/check-postgres-test-discovery.py', '.github/workflows/ci.yml', '.github/workflows/_ci-*.yml') }}
+          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'third_party/mesh-llm/**', 'scripts/verify-mesh-host-runtime-upstream.py', 'migrations/**', 'schema/schema.sql', 'docs/nips/NIP-MP.fixtures.json', 'scripts/reconcile-schema-after-pgschema.sql', 'Dockerfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.config/nextest.toml', 'scripts/postgres-test-*.sh', 'scripts/check-postgres-test-discovery.py', '.github/workflows/ci.yml', '.github/workflows/_ci-*.yml') }}
       - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
         if: steps.relay-artifacts-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
@@ -126,7 +126,7 @@ jobs:
             target/ci/git-credential-nostr
             target/ci/backend-integration-tests.tar.zst
             target/ci/postgres-tests.tar.zst
-          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/schema.sql', 'docs/nips/NIP-MP.fixtures.json', 'scripts/reconcile-schema-after-pgschema.sql', 'Dockerfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.config/nextest.toml', 'scripts/postgres-test-*.sh', 'scripts/check-postgres-test-discovery.py', '.github/workflows/ci.yml', '.github/workflows/_ci-*.yml') }}
+          key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'third_party/mesh-llm/**', 'scripts/verify-mesh-host-runtime-upstream.py', 'migrations/**', 'schema/schema.sql', 'docs/nips/NIP-MP.fixtures.json', 'scripts/reconcile-schema-after-pgschema.sql', 'Dockerfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.config/nextest.toml', 'scripts/postgres-test-*.sh', 'scripts/check-postgres-test-discovery.py', '.github/workflows/ci.yml', '.github/workflows/_ci-*.yml') }}
       - name: Upload relay artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

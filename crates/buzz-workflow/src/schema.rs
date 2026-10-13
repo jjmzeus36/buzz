@@ -334,7 +334,15 @@ pub(crate) fn normalize_cron(expr: &str) -> String {
 ///
 /// Returns `(WorkflowDef, canonical_json)` on success.
 pub fn parse_yaml(yaml: &str) -> Result<(WorkflowDef, String), WorkflowError> {
-    let def: WorkflowDef = serde_yaml::from_str(yaml)?;
+    let def: WorkflowDef = serde_saphyr::from_str_with_options(
+        yaml,
+        serde_saphyr::options! {
+            strict_booleans: true,
+            with_snippet: false,
+            merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+            ignore_binary_tag_for_string: true,
+        },
+    )?;
     def.validate()?;
     let json =
         serde_json::to_string(&def).map_err(|e| WorkflowError::InvalidDefinition(e.to_string()))?;
@@ -344,6 +352,37 @@ pub fn parse_yaml(yaml: &str) -> Result<(WorkflowDef, String), WorkflowError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_yaml_diagnostics_do_not_copy_neighboring_payload_values() {
+        let error = parse_yaml("name: demo\ndescription: synthetic-private-neighbor\ntrigger: {on: webhook}\nsteps: [\n").unwrap_err();
+        assert!(!error.to_string().contains("synthetic-private-neighbor"));
+    }
+
+    #[test]
+    fn yaml12_scalars_aliases_and_tags_keep_workflow_contract() {
+        let yaml = "name: &label Review\ndescription: *label\nenabled: FALSE\ntrigger: {on: message_posted, filter: null}\nsteps:\n  - id: notify\n    action: send_message\n    text: !!binary aGVsbG8=\n    timeout_secs: 30\n    reply_in_thread: true\n";
+        let (definition, json) = parse_yaml(yaml).unwrap();
+        assert_eq!(definition.description.as_deref(), Some("Review"));
+        assert!(!definition.enabled);
+        assert_eq!(definition.steps[0].timeout_secs, Some(30));
+        let canonical: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(canonical["steps"][0]["text"], "aGVsbG8=");
+        assert_eq!(canonical["steps"][0]["reply_in_thread"], true);
+        for invalid in ["", "null", "[]"] {
+            assert!(parse_yaml(invalid).is_err());
+        }
+        for legacy in ["yes", "no", "on", "off"] {
+            assert!(
+                parse_yaml(&yaml.replace("enabled: FALSE", &format!("enabled: {legacy}"))).is_err()
+            );
+        }
+        let merge_only = "base: &base {name: Review}\n<<: *base\ntrigger: {on: message_posted}\nsteps: [{id: d, action: delay, duration: 1m}]\n";
+        assert!(
+            parse_yaml(merge_only).is_err(),
+            "merge keys must not silently supply required fields"
+        );
+    }
 
     #[test]
     fn parse_simple_message_posted_workflow() {
@@ -804,7 +843,7 @@ mod tests {
         // Unknown trigger `on:` value should fail deserialization.
         let yaml = "name: Bad Trigger\ntrigger:\n  on: unknown_trigger_type\nsteps:\n  - id: s1\n    action: delay\n    duration: 1m\n";
         let err = parse_yaml(yaml).unwrap_err();
-        // serde_yaml will return an InvalidYaml error for unknown enum variant.
+        // The YAML parser returns an InvalidYaml error for unknown enum variant.
         assert!(
             matches!(
                 err,
@@ -1046,16 +1085,34 @@ mod tests {
     #[test]
     fn diff_posted_trigger_roundtrips_yaml() {
         let yaml = "on: diff_posted\n";
-        let trigger: TriggerDef = serde_yaml::from_str(yaml).unwrap();
+        let trigger: TriggerDef = serde_saphyr::from_str_with_options(
+            yaml,
+            serde_saphyr::options! {
+                strict_booleans: true,
+            with_snippet: false,
+                merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+                ignore_binary_tag_for_string: true,
+            },
+        )
+        .unwrap();
         assert!(matches!(trigger, TriggerDef::DiffPosted { filter: None }));
-        let back = serde_yaml::to_string(&trigger).unwrap();
+        let back = serde_saphyr::to_string(&trigger).unwrap();
         assert!(back.contains("diff_posted"));
     }
 
     #[test]
     fn diff_posted_trigger_with_filter_roundtrips_yaml() {
         let yaml = "on: diff_posted\nfilter: 'str_contains(trigger_text, \"src/\")'\n";
-        let trigger: TriggerDef = serde_yaml::from_str(yaml).unwrap();
+        let trigger: TriggerDef = serde_saphyr::from_str_with_options(
+            yaml,
+            serde_saphyr::options! {
+                strict_booleans: true,
+            with_snippet: false,
+                merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+                ignore_binary_tag_for_string: true,
+            },
+        )
+        .unwrap();
         assert!(matches!(
             trigger,
             TriggerDef::DiffPosted { filter: Some(_) }

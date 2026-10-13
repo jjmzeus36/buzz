@@ -1,0 +1,975 @@
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result, anyhow};
+use skippy_coordinator::{ClaimDecision, ClaimFence, LoadClaimRef};
+use skippy_protocol::{FlashAttentionType, LoadMode, PeerConfig, StageConfig};
+use skippy_server::{EmbeddedServerHandle, binary_transport::BinaryStageOptions};
+use tokio::{
+    sync::{Mutex, mpsc},
+    task::JoinHandle,
+};
+
+mod inventory;
+#[cfg(test)]
+mod tests;
+mod types;
+
+use inventory::{resolve_inventory_source, run_stage_prepare_task};
+pub(crate) use types::*;
+
+struct RunningStage {
+    load: StageLoadRequest,
+    server: EmbeddedServerHandle,
+    materialized: Option<super::materialization::MaterializedStageArtifact>,
+    package: Option<super::materialization::ResolvedStagePackage>,
+    _materialized_pin: Option<super::materialization::MaterializedStagePin>,
+}
+
+#[derive(Default)]
+struct StageControlState {
+    stages: HashMap<String, RunningStage>,
+    coordinator_claims: ClaimFence,
+    preparations: Arc<Mutex<HashMap<String, StagePreparationStatus>>>,
+    preparation_tasks: HashMap<String, StagePreparationTask>,
+    package_prefetcher: Option<Arc<dyn StagePackagePrefetcher>>,
+    telemetry: super::SkippyTelemetryOptions,
+}
+
+struct StagePreparationTask {
+    cancelled: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+#[async_trait::async_trait]
+pub(crate) trait StagePackagePrefetcher: Send + Sync {
+    async fn prefetch_stage_package(&self, request: &StagePrepareRequest) -> Result<()>;
+}
+
+pub(crate) fn spawn_stage_control_loop(
+    package_prefetcher: Option<Arc<dyn StagePackagePrefetcher>>,
+    telemetry: super::SkippyTelemetryOptions,
+) -> mpsc::UnboundedSender<StageControlCommand> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<StageControlCommand>();
+    tokio::spawn(async move {
+        let mut state = StageControlState {
+            package_prefetcher,
+            telemetry,
+            ..Default::default()
+        };
+        while let Some(command) = rx.recv().await {
+            let result = state.handle(command.request).await;
+            let _ = command.resp.send(result);
+        }
+    });
+    tx
+}
+
+impl StageControlState {
+    async fn handle(&mut self, request: StageControlRequest) -> Result<StageControlResponse> {
+        match request {
+            StageControlRequest::Claim(claim) => self
+                .claim(claim)
+                .await
+                .map(StageControlResponse::ClaimAccepted),
+            StageControlRequest::Load(load) => {
+                self.load(load).await.map(StageControlResponse::Ready)
+            }
+            StageControlRequest::Stop(stop) => {
+                self.stop(stop).await.map(StageControlResponse::Ready)
+            }
+            StageControlRequest::Status(filter) => {
+                Ok(StageControlResponse::Status(self.statuses(&filter)))
+            }
+            StageControlRequest::Inventory(request) => Ok(StageControlResponse::Inventory(
+                self.inventory(request).await,
+            )),
+            StageControlRequest::Prepare(request) => Ok(StageControlResponse::PrepareAccepted(
+                self.prepare(request).await?,
+            )),
+            StageControlRequest::CancelPrepare(cancel) => Ok(
+                StageControlResponse::PreparationStatus(self.cancel_prepare(cancel).await),
+            ),
+            StageControlRequest::StatusUpdate(_status) => Ok(StageControlResponse::StatusAck(
+                self.apply_status_update(_status).await,
+            )),
+        }
+    }
+
+    async fn claim(&mut self, claim: StageCoordinatorClaim) -> Result<StageCoordinatorClaimAck> {
+        let attempted_claim = claim.clone();
+        match self
+            .coordinator_claims
+            .accept_claim(claim, current_time_unix_ms())
+        {
+            ClaimDecision::Accepted {
+                supersedes_term: Some(_),
+                claim,
+            } => {
+                self.fence_stale_runtime_for_claim(&claim).await?;
+                Ok(StageCoordinatorClaimAck {
+                    accepted: true,
+                    claim,
+                    error: None,
+                })
+            }
+            ClaimDecision::Accepted { claim, .. } => Ok(StageCoordinatorClaimAck {
+                accepted: true,
+                claim,
+                error: None,
+            }),
+            ClaimDecision::Rejected { reason, .. } => Ok(StageCoordinatorClaimAck {
+                accepted: false,
+                claim: attempted_claim,
+                error: Some(reason.to_string()),
+            }),
+        }
+    }
+
+    async fn inventory(&self, request: StageInventoryRequest) -> StageLayerInventory {
+        let preparing_ranges = self
+            .preparations
+            .lock()
+            .await
+            .values()
+            .filter(|status| {
+                status.model_id == request.model_id
+                    && status.package_ref == request.package_ref
+                    && status.manifest_sha256 == request.manifest_sha256
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let source = resolve_inventory_source(&request);
+        let layer_count = source
+            .as_ref()
+            .map(|source| source.layer_count)
+            .unwrap_or(0);
+        let available_ranges = if source.is_some() && layer_count > 0 {
+            vec![LayerRange {
+                layer_start: 0,
+                layer_end: layer_count,
+            }]
+        } else {
+            Vec::new()
+        };
+        let ready_ranges = self
+            .stages
+            .values()
+            .filter(|stage| {
+                stage.load.model_id == request.model_id
+                    && stage.load.package_ref == request.package_ref
+                    && stage.load.manifest_sha256 == request.manifest_sha256
+            })
+            .map(|stage| LayerRange {
+                layer_start: stage.load.layer_start,
+                layer_end: stage.load.layer_end,
+            })
+            .collect::<Vec<_>>();
+        let missing_ranges = if source.is_none() && layer_count > 0 {
+            vec![LayerRange {
+                layer_start: 0,
+                layer_end: layer_count,
+            }]
+        } else {
+            Vec::new()
+        };
+        StageLayerInventory {
+            model_id: request.model_id,
+            package_ref: request.package_ref,
+            manifest_sha256: request.manifest_sha256,
+            layer_count,
+            ready_ranges,
+            available_ranges,
+            missing_ranges,
+            preparing_ranges,
+            source_model_path: source
+                .as_ref()
+                .map(|source| source.path.to_string_lossy().to_string()),
+            source_model_bytes: source.as_ref().and_then(|source| source.bytes),
+            source_model_kind: source
+                .as_ref()
+                .map(|source| source.kind)
+                .unwrap_or(SourceModelKind::Unknown),
+        }
+    }
+
+    async fn prepare(
+        &mut self,
+        request: StagePrepareRequest,
+    ) -> Result<StagePrepareAcceptedResponse> {
+        if let Some(error) = self.validate_load_claim(&request.load) {
+            return Ok(StagePrepareAcceptedResponse {
+                accepted: false,
+                status: preparation_status_from_load(
+                    &request.load,
+                    StagePreparationState::Failed,
+                    Some(error.clone()),
+                ),
+                error: Some(error),
+            });
+        }
+        let key = stage_key(
+            &request.load.topology_id,
+            &request.load.run_id,
+            &request.load.stage_id,
+        );
+        let status =
+            preparation_status_from_load(&request.load, StagePreparationState::Assigned, None);
+        {
+            let mut preparations = self.preparations.lock().await;
+            if let Some(existing) = preparations.get(&key)
+                && existing.state == StagePreparationState::Cancelled
+                && existing.shutdown_generation >= request.load.shutdown_generation
+            {
+                let mut status = existing.clone();
+                status.error = Some("stale shutdown generation".to_string());
+                return Ok(StagePrepareAcceptedResponse {
+                    accepted: false,
+                    status,
+                    error: Some("stale shutdown generation".to_string()),
+                });
+            }
+            preparations.insert(key.clone(), status.clone());
+        }
+        if let Some(task) = self.preparation_tasks.remove(&key) {
+            task.cancelled.store(true, Ordering::Release);
+            task.handle.abort();
+        }
+        let preparations = Arc::clone(&self.preparations);
+        let package_prefetcher = self.package_prefetcher.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = Arc::clone(&cancelled);
+        let task_key = key.clone();
+        let handle = tokio::spawn(async move {
+            run_stage_prepare_task(
+                preparations,
+                task_key,
+                request,
+                package_prefetcher,
+                task_cancelled,
+            )
+            .await;
+        });
+        self.preparation_tasks
+            .insert(key.clone(), StagePreparationTask { cancelled, handle });
+        Ok(StagePrepareAcceptedResponse {
+            accepted: true,
+            status,
+            error: None,
+        })
+    }
+
+    async fn cancel_prepare(
+        &mut self,
+        cancel: StageCancelPrepareRequest,
+    ) -> StagePreparationStatus {
+        let key = stage_key(&cancel.topology_id, &cancel.run_id, &cancel.stage_id);
+        let mut preparations = self.preparations.lock().await;
+        if let Some(existing) = preparations.get(&key)
+            && cancel.shutdown_generation < existing.shutdown_generation
+        {
+            let mut status = existing.clone();
+            status.error = Some("stale shutdown generation".to_string());
+            return status;
+        }
+
+        if let Some(task) = self.preparation_tasks.remove(&key) {
+            task.cancelled.store(true, Ordering::Release);
+            task.handle.abort();
+        }
+
+        let status = preparations
+            .get(&key)
+            .cloned()
+            .map(|mut status| {
+                status.state = StagePreparationState::Cancelled;
+                status.shutdown_generation = cancel.shutdown_generation;
+                status.error = None;
+                status
+            })
+            .unwrap_or_else(|| preparation_status_from_cancel(cancel));
+        preparations.insert(key, status.clone());
+        status
+    }
+
+    async fn apply_status_update(&mut self, status: StagePreparationStatus) -> StageStatusAck {
+        if status.topology_id.is_empty() || status.run_id.is_empty() || status.stage_id.is_empty() {
+            return StageStatusAck {
+                accepted: false,
+                error: Some(
+                    "stage status update requires topology_id, run_id, and stage_id".into(),
+                ),
+            };
+        }
+        let key = stage_key(&status.topology_id, &status.run_id, &status.stage_id);
+        let mut preparations = self.preparations.lock().await;
+        if preparations.get(&key).is_some_and(|existing| {
+            status.shutdown_generation < existing.shutdown_generation
+                || (matches!(existing.state, StagePreparationState::Cancelled)
+                    && status.shutdown_generation <= existing.shutdown_generation)
+        }) {
+            return StageStatusAck {
+                accepted: false,
+                error: Some("stale shutdown generation".to_string()),
+            };
+        }
+        preparations.insert(key, status);
+        StageStatusAck {
+            accepted: true,
+            error: None,
+        }
+    }
+
+    async fn load(&mut self, load: StageLoadRequest) -> Result<StageReadyResponse> {
+        anyhow::ensure!(
+            load.backend == "skippy",
+            "unsupported stage backend '{}'",
+            load.backend
+        );
+        if let Some(error) = self.validate_load_claim(&load) {
+            return Ok(StageReadyResponse {
+                accepted: false,
+                status: failed_status_from_load(&load, error.clone()),
+                error: Some(error),
+            });
+        }
+        let key = stage_key(&load.topology_id, &load.run_id, &load.stage_id);
+        if let Some(existing) = self.stages.remove(&key) {
+            existing.server.shutdown().await?;
+        }
+
+        let bind_addr = materialize_stage_bind_addr(parse_bind_addr(&load.bind_addr)?)?;
+        let mut effective_load = load;
+        effective_load.bind_addr = bind_addr.to_string();
+        super::configure_materialized_stage_cache();
+        let package_request = effective_load.clone();
+        let mut resolved_package = None;
+        if let Some(package) = tokio::task::spawn_blocking(move || {
+            super::materialization::resolve_stage_load_package(&package_request)
+        })
+        .await
+        .context("join resolve stage load package task")??
+        {
+            effective_load.model_path = Some(package.local_ref.clone());
+            effective_load.source_model_bytes = package.source_model_bytes;
+            resolved_package = Some(package);
+        }
+        let config = stage_config(&effective_load, None, resolved_package.as_ref())?;
+        let server = skippy_server::start_binary_stage(BinaryStageOptions {
+            config,
+            topology: None,
+            bind_addr,
+            activation_width: effective_load.activation_width,
+            wire_dtype: effective_load.wire_dtype.into(),
+            metrics_otlp_grpc: self.telemetry.metrics_otlp_grpc.clone(),
+            telemetry_queue_capacity: self.telemetry.queue_capacity,
+            telemetry_level: self.telemetry.level,
+            max_inflight: effective_load.lane_count as usize,
+            reply_credit_limit: None,
+            async_prefill_forward: true,
+            downstream_wire_condition: super::benchmark_downstream_wire_condition()?,
+            downstream_connect_timeout_secs: 30,
+            native_mtp_enabled: effective_load.native_mtp_enabled,
+            openai: None,
+        });
+        if let Err(error) =
+            wait_for_binary_stage_ready(bind_addr, stage_load_timeout(&effective_load)).await
+        {
+            let last_error = server.status().last_error;
+            let context = stage_load_failure_context(
+                &effective_load,
+                "binary stage did not become ready",
+                last_error.as_deref(),
+            );
+            let _ = server.shutdown().await;
+            return Err(error.context(context));
+        }
+
+        self.stages.insert(
+            key,
+            RunningStage {
+                load: effective_load.clone(),
+                server,
+                materialized: None,
+                package: resolved_package,
+                _materialized_pin: None,
+            },
+        );
+        let status = self
+            .statuses(&StageStatusFilter {
+                topology_id: Some(effective_load.topology_id.clone()),
+                run_id: Some(effective_load.run_id.clone()),
+                stage_id: Some(effective_load.stage_id.clone()),
+            })
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("stage status missing after load"))?;
+        Ok(StageReadyResponse {
+            accepted: true,
+            status,
+            error: None,
+        })
+    }
+
+    async fn stop(&mut self, stop: StageStopRequest) -> Result<StageReadyResponse> {
+        let key = stage_key(&stop.topology_id, &stop.run_id, &stop.stage_id);
+        let Some(existing) = self.stages.remove(&key) else {
+            let status = stopped_status(&stop);
+            return Ok(StageReadyResponse {
+                accepted: true,
+                status,
+                error: None,
+            });
+        };
+        if stop.coordinator_term < existing.load.coordinator_term {
+            let current_term = existing.load.coordinator_term;
+            let status = status_from_running(&existing);
+            self.stages.insert(key, existing);
+            return Ok(StageReadyResponse {
+                accepted: false,
+                status,
+                error: Some(format!(
+                    "stale coordinator term {} < {}",
+                    stop.coordinator_term, current_term
+                )),
+            });
+        }
+        if stop.shutdown_generation < existing.load.shutdown_generation {
+            let status = status_from_running(&existing);
+            self.stages.insert(key, existing);
+            return Ok(StageReadyResponse {
+                accepted: false,
+                status,
+                error: Some("stale shutdown generation".to_string()),
+            });
+        }
+        let mut status = status_from_running(&existing);
+        status.state = StageRuntimeState::Stopping;
+        existing.server.shutdown().await?;
+        status.state = StageRuntimeState::Stopped;
+        status.shutdown_generation = stop.shutdown_generation;
+        Ok(StageReadyResponse {
+            accepted: true,
+            status,
+            error: None,
+        })
+    }
+
+    fn statuses(&self, filter: &StageStatusFilter) -> Vec<StageStatusSnapshot> {
+        self.stages
+            .values()
+            .filter(|stage| filter.matches(&stage.load))
+            .map(status_from_running)
+            .collect()
+    }
+
+    fn validate_load_claim(&self, load: &StageLoadRequest) -> Option<String> {
+        if load.coordinator_term == 0 && load.coordinator_id.is_none() {
+            return None;
+        }
+        self.coordinator_claims
+            .validate_load(&load_claim_ref(load), current_time_unix_ms())
+            .err()
+            .map(|error| error.to_string())
+    }
+
+    async fn fence_stale_runtime_for_claim(&mut self, claim: &StageCoordinatorClaim) -> Result<()> {
+        let stale_keys = self
+            .stages
+            .iter()
+            .filter_map(|(key, stage)| {
+                (stage.load.model_id == claim.model_id
+                    && stage.load.package_ref == claim.package_ref
+                    && stage.load.manifest_sha256 == claim.manifest_sha256
+                    && stage.load.coordinator_term < claim.coordinator_term)
+                    .then_some(key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in stale_keys {
+            if let Some(stage) = self.stages.remove(&key) {
+                stage.server.shutdown().await?;
+            }
+        }
+
+        let mut preparations = self.preparations.lock().await;
+        let stale_preparations = preparations
+            .iter()
+            .filter_map(|(key, status)| {
+                (status.model_id == claim.model_id
+                    && status.package_ref == claim.package_ref
+                    && status.manifest_sha256 == claim.manifest_sha256
+                    && status.coordinator_term < claim.coordinator_term)
+                    .then_some(key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in stale_preparations {
+            if let Some(task) = self.preparation_tasks.remove(&key) {
+                task.cancelled.store(true, Ordering::Release);
+                task.handle.abort();
+            }
+            if let Some(status) = preparations.get_mut(&key) {
+                status.state = StagePreparationState::Cancelled;
+                status.error = Some("superseded by newer coordinator term".to_string());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl StageStatusFilter {
+    fn matches(&self, load: &StageLoadRequest) -> bool {
+        self.topology_id
+            .as_ref()
+            .is_none_or(|value| value == &load.topology_id)
+            && self
+                .run_id
+                .as_ref()
+                .is_none_or(|value| value == &load.run_id)
+            && self
+                .stage_id
+                .as_ref()
+                .is_none_or(|value| value == &load.stage_id)
+    }
+}
+
+fn stage_key(topology_id: &str, run_id: &str, stage_id: &str) -> String {
+    format!("{topology_id}\n{run_id}\n{stage_id}")
+}
+
+fn current_time_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn load_claim_ref(load: &StageLoadRequest) -> LoadClaimRef {
+    LoadClaimRef {
+        model_id: load.model_id.clone(),
+        package_ref: load.package_ref.clone(),
+        manifest_sha256: load.manifest_sha256.clone(),
+        topology_id: load.topology_id.clone(),
+        run_id: load.run_id.clone(),
+        coordinator_id: load.coordinator_id.map(|id| id.to_string()),
+        coordinator_term: load.coordinator_term,
+    }
+}
+
+fn parse_bind_addr(bind_addr: &str) -> Result<SocketAddr> {
+    bind_addr
+        .parse()
+        .with_context(|| format!("parse stage bind_addr {bind_addr:?}"))
+}
+
+fn materialize_stage_bind_addr(bind_addr: SocketAddr) -> Result<SocketAddr> {
+    if bind_addr.port() != 0 {
+        return Ok(bind_addr);
+    }
+    let listener = std::net::TcpListener::bind(bind_addr)
+        .with_context(|| format!("reserve ephemeral stage bind address for {bind_addr}"))?;
+    listener
+        .local_addr()
+        .context("read reserved ephemeral stage bind address")
+}
+
+async fn wait_for_binary_stage_ready(bind_addr: SocketAddr, timeout: Duration) -> Result<()> {
+    tokio::task::spawn_blocking(move || probe_binary_stage_ready(bind_addr, timeout))
+        .await
+        .context("join binary stage readiness probe")?
+}
+
+pub(crate) fn stage_load_timeout(load: &StageLoadRequest) -> Duration {
+    const MIN_STAGE_LOAD_TIMEOUT_SECS: u64 = 900;
+    const MAX_STAGE_LOAD_TIMEOUT_SECS: u64 = 4 * 60 * 60;
+    const STAGE_LOAD_BYTES_PER_SEC: u64 = 128 * 1024 * 1024;
+
+    let scaled_secs = load
+        .source_model_bytes
+        .map(|bytes| {
+            bytes.saturating_add(STAGE_LOAD_BYTES_PER_SEC.saturating_sub(1))
+                / STAGE_LOAD_BYTES_PER_SEC
+        })
+        .unwrap_or(MIN_STAGE_LOAD_TIMEOUT_SECS);
+    Duration::from_secs(
+        MIN_STAGE_LOAD_TIMEOUT_SECS
+            .max(scaled_secs)
+            .min(MAX_STAGE_LOAD_TIMEOUT_SECS),
+    )
+}
+
+fn stage_load_failure_context(
+    load: &StageLoadRequest,
+    error: &str,
+    last_error: Option<&str>,
+) -> String {
+    let source_bytes = load
+        .source_model_bytes
+        .map(|bytes| bytes.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let device = load
+        .selected_device
+        .as_ref()
+        .map(|device| device.backend_device.as_str())
+        .unwrap_or("auto");
+    format!(
+        "split stage load failed: model={} topology={} run={} stage={} index={} layers={}..{} mode={:?} bind={} ctx={} lanes={} source_bytes={} device={} error={} last_error={}",
+        load.model_id,
+        load.topology_id,
+        load.run_id,
+        load.stage_id,
+        load.stage_index,
+        load.layer_start,
+        load.layer_end,
+        load.load_mode,
+        load.bind_addr,
+        load.ctx_size,
+        load.lane_count,
+        source_bytes,
+        device,
+        error,
+        last_error.unwrap_or("none"),
+    )
+}
+
+fn probe_binary_stage_ready(bind_addr: SocketAddr, timeout: Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_error = None;
+    while std::time::Instant::now() < deadline {
+        match std::net::TcpStream::connect(bind_addr) {
+            Ok(mut stream) => {
+                stream.set_nodelay(true).ok();
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                match skippy_protocol::binary::recv_ready(&mut stream) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        last_error =
+                            Some(anyhow!(error).context("binary stage ready handshake failed"));
+                    }
+                }
+            }
+            Err(error) => {
+                last_error = Some(anyhow!(error).context("connect binary stage listener"));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow!("timed out waiting for binary stage ready at {bind_addr}"))
+        .context(format!(
+            "binary stage did not become ready at {bind_addr} before timeout"
+        )))
+}
+
+fn stage_config(
+    load: &StageLoadRequest,
+    materialized: Option<&super::materialization::MaterializedStageArtifact>,
+    package: Option<&super::materialization::ResolvedStagePackage>,
+) -> Result<StageConfig> {
+    anyhow::ensure!(!load.topology_id.is_empty(), "topology_id is required");
+    anyhow::ensure!(!load.run_id.is_empty(), "run_id is required");
+    anyhow::ensure!(!load.model_id.is_empty(), "model_id is required");
+    anyhow::ensure!(!load.stage_id.is_empty(), "stage_id is required");
+    anyhow::ensure!(
+        load.layer_start < load.layer_end,
+        "invalid stage layer range"
+    );
+    anyhow::ensure!(load.ctx_size > 0, "ctx_size must be greater than zero");
+    anyhow::ensure!(load.lane_count > 0, "lane_count must be greater than zero");
+    if let Some(device) = load.selected_device.as_ref() {
+        anyhow::ensure!(
+            !device.backend_device.is_empty(),
+            "selected backend device must not be empty"
+        );
+    }
+    let mut config = StageConfig {
+        run_id: load.run_id.clone(),
+        topology_id: load.topology_id.clone(),
+        model_id: load.model_id.clone(),
+        package_ref: Some(load.package_ref.clone()),
+        manifest_sha256: Some(load.manifest_sha256.clone()),
+        source_model_path: materialized
+            .map(|artifact| artifact.source_model_path.clone())
+            .or_else(|| package.map(|package| package.source_model_path.clone()))
+            .or_else(|| load.model_path.clone()),
+        source_model_sha256: materialized
+            .map(|artifact| artifact.source_model_sha256.clone())
+            .or_else(|| package.map(|package| package.source_model_sha256.clone())),
+        source_model_bytes: materialized
+            .and_then(|artifact| artifact.source_model_bytes)
+            .or_else(|| package.and_then(|package| package.source_model_bytes))
+            .or(load.source_model_bytes),
+        materialized_path: materialized.map(|artifact| artifact.path.to_string_lossy().to_string()),
+        materialized_pinned: materialized.is_some(),
+        model_path: load.model_path.clone(),
+        projector_path: load.projector_path.clone(),
+        stage_id: load.stage_id.clone(),
+        stage_index: load.stage_index,
+        layer_start: load.layer_start,
+        layer_end: load.layer_end,
+        ctx_size: load.ctx_size,
+        lane_count: load.lane_count,
+        n_batch: load.n_batch,
+        n_ubatch: load.n_ubatch,
+        n_gpu_layers: load.n_gpu_layers,
+        mmap: load.mmap,
+        mlock: load.mlock,
+        cache_type_k: empty_to_default(&load.cache_type_k, "f16"),
+        cache_type_v: empty_to_default(&load.cache_type_v, "f16"),
+        flash_attn_type: load.flash_attn_type,
+        filter_tensors_on_load: matches!(
+            load.load_mode,
+            LoadMode::RuntimeSlice | LoadMode::LayerPackage
+        ),
+        selected_device: load.selected_device.clone(),
+        kv_cache: None,
+        native_mtp_enabled: load.native_mtp_enabled,
+        load_mode: load.load_mode.clone(),
+        bind_addr: load.bind_addr.clone(),
+        upstream: load.upstream.as_ref().map(peer_config),
+        downstream: load.downstream.as_ref().map(peer_config),
+    };
+    let family_policy = super::family_policy_for_stage_config(&config);
+    config.kv_cache = package.map_or_else(
+        || family_policy.stage_kv_cache_config_for_stage(&config),
+        |package| {
+            family_policy.stage_kv_cache_config_for_package(&config, Path::new(&package.local_ref))
+        },
+    );
+    Ok(config)
+}
+
+fn peer_config(peer: &StagePeerDescriptor) -> PeerConfig {
+    PeerConfig {
+        stage_id: peer.stage_id.clone(),
+        stage_index: peer.stage_index,
+        endpoint: peer.endpoint.clone(),
+    }
+}
+
+fn empty_to_default(value: &str, default: &str) -> String {
+    if value.is_empty() {
+        default.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn status_from_running(stage: &RunningStage) -> StageStatusSnapshot {
+    let server = stage.server.status();
+    let state = match server.state {
+        skippy_server::EmbeddedState::Starting => StageRuntimeState::Starting,
+        skippy_server::EmbeddedState::Ready => StageRuntimeState::Ready,
+        skippy_server::EmbeddedState::Stopping => StageRuntimeState::Stopping,
+        skippy_server::EmbeddedState::Stopped => StageRuntimeState::Stopped,
+        skippy_server::EmbeddedState::Failed => StageRuntimeState::Failed,
+    };
+    StageStatusSnapshot {
+        topology_id: stage.load.topology_id.clone(),
+        run_id: stage.load.run_id.clone(),
+        model_id: stage.load.model_id.clone(),
+        backend: stage.load.backend.clone(),
+        package_ref: Some(stage.load.package_ref.clone()),
+        manifest_sha256: Some(stage.load.manifest_sha256.clone()),
+        source_model_path: stage
+            .materialized
+            .as_ref()
+            .map(|artifact| artifact.source_model_path.clone())
+            .or_else(|| {
+                stage
+                    .package
+                    .as_ref()
+                    .map(|package| package.source_model_path.clone())
+            })
+            .or_else(|| stage.load.model_path.clone()),
+        source_model_sha256: stage
+            .materialized
+            .as_ref()
+            .map(|artifact| artifact.source_model_sha256.clone())
+            .or_else(|| {
+                stage
+                    .package
+                    .as_ref()
+                    .map(|package| package.source_model_sha256.clone())
+            }),
+        source_model_bytes: stage
+            .materialized
+            .as_ref()
+            .and_then(|artifact| artifact.source_model_bytes)
+            .or_else(|| {
+                stage
+                    .package
+                    .as_ref()
+                    .and_then(|package| package.source_model_bytes)
+            })
+            .or(stage.load.source_model_bytes),
+        materialized_path: stage
+            .materialized
+            .as_ref()
+            .map(|artifact| artifact.path.to_string_lossy().to_string()),
+        materialized_pinned: stage.materialized.is_some(),
+        projector_path: stage.load.projector_path.clone(),
+        stage_id: stage.load.stage_id.clone(),
+        stage_index: stage.load.stage_index,
+        layer_start: stage.load.layer_start,
+        layer_end: stage.load.layer_end,
+        state,
+        bind_addr: server.bind_addr.to_string(),
+        activation_width: stage.load.activation_width.max(0) as u32,
+        wire_dtype: stage.load.wire_dtype,
+        selected_device: stage.load.selected_device.clone(),
+        ctx_size: stage.load.ctx_size,
+        lane_count: stage.load.lane_count,
+        n_batch: stage.load.n_batch,
+        n_ubatch: stage.load.n_ubatch,
+        flash_attn_type: stage.load.flash_attn_type,
+        error: server.last_error.clone(),
+        shutdown_generation: stage.load.shutdown_generation,
+        coordinator_term: stage.load.coordinator_term,
+        coordinator_id: stage.load.coordinator_id,
+        lease_until_unix_ms: stage.load.lease_until_unix_ms,
+    }
+}
+
+fn stopped_status(stop: &StageStopRequest) -> StageStatusSnapshot {
+    StageStatusSnapshot {
+        topology_id: stop.topology_id.clone(),
+        run_id: stop.run_id.clone(),
+        model_id: String::new(),
+        backend: "skippy".to_string(),
+        package_ref: None,
+        manifest_sha256: None,
+        source_model_path: None,
+        source_model_sha256: None,
+        source_model_bytes: None,
+        materialized_path: None,
+        materialized_pinned: false,
+        projector_path: None,
+        stage_id: stop.stage_id.clone(),
+        stage_index: 0,
+        layer_start: 0,
+        layer_end: 0,
+        state: StageRuntimeState::Stopped,
+        bind_addr: String::new(),
+        activation_width: 0,
+        wire_dtype: StageWireDType::F32,
+        selected_device: None,
+        ctx_size: 0,
+        lane_count: 0,
+        n_batch: None,
+        n_ubatch: None,
+        flash_attn_type: FlashAttentionType::Auto,
+        error: None,
+        shutdown_generation: stop.shutdown_generation,
+        coordinator_term: stop.coordinator_term,
+        coordinator_id: None,
+        lease_until_unix_ms: 0,
+    }
+}
+
+fn failed_status_from_load(load: &StageLoadRequest, error: String) -> StageStatusSnapshot {
+    StageStatusSnapshot {
+        topology_id: load.topology_id.clone(),
+        run_id: load.run_id.clone(),
+        model_id: load.model_id.clone(),
+        backend: load.backend.clone(),
+        package_ref: Some(load.package_ref.clone()),
+        manifest_sha256: Some(load.manifest_sha256.clone()),
+        source_model_path: load.model_path.clone(),
+        source_model_sha256: None,
+        source_model_bytes: load.source_model_bytes,
+        materialized_path: None,
+        materialized_pinned: false,
+        projector_path: load.projector_path.clone(),
+        stage_id: load.stage_id.clone(),
+        stage_index: load.stage_index,
+        layer_start: load.layer_start,
+        layer_end: load.layer_end,
+        state: StageRuntimeState::Failed,
+        bind_addr: load.bind_addr.clone(),
+        activation_width: load.activation_width.max(0) as u32,
+        wire_dtype: load.wire_dtype,
+        selected_device: load.selected_device.clone(),
+        ctx_size: load.ctx_size,
+        lane_count: load.lane_count,
+        n_batch: load.n_batch,
+        n_ubatch: load.n_ubatch,
+        flash_attn_type: load.flash_attn_type,
+        error: Some(error),
+        shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load.coordinator_id,
+        lease_until_unix_ms: load.lease_until_unix_ms,
+    }
+}
+
+fn preparation_status_from_load(
+    load: &StageLoadRequest,
+    state: StagePreparationState,
+    error: Option<String>,
+) -> StagePreparationStatus {
+    StagePreparationStatus {
+        topology_id: load.topology_id.clone(),
+        run_id: load.run_id.clone(),
+        model_id: load.model_id.clone(),
+        backend: load.backend.clone(),
+        package_ref: load.package_ref.clone(),
+        manifest_sha256: load.manifest_sha256.clone(),
+        stage_id: load.stage_id.clone(),
+        stage_index: load.stage_index,
+        layer_start: load.layer_start,
+        layer_end: load.layer_end,
+        state,
+        bytes_done: None,
+        bytes_total: None,
+        bind_addr: None,
+        error,
+        shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load.coordinator_id,
+        lease_until_unix_ms: load.lease_until_unix_ms,
+    }
+}
+
+fn preparation_status_from_cancel(cancel: StageCancelPrepareRequest) -> StagePreparationStatus {
+    StagePreparationStatus {
+        topology_id: cancel.topology_id,
+        run_id: cancel.run_id,
+        model_id: String::new(),
+        backend: "skippy".to_string(),
+        package_ref: String::new(),
+        manifest_sha256: String::new(),
+        stage_id: cancel.stage_id,
+        stage_index: 0,
+        layer_start: 0,
+        layer_end: 0,
+        state: StagePreparationState::Cancelled,
+        bytes_done: None,
+        bytes_total: None,
+        bind_addr: None,
+        error: None,
+        shutdown_generation: cancel.shutdown_generation,
+        coordinator_term: 0,
+        coordinator_id: None,
+        lease_until_unix_ms: 0,
+    }
+}
+
+impl From<StageWireDType> for skippy_protocol::binary::WireActivationDType {
+    fn from(value: StageWireDType) -> Self {
+        match value {
+            StageWireDType::F32 => Self::F32,
+            StageWireDType::F16 => Self::F16,
+            StageWireDType::Q8 => Self::Q8,
+        }
+    }
+}

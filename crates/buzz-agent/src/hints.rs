@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::mcp::truncate_at_boundary;
@@ -83,6 +83,24 @@ fn load_hint_files_impl(cwd: &Path, home: Option<&Path>) -> String {
     result
 }
 
+// Keep string inspection strict while accepting arbitrary YAML in ignored fields.
+// A JSON value would reject valid YAML such as mappings with sequence keys.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum SkillField {
+    Text(String),
+    Other(serde::de::IgnoredAny),
+}
+
+impl SkillField {
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Text(value) => Some(value),
+            Self::Other(_) => None,
+        }
+    }
+}
+
 fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
     // Must start with `---`
     let rest = content.strip_prefix("---\n")?;
@@ -90,15 +108,31 @@ fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
     let close_pos = rest.find("\n---")?;
     let yaml_block = &rest[..close_pos];
 
-    let map: HashMap<String, serde_yaml::Value> = serde_yaml::from_str(yaml_block).ok()?;
+    #[derive(serde::Deserialize)]
+    struct SkillFrontmatter {
+        name: Option<SkillField>,
+        description: Option<SkillField>,
+    }
+    let map: SkillFrontmatter = serde_saphyr::from_str_with_options(
+        yaml_block,
+        serde_saphyr::options! {
+            strict_booleans: true,
+            with_snippet: false,
+            merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+            ignore_binary_tag_for_string: true,
+        },
+    )
+    .ok()?;
     let name = map
-        .get("name")
+        .name
+        .as_ref()
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)?;
     let description = map
-        .get("description")
+        .description
+        .as_ref()
         .and_then(|v| v.as_str())
         .map(str::trim)
         .unwrap_or("")
@@ -266,6 +300,28 @@ pub(crate) fn strip_frontmatter(content: &str) -> &str {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn skill_yaml_preserves_strings_and_ignores_yaml_only_extensions() {
+        let input = "---\nname: review\ndescription: |\n  First line\n  Second line\nextra:\n  ? [a, b]\n  : 17\n---\nBody";
+        assert_eq!(
+            parse_skill_frontmatter(input),
+            Some(("review".into(), "First line\nSecond line".into()))
+        );
+        assert_eq!(parse_skill_frontmatter("---\nname: 42\n---\n"), None);
+        assert_eq!(
+            parse_skill_frontmatter("---\nname: on\ndescription: no\n---\n"),
+            Some(("on".into(), "no".into()))
+        );
+        assert_eq!(
+            parse_skill_frontmatter("---\nname: review\nextra: .inf\n---\n"),
+            None
+        );
+        assert_eq!(
+            parse_skill_frontmatter("---\nname: review\ndescription: [a, b]\n---\n"),
+            Some(("review".into(), String::new()))
+        );
+    }
 
     #[test]
     fn find_git_root_normal_repo() {
