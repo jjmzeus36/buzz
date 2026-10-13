@@ -28,6 +28,8 @@ export type WorkflowRunStatus =
 export type TraceEntry = {
   stepId: string;
   status: string;
+  /** Resolved approval question; older trace entries may omit it. */
+  message?: string | null;
   output: Record<string, unknown>;
   startedAt: number | null;
   completedAt: number | null;

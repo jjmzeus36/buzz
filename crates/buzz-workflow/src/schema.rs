@@ -139,7 +139,7 @@ pub enum ActionDef {
     },
     /// Suspend execution and request approval.
     RequestApproval {
-        /// User mention or role (e.g. `"@release-manager"`).
+        /// `any`, empty, or a 64-character hex public key; templates resolve at runtime.
         from: String,
         /// Message shown to the approver.
         message: String,
@@ -211,6 +211,16 @@ impl WorkflowDef {
                     step.id
                 )));
             }
+            if let ActionDef::RequestApproval { from, .. } = &step.action {
+                // Dynamic selectors are validated after resolution. Reject
+                // unsupported literal roles/mentions before any step can run.
+                let has_template = from
+                    .split_once("{{")
+                    .is_some_and(|(_, rest)| rest.contains("}}"));
+                if !has_template {
+                    validate_approval_from(from)?;
+                }
+            }
         }
 
         // `reply_in_thread` requires a triggering message to reply to. Schedule
@@ -275,6 +285,21 @@ impl WorkflowDef {
         }
 
         Ok(())
+    }
+}
+
+/// Validate a resolved approval selector, also used for literal save-time inputs.
+pub(crate) fn validate_approval_from(from: &str) -> Result<(), WorkflowError> {
+    let spec = from.trim();
+    if spec.is_empty()
+        || spec == "any"
+        || (spec.len() == 64 && spec.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        Ok(())
+    } else {
+        Err(WorkflowError::InvalidDefinition(
+            "approval from must be empty, 'any', or a 64-character hexadecimal public key; roles and mentions are unsupported".into(),
+        ))
     }
 }
 
@@ -394,7 +419,7 @@ mod tests {
             "  - id: topic\n    action: set_channel_topic\n    topic: Status active\n",
             "  - id: react\n    action: add_reaction\n    emoji: white_check_mark\n",
             "  - id: hook\n    action: call_webhook\n    url: https://hooks.example.com/notify\n    method: POST\n",
-            "  - id: approve\n    action: request_approval\n    from: '@manager'\n    message: Approve?\n    timeout: 4h\n",
+            "  - id: approve\n    action: request_approval\n    from: any\n    message: Approve?\n    timeout: 4h\n",
             "  - id: wait\n    action: delay\n    duration: 5m\n",
         );
         let (def, _) = parse_yaml(yaml).expect("parse failed");
@@ -430,7 +455,7 @@ mod tests {
             "name: Deploy Approval\n",
             "trigger:\n  on: webhook\n",
             "steps:\n",
-            "  - id: request\n    action: request_approval\n    from: '@engineering-lead'\n",
+            "  - id: request\n    action: request_approval\n    from: '{{trigger.approver}}'\n",
             "    message: Approve deploy?\n    timeout: 4h\n",
             "  - id: notify_approved\n    if: 'steps_request_output_approved == true'\n",
             "    action: send_message\n    text: Deploy approved\n",
@@ -439,6 +464,44 @@ mod tests {
         );
         let (def, _) = parse_yaml(yaml).expect("parse failed");
         assert_eq!(def.steps.len(), 3);
+    }
+
+    #[test]
+    fn approval_selectors_are_validated_before_saving() {
+        let yaml = |from: &str| {
+            format!(
+            "name: Approval\ntrigger:\n  on: webhook\nsteps:\n  - id: before\n    action: send_message\n    text: Do not send before validation\n  - id: gate\n    action: request_approval\n    from: '{from}'\n    message: Approve?\n"
+        )
+        };
+        for from in [
+            "admin",
+            "owner",
+            "@manager",
+            "npub1invalid",
+            "{{trigger.approver",
+            "gggg",
+        ] {
+            let error = crate::WorkflowEngine::parse_yaml(&yaml(from)).unwrap_err();
+            assert!(
+                matches!(error, WorkflowError::InvalidDefinition(_)),
+                "{from}: {error}"
+            );
+            assert!(error
+                .to_string()
+                .contains("roles and mentions are unsupported"));
+        }
+        for from in [
+            "".to_owned(),
+            " any ".to_owned(),
+            "ab".repeat(32),
+            "AB".repeat(32),
+            "{{trigger.approver}}".to_owned(),
+        ] {
+            assert!(
+                crate::WorkflowEngine::parse_yaml(&yaml(&from)).is_ok(),
+                "{from}"
+            );
+        }
     }
 
     #[test]

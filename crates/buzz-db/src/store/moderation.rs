@@ -492,6 +492,66 @@ pub async fn restriction_state(
     }
 }
 
+/// Authenticated identity and optional cryptographically proven owner.
+/// Ownership here narrows moderation access only; it never grants permissions.
+#[derive(Debug, Clone)]
+pub struct ModerationPrincipal {
+    /// The authenticated signer.
+    pub pubkey: Vec<u8>,
+    /// Owner proven by the transport's verified NIP-OA credential, if any.
+    pub proven_owner: Option<Vec<u8>>,
+}
+
+/// Resolve a recipient batch against the writer in input order and one snapshot.
+/// Active bans on either the principal, its persisted first-write-wins owner,
+/// or its request-proven owner apply. Only the principal's timeout applies.
+/// A new owner proof cannot erase a persisted owner's ban. No mapping or ban
+/// from another community participates in this decision.
+pub async fn principal_restrictions(
+    pool: &PgPool,
+    community: CommunityId,
+    principals: &[ModerationPrincipal],
+) -> Result<Vec<RestrictionState>> {
+    if principals.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pubkeys: Vec<_> = principals.iter().map(|p| p.pubkey.clone()).collect();
+    let owners: Vec<_> = principals.iter().map(|p| p.proven_owner.clone()).collect();
+    let mut connection = crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM community_bans b
+            WHERE b.community_id = $1
+              AND b.pubkey IN (p.pubkey, p.proven_owner, u.agent_owner_pubkey)
+              AND b.banned AND (b.ban_expires_at IS NULL OR b.ban_expires_at > now())
+        ) AS banned,
+        CASE WHEN direct.muted_until > now() THEN direct.muted_until ELSE NULL END AS muted_until
+        FROM unnest($2::bytea[], $3::bytea[]) WITH ORDINALITY AS p(pubkey, proven_owner, position)
+        LEFT JOIN users u ON u.community_id = $1 AND u.pubkey = p.pubkey
+        LEFT JOIN community_bans direct ON direct.community_id = $1 AND direct.pubkey = p.pubkey
+        ORDER BY p.position
+    "#,
+    )
+    .bind(community.as_uuid())
+    .bind(&pubkeys)
+    .bind(&owners)
+    .fetch_all(&mut *connection)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(RestrictionState {
+                banned: row.try_get("banned")?,
+                muted_until: row.try_get("muted_until")?,
+            })
+        })
+        .collect()
+}
+
 /// Fetch the full ban/timeout row (moderation queue / audit views).
 pub async fn get_ban(
     pool: &PgPool,
@@ -776,6 +836,35 @@ impl Db {
         pubkey: &[u8],
     ) -> Result<RestrictionState> {
         restriction_state(&self.pool, community, pubkey).await
+    }
+
+    /// Resolve direct and owner bans for an authenticated batch on the writer.
+    pub async fn moderation_principal_restrictions(
+        &self,
+        community: CommunityId,
+        principals: &[ModerationPrincipal],
+    ) -> Result<Vec<RestrictionState>> {
+        principal_restrictions(&self.pool, community, principals).await
+    }
+
+    /// Resolve direct and owner bans, and the signer's own timeout, on the writer.
+    pub async fn moderation_principal_restriction_state(
+        &self,
+        community: CommunityId,
+        pubkey: &[u8],
+        proven_owner: Option<&[u8]>,
+    ) -> Result<RestrictionState> {
+        self.moderation_principal_restrictions(
+            community,
+            &[ModerationPrincipal {
+                pubkey: pubkey.to_vec(),
+                proven_owner: proven_owner.map(<[u8]>::to_vec),
+            }],
+        )
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| sqlx::Error::RowNotFound.into())
     }
 
     /// Fetch the full ban/timeout row for a member pubkey.

@@ -56,7 +56,7 @@ pub async fn handle_req(
     conn: Arc<ConnectionState>,
     state: Arc<AppState>,
 ) {
-    let (conn_id, pubkey_bytes, token_channel_ids) = {
+    let (conn_id, pubkey_bytes, token_channel_ids, pubkey, moderation_owner) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
             AuthState::Authenticated(ctx) => {
@@ -80,7 +80,13 @@ pub async fn handle_req(
                     return;
                 }
 
-                (conn.conn_id, pk_bytes, ctx.channel_ids.clone())
+                (
+                    conn.conn_id,
+                    pk_bytes,
+                    ctx.channel_ids.clone(),
+                    ctx.pubkey,
+                    ctx.moderation_owner_pubkey,
+                )
             }
             _ => {
                 conn.send(RelayMessage::notice(
@@ -94,6 +100,18 @@ pub async fn handle_req(
             }
         }
     };
+
+    if let Err(reason) = crate::moderation::check_read(
+        &state,
+        conn.tenant.community(),
+        &pubkey,
+        moderation_owner.as_ref(),
+    )
+    .await
+    {
+        conn.send(RelayMessage::closed(&sub_id, reason));
+        return;
+    }
 
     let channel_id = extract_channel_id_from_filters(&filters);
     let requested_channel_ids = match extract_channel_ids_from_filters_limited(&filters) {

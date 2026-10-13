@@ -92,97 +92,28 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
         Ok(mut auth_ctx) => {
             let pubkey = auth_ctx.pubkey;
 
-            // Community ban gate (NIP-42 seam). Runs immediately after auth
-            // verification succeeds and before the allowlist and relay-membership
-            // gates, per COMMUNITY_MODERATION_PLAN.md §0 decision 4 and the
-            // MOD-7/M20 invariant (a ban must block connection auth even for open
-            // channels — enforcement is structural, not filtered later). A banned
-            // principal gets the standard protocol denial and the connection is
-            // dropped with zero further processing.
-            //
-            // NIP-OA cascade: a ban on the authenticated pubkey blocks it directly;
-            // a ban on its cryptographically-proven owner cascades to the agent
-            // (owner ban ⇒ agents banned; agent ban is agent-only). The owner is
-            // extracted from the self-proving auth tag with no DB round-trip.
+            // Preserve the self-proving moderation identity independently of
+            // optional first-write-wins materialization and membership grants.
+            auth_ctx.moderation_owner_pubkey = crate::api::relay_members::extract_nip_oa_owner(
+                pubkey.as_bytes(),
+                auth_tag_json.as_deref(),
+                Some(signed_auth_created_at),
+            );
+            if let Err(reason) = crate::moderation::check_read(
+                &state,
+                conn.tenant.community(),
+                &pubkey,
+                auth_ctx.moderation_owner_pubkey.as_ref(),
+            )
+            .await
             {
-                // Fail closed on a DB error, but distinguish it from a real ban:
-                // a transient blip must deny (never let a banned principal
-                // through) without telling an innocent user they are banned and
-                // pinning `Failed` for the connection's life on a false premise.
-                // `Banned` claims the ban; `DbError` denies with `error: internal`
-                // (mirrors the ingest write-path gate).
-                enum BanOutcome {
-                    Clear,
-                    Banned,
-                    DbError,
-                }
-
-                let mut outcome = match state
-                    .db
-                    .moderation_restriction_state(conn.tenant.community(), pubkey.as_bytes())
-                    .await
-                {
-                    Ok(state) if state.banned => BanOutcome::Banned,
-                    Ok(_) => BanOutcome::Clear,
-                    Err(e) => {
-                        warn!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), error = %e,
-                              "ban-state DB lookup failed, denying (fail-closed)");
-                        BanOutcome::DbError
-                    }
-                };
-
-                // Cascade: check the proven NIP-OA owner only if the agent itself
-                // is clear (a DB error already denies; a direct ban already blocks
-                // — both skip the needless second DB read).
-                if matches!(outcome, BanOutcome::Clear) {
-                    if let Some(owner) = crate::api::relay_members::extract_nip_oa_owner(
-                        pubkey.as_bytes(),
-                        auth_tag_json.as_deref(),
-                        Some(signed_auth_created_at),
-                    ) {
-                        outcome = match state
-                            .db
-                            .moderation_restriction_state(conn.tenant.community(), owner.as_bytes())
-                            .await
-                        {
-                            Ok(state) if state.banned => BanOutcome::Banned,
-                            Ok(_) => BanOutcome::Clear,
-                            Err(e) => {
-                                warn!(conn_id = %conn_id, owner = %owner.to_hex(), error = %e,
-                                      "owner ban-state DB lookup failed, denying (fail-closed)");
-                                BanOutcome::DbError
-                            }
-                        };
-                    }
-                }
-
-                let denial: Option<(&str, &str)> = match outcome {
-                    BanOutcome::Clear => None,
-                    BanOutcome::Banned => {
-                        Some(("banned", "blocked: you are banned from this community"))
-                    }
-                    BanOutcome::DbError => Some((
-                        "ban_check_error",
-                        "error: internal error checking restriction state",
-                    )),
-                };
-
-                if let Some((metric_reason, deny_reason)) = denial {
-                    warn!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), reason = deny_reason, "principal denied at ban seam");
-                    metrics::counter!("buzz_auth_failures_total", "reason" => metric_reason)
-                        .increment(1);
-                    *conn.auth_state.write().await = AuthState::Failed;
-                    // Decision 4: banned ⇒ OK false + immediate WebSocket close.
-                    // Route the reason frame on the control channel (not `send`,
-                    // which uses the data channel and would race the cancel), so
-                    // the send loop drains it ahead of the Close it emits on
-                    // cancel. Then cancel to close the socket immediately.
-                    let _ = conn.ctrl_tx.try_send(WsMessage::Text(
-                        RelayMessage::ok(&event_id_hex, false, deny_reason).into(),
-                    ));
-                    conn.cancel.cancel();
-                    return;
-                }
+                metrics::counter!("buzz_auth_failures_total", "reason" => if reason == crate::moderation::BANNED { "banned" } else { "ban_check_error" }).increment(1);
+                *conn.auth_state.write().await = AuthState::Failed;
+                let _ = conn.ctrl_tx.try_send(WsMessage::Text(
+                    RelayMessage::ok(&event_id_hex, false, reason).into(),
+                ));
+                conn.cancel.cancel();
+                return;
             }
 
             // Pubkey allowlist gate — only for pubkey-only auth.
@@ -279,10 +210,16 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             }
 
             info!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "NIP-42 auth successful");
+            state.conn_manager.set_authenticated_principal(
+                conn_id,
+                buzz_db::moderation::ModerationPrincipal {
+                    pubkey: pubkey.to_bytes().to_vec(),
+                    proven_owner: auth_ctx
+                        .moderation_owner_pubkey
+                        .map(|owner| owner.to_bytes().to_vec()),
+                },
+            );
             *conn.auth_state.write().await = AuthState::Authenticated(auth_ctx);
-            state
-                .conn_manager
-                .set_authenticated_pubkey(conn_id, pubkey.to_bytes().to_vec());
             conn.send(RelayMessage::ok(&event_id_hex, true, ""));
         }
         Err(e) => {

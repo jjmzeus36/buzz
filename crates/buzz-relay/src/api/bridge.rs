@@ -1140,6 +1140,7 @@ fn keyed_http_verified_owner(
 
 fn keyed_http_nip98_auth(pubkey: nostr::PublicKey) -> IngestAuth {
     IngestAuth::Http {
+        moderation_owner: None,
         pubkey,
         scopes: buzz_auth::Scope::all_known(),
         auth_method: crate::handlers::ingest::HttpAuthMethod::Nip98,
@@ -1153,6 +1154,7 @@ struct KeyedHttpAdmitRequest<'req> {
     event_id_bytes: [u8; 32],
     body: &'req [u8],
     signed_created_at: Option<u64>,
+    moderation_owner: Option<nostr::PublicKey>,
 }
 
 async fn keyed_deadline_io<T, F>(
@@ -1194,7 +1196,8 @@ where
 /// when open-relay extraction is applicable. A closed-relay caller must
 /// return `None` so this seam cannot acquire an owner from the header. The
 /// tag is verified here with [`super::relay_members::extract_nip_oa_owner`]
-/// against the authenticated agent; a pre-extracted owner cannot be injected.
+/// against the authenticated agent. The separate moderation-only owner in the
+/// request is verified by the outer NIP-98 seam and never grants membership.
 async fn admit_keyed_http_after_attempt<'req, 'tag, Mem, MemFut, Tag>(
     replay_guard: &dyn Nip98ReplayGuard,
     request: KeyedHttpAdmitRequest<'req>,
@@ -1214,6 +1217,7 @@ where
         event_id_bytes,
         body,
         signed_created_at,
+        moderation_owner,
     } = request;
     let deadline = early.deadline;
     match keyed_deadline_io(
@@ -1231,7 +1235,14 @@ where
         Err(error) => return Err(KeyedHttpAdmitError::PreIngest(error)),
     }
     let event: nostr::Event = serde_json::from_slice(body).map_err(KeyedHttpAdmitError::Parse)?;
-    let auth = keyed_http_nip98_auth(pubkey);
+    let mut auth = keyed_http_nip98_auth(pubkey);
+    if let IngestAuth::Http {
+        moderation_owner: owner,
+        ..
+    } = &mut auth
+    {
+        *owner = moderation_owner;
+    }
     let kind = buzz_core::kind::event_kind_u32(&event);
     // Blocking verification owns `early` (ingress included). Do not wrap this
     // join in `timeout`/`select!` — dropping that JoinHandle while the request
@@ -1694,6 +1705,11 @@ async fn submit_event_authed(
         let (validated, early) = match admit_keyed_http_after_attempt(
             state.nip98_replay.as_ref(),
             KeyedHttpAdmitRequest {
+                moderation_owner: super::relay_members::extract_nip_oa_owner(
+                    &pubkey_bytes,
+                    auth_tag,
+                    signed_auth_created_at,
+                ),
                 tenant,
                 pubkey,
                 event_id_bytes,
@@ -1820,7 +1836,17 @@ async fn submit_event_authed(
     }
 
     let kind_u32 = buzz_core::kind::event_kind_u32(&event);
-    let auth = keyed_http_nip98_auth(pubkey);
+    let mut auth = keyed_http_nip98_auth(pubkey);
+    if let IngestAuth::Http {
+        moderation_owner, ..
+    } = &mut auth
+    {
+        *moderation_owner = super::relay_members::extract_nip_oa_owner(
+            &pubkey_bytes,
+            auth_tag,
+            signed_auth_created_at,
+        );
+    }
 
     match crate::handlers::ingest::ingest_event(state, tenant, event, auth).await {
         Ok(result) => SubmitOutcome::Ok {
@@ -1932,6 +1958,25 @@ async fn query_events_authed(
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let auth_tag = super::relay_members::extract_auth_tag_header(headers);
+    let moderation_owner =
+        super::relay_members::extract_nip_oa_owner(&pubkey_bytes, auth_tag, signed_auth_created_at);
+    crate::moderation::check_read(
+        state,
+        tenant.community(),
+        &pubkey,
+        moderation_owner.as_ref(),
+    )
+    .await
+    .map_err(|reason| {
+        api_error(
+            if reason == crate::moderation::BANNED {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
+            reason,
+        )
+    })?;
     super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
@@ -2464,6 +2509,25 @@ async fn count_events_authed(
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let auth_tag = super::relay_members::extract_auth_tag_header(headers);
+    let moderation_owner =
+        super::relay_members::extract_nip_oa_owner(&pubkey_bytes, auth_tag, signed_auth_created_at);
+    crate::moderation::check_read(
+        state,
+        tenant.community(),
+        &pubkey,
+        moderation_owner.as_ref(),
+    )
+    .await
+    .map_err(|reason| {
+        api_error(
+            if reason == crate::moderation::BANNED {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
+            reason,
+        )
+    })?;
     super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
@@ -3038,14 +3102,12 @@ pub async fn workflow_webhook(
             }
         };
 
-        let result = buzz_workflow::executor::execute_from_step(
+        let result = buzz_workflow::executor::execute_run(
             &engine,
             community_id,
             run_id,
             &def,
             &trigger_ctx_clone,
-            0,
-            None,
         )
         .await;
         engine
@@ -8537,6 +8599,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -8581,6 +8644,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -8617,6 +8681,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -8674,6 +8739,7 @@ mod postgres_tests {
         let err = admit_keyed_http_after_attempt(
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -8716,6 +8782,7 @@ mod postgres_tests {
             &limiter,
             &replay_ok,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: parse_keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -8741,6 +8808,7 @@ mod postgres_tests {
             &limiter,
             &replay_hit,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: replay_keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -8766,6 +8834,7 @@ mod postgres_tests {
             &limiter,
             &replay_member,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: member_keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -8793,6 +8862,7 @@ mod postgres_tests {
             &limiter,
             &replay_member,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: error_keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -8905,6 +8975,7 @@ mod postgres_tests {
                 &limiter,
                 &replay,
                 KeyedHttpAdmitRequest {
+                    moderation_owner: None,
                     tenant: &tenant,
                     pubkey,
                     event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -8990,6 +9061,7 @@ mod postgres_tests {
                 &limiter,
                 &replay,
                 KeyedHttpAdmitRequest {
+                    moderation_owner: None,
                     tenant: &tenant,
                     pubkey,
                     event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9041,6 +9113,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9096,6 +9169,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9150,6 +9224,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9192,6 +9267,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9229,6 +9305,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9272,6 +9349,7 @@ mod postgres_tests {
                 &limiter,
                 &replay,
                 KeyedHttpAdmitRequest {
+                    moderation_owner: None,
                     tenant: &tenant,
                     pubkey: keys.public_key(),
                     event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9309,6 +9387,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9368,6 +9447,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: agent_a.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9383,6 +9463,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: agent_b.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9430,6 +9511,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9472,6 +9554,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: agent.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9531,6 +9614,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: agent.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9586,6 +9670,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: agent.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),
@@ -9667,6 +9752,7 @@ mod postgres_tests {
             &limiter,
             &replay,
             KeyedHttpAdmitRequest {
+                moderation_owner: None,
                 tenant: &tenant,
                 pubkey: keys.public_key(),
                 event_id_bytes: fresh_nip98_event_id_bytes(),

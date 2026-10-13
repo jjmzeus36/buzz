@@ -461,7 +461,7 @@ pub fn resolve_step_templates(
         } => Ok(RequestApproval {
             from: t(from)?,
             message: t(message)?,
-            timeout: timeout.clone(),
+            timeout: t_opt(timeout)?,
         }),
         Delay { duration } => Ok(Delay {
             duration: duration.clone(),
@@ -478,6 +478,12 @@ pub enum StepResult {
     Suspended {
         /// Token used to resume or reject this approval gate.
         approval_token: String,
+        /// Resolved approver restriction.
+        approver_spec: String,
+        /// Resolved prompt shown in the trace.
+        message: String,
+        /// Absolute approval deadline.
+        expires_at: chrono::DateTime<chrono::Utc>,
     },
     /// Step was skipped due to `if:` condition being false.
     Skipped,
@@ -735,11 +741,19 @@ pub async fn dispatch_action(
 
                     let token = generate_approval_token(run_id, step_id);
 
-                    // TODO (WF-08): create approval record in DB, emit kind:46010.
-                    // For now, return Suspended with the token so the caller can persist state.
-
+                    let spec = from.trim();
+                    crate::schema::validate_approval_from(spec)?;
+                    let seconds = parse_duration_secs(timeout_str)?;
+                    if seconds == 0 || seconds > 30 * 24 * 60 * 60 {
+                        return Err(WorkflowError::InvalidDefinition(
+                            "approval timeout must be between 1 second and 30 days".into(),
+                        ));
+                    }
                     Ok(StepResult::Suspended {
                         approval_token: token,
+                        approver_spec: spec.to_owned(),
+                        message: message.clone(),
+                        expires_at: chrono::Utc::now() + chrono::Duration::seconds(seconds as i64),
                     })
                 }
 
@@ -1025,7 +1039,7 @@ async fn add_reaction_impl(message_id: &str, emoji: &str) -> Result<JsonValue, W
     }))
 }
 
-/// Rich return type from `execute_run` / `execute_from_step`.
+/// Rich return type from `execute_run` / approval resume.
 ///
 /// Carries enough information for the caller to:
 /// - Persist the approval record when suspended at a `RequestApproval` step.
@@ -1036,6 +1050,8 @@ pub struct ExecutionResult {
     /// Set when execution suspended at a `RequestApproval` step.
     /// `None` means the run completed normally.
     pub approval_token: Option<String>,
+    /// Durable gate input, present only when suspended.
+    pub pending_approval: Option<crate::approval::PendingApproval>,
     /// Index of the step that suspended (or the total step count on completion).
     pub step_index: usize,
     /// Accumulated step outputs at the point of suspension or completion.
@@ -1096,84 +1112,13 @@ pub async fn execute_run(
     execute_steps(engine, community_id, run_id, def, trigger_ctx, 0, None).await
 }
 
-/// Resume execution from a specific step index (used for approval resume).
-///
-/// Acquires a concurrency permit from `engine.run_semaphore` before executing —
-/// returns [`WorkflowError::CapacityExceeded`] immediately if all permits are
-/// taken.
-///
-/// Transitions the run to `Running` after acquiring a permit, so that
-/// approval-resumed runs correctly reflect their active state.
-///
-/// `initial_outputs` should be reconstructed from the execution trace before
-/// calling this function on resume, so that steps after the resume point can
-/// reference `{{steps.PREV_STEP.output.X}}` correctly.
-pub async fn execute_from_step(
-    engine: &WorkflowEngine,
-    community_id: CommunityId,
-    run_id: Uuid,
-    def: &WorkflowDef,
-    trigger_ctx: &TriggerContext,
-    start_index: usize,
-    initial_outputs: Option<HashMap<String, JsonValue>>,
-) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
-    // Fail fast if all concurrency permits are in use — no queuing.
-    let _permit = engine.run_semaphore.try_acquire().map_err(|_| {
-        (
-            WorkflowError::CapacityExceeded,
-            crate::error::PartialProgress::default(),
-        )
-    })?;
-
-    // Mark run as Running now that we have a permit (resume from approval).
-    // Preserve the existing execution trace from pre-approval steps.
-    let existing_trace = match engine.db.get_workflow_run(community_id, run_id).await {
-        Ok(r) => r.execution_trace,
-        Err(e) => {
-            warn!(
-                run_id = %run_id,
-                "Failed to read existing trace for resume — pre-approval trace will be lost: {e}"
-            );
-            serde_json::json!([])
-        }
-    };
-    engine
-        .db
-        .update_workflow_run(
-            community_id,
-            run_id,
-            buzz_db::workflow::RunStatus::Running,
-            start_index as i32,
-            &existing_trace,
-            None,
-        )
-        .await
-        .map_err(|e| {
-            (
-                WorkflowError::from(e),
-                crate::error::PartialProgress::default(),
-            )
-        })?;
-
-    execute_steps(
-        engine,
-        community_id,
-        run_id,
-        def,
-        trigger_ctx,
-        start_index,
-        initial_outputs,
-    )
-    .await
-}
-
 /// Internal: execute workflow steps starting from `start_index`, without
 /// acquiring the semaphore. Called by both [`execute_run`] and
-/// [`execute_from_step`] after they have already acquired a permit.
+/// approval resume after they have already acquired a permit.
 ///
 /// On error, returns `(WorkflowError, PartialProgress)` so callers can persist
 /// the trace of steps completed before the failure.
-async fn execute_steps(
+pub(crate) async fn execute_steps(
     engine: &WorkflowEngine,
     community_id: CommunityId,
     run_id: Uuid,
@@ -1212,6 +1157,20 @@ async fn execute_steps(
                     };
                     return Err((e, progress));
                 }
+            }
+        }
+
+        // Resumed work can be arbitrarily old. Recheck authority before every
+        // remaining action, including webhooks and a later approval gate.
+        if start_index > 0 {
+            if let Err(error) = engine.approval_authority(community_id, run_id, def).await {
+                return Err((
+                    error,
+                    crate::error::PartialProgress {
+                        step_index: i,
+                        trace,
+                    },
+                ));
             }
         }
 
@@ -1276,7 +1235,12 @@ async fn execute_steps(
                 }));
                 step_outputs.insert(step.id.clone(), output);
             }
-            StepResult::Suspended { approval_token } => {
+            StepResult::Suspended {
+                approval_token,
+                approver_spec,
+                message,
+                expires_at,
+            } => {
                 info!(
                     run_id = %run_id, step = %step.id,
                     "Step suspended — awaiting approval (token: <redacted>)"
@@ -1285,6 +1249,13 @@ async fn execute_steps(
                 // approval record and update the run's execution trace.
                 return Ok(ExecutionResult {
                     approval_token: Some(approval_token),
+                    pending_approval: Some(crate::approval::PendingApproval {
+                        step_id: step.id.clone(),
+                        approver_spec,
+                        message,
+                        expires_at,
+                        definition: def.clone(),
+                    }),
                     step_index: i,
                     step_outputs,
                     trace,
@@ -1303,6 +1274,7 @@ async fn execute_steps(
     info!(run_id = %run_id, "Workflow run completed");
     Ok(ExecutionResult {
         approval_token: None,
+        pending_approval: None,
         step_index: def.steps.len(),
         step_outputs,
         trace,

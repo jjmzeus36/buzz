@@ -106,7 +106,7 @@ struct ConnEntry {
     /// broadcasts track the same consecutive-full counter.
     backpressure_count: Arc<AtomicU8>,
     subscriptions: ConnectionSubscriptions,
-    authenticated_pubkey: Arc<std::sync::RwLock<Option<Vec<u8>>>>,
+    authenticated_pubkey: Arc<std::sync::RwLock<Option<buzz_db::moderation::ModerationPrincipal>>>,
     grace_limit: u8,
 }
 
@@ -306,11 +306,36 @@ impl ConnectionManager {
 
     /// Record the authenticated pubkey for a connection after NIP-42 succeeds.
     pub fn set_authenticated_pubkey(&self, conn_id: Uuid, pubkey_bytes: Vec<u8>) {
+        self.set_authenticated_principal(
+            conn_id,
+            buzz_db::moderation::ModerationPrincipal {
+                pubkey: pubkey_bytes,
+                proven_owner: None,
+            },
+        );
+    }
+
+    /// Atomically record the authenticated signer and proven moderation owner.
+    pub fn set_authenticated_principal(
+        &self,
+        conn_id: Uuid,
+        principal: buzz_db::moderation::ModerationPrincipal,
+    ) {
         if let Some(entry) = self.connections.get(&conn_id) {
             if let Ok(mut slot) = entry.authenticated_pubkey.write() {
-                *slot = Some(pubkey_bytes);
+                *slot = Some(principal);
             }
         }
+    }
+
+    /// Return the immutable moderation identity established by authentication.
+    pub fn principal_for_conn(
+        &self,
+        conn_id: Uuid,
+    ) -> Option<buzz_db::moderation::ModerationPrincipal> {
+        self.connections
+            .get(&conn_id)
+            .and_then(|entry| entry.authenticated_pubkey.read().ok()?.clone())
     }
 
     /// Return live connection IDs authenticated as `pubkey_bytes` in one community.
@@ -335,7 +360,7 @@ impl ConnectionManager {
                         .and_then(|value| {
                             value
                                 .as_ref()
-                                .map(|stored| stored.as_slice() == pubkey_bytes)
+                                .map(|stored| stored.pubkey.as_slice() == pubkey_bytes)
                         })
                         .unwrap_or(false);
                 matches.then_some(*entry.key())
@@ -345,9 +370,8 @@ impl ConnectionManager {
 
     /// Return the authenticated pubkey recorded for a connection, if any.
     pub fn pubkey_for_conn(&self, conn_id: Uuid) -> Option<Vec<u8>> {
-        self.connections
-            .get(&conn_id)
-            .and_then(|entry| entry.authenticated_pubkey.read().ok()?.clone())
+        self.principal_for_conn(conn_id)
+            .map(|principal| principal.pubkey)
     }
 
     /// Disconnect every live connection authenticated as `pubkey` **in
@@ -554,7 +578,7 @@ impl ConnectionManager {
                 if let Some(pk) = lock.as_ref() {
                     seen.entry(entry.community_id)
                         .or_default()
-                        .insert(pk.clone());
+                        .insert(pk.pubkey.clone());
                 }
             }
         }
@@ -565,9 +589,8 @@ impl ConnectionManager {
 
     /// Return the authenticated pubkey for a connection, if any.
     pub fn pubkey_for(&self, conn_id: Uuid) -> Option<Vec<u8>> {
-        self.connections
-            .get(&conn_id)
-            .and_then(|entry| entry.authenticated_pubkey.read().ok()?.clone())
+        self.principal_for_conn(conn_id)
+            .map(|principal| principal.pubkey)
     }
 
     /// Sends a text message to the given connection.

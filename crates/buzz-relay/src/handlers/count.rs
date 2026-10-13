@@ -22,12 +22,15 @@ pub async fn handle_count(
     state: Arc<AppState>,
 ) {
     // Require auth
-    let (pubkey_bytes, token_channel_ids) = {
+    let (pubkey_bytes, token_channel_ids, pubkey, moderation_owner) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
-            AuthState::Authenticated(ctx) => {
-                (ctx.pubkey.to_bytes().to_vec(), ctx.channel_ids.clone())
-            }
+            AuthState::Authenticated(ctx) => (
+                ctx.pubkey.to_bytes().to_vec(),
+                ctx.channel_ids.clone(),
+                ctx.pubkey,
+                ctx.moderation_owner_pubkey,
+            ),
             _ => {
                 conn.send(RelayMessage::closed(
                     &sub_id,
@@ -37,6 +40,18 @@ pub async fn handle_count(
             }
         }
     };
+
+    if let Err(reason) = crate::moderation::check_read(
+        &state,
+        conn.tenant.community(),
+        &pubkey,
+        moderation_owner.as_ref(),
+    )
+    .await
+    {
+        conn.send(RelayMessage::closed(&sub_id, reason));
+        return;
+    }
 
     // P-gated kinds (gift wraps, member notifications, observer frames) require
     // the caller's own pubkey in the #p tag — same enforcement as WS REQ handler.

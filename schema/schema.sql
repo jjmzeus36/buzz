@@ -479,6 +479,7 @@ CREATE TABLE workflow_approvals (
     status          approval_status NOT NULL DEFAULT 'pending',
     approver_pubkey BYTEA,
     note            TEXT,
+    checkpoint      JSONB,
     granted_at      TIMESTAMPTZ,
     denied_at       TIMESTAMPTZ,
     expires_at      TIMESTAMPTZ NOT NULL,
@@ -493,6 +494,8 @@ CREATE TABLE workflow_approvals (
 CREATE INDEX idx_workflow_approvals_workflow ON workflow_approvals (community_id, workflow_id);
 CREATE INDEX idx_workflow_approvals_run ON workflow_approvals (community_id, run_id);
 CREATE INDEX idx_workflow_approvals_status ON workflow_approvals (community_id, status);
+CREATE INDEX idx_workflow_approvals_recovery ON workflow_approvals (created_at)
+    WHERE status IN ('pending', 'granted');
 
 -- ── Scheduled workflow fires (cron claim) ─────────────────────────────────────
 -- Plan §5: the at-most-once cron fire claim. UNIQUE (community_id, workflow_id,

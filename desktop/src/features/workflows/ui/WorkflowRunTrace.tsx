@@ -1,6 +1,10 @@
 import { Check, Clock, SkipForward, X } from "lucide-react";
 
-import type { WorkflowApproval, WorkflowRun } from "@/shared/api/types";
+import type {
+  TraceEntry,
+  WorkflowApproval,
+  WorkflowRun,
+} from "@/shared/api/types";
 import { Badge, type BadgeProps } from "@/shared/ui/badge";
 import { WorkflowApprovalCard } from "@/features/workflows/ui/WorkflowApprovalCard";
 
@@ -23,6 +27,9 @@ function StepStatusBadge({ status }: { status: string }) {
     cancelled: "secondary",
     skipped: "secondary",
     waiting_approval: "warning",
+    granted: "success",
+    denied: "destructive",
+    expired: "destructive",
   };
 
   return (
@@ -35,9 +42,12 @@ function StepStatusBadge({ status }: { status: string }) {
 function StepStatusIcon({ status }: { status: string }) {
   switch (status) {
     case "completed":
+    case "granted":
       return <Check className="h-4 w-4 text-green-500" />;
     case "failed":
     case "error":
+    case "denied":
+    case "expired":
       return <X className="h-4 w-4 text-red-500" />;
     case "skipped":
       return <SkipForward className="h-4 w-4 text-muted-foreground" />;
@@ -53,6 +63,31 @@ function formatDuration(startedAt: number | null, completedAt: number | null) {
   const seconds = completedAt - startedAt;
   if (seconds < 1) return `${Math.round(seconds * 1000)}ms`;
   return `${seconds.toFixed(1)}s`;
+}
+
+function stepDisplayStatus(
+  step: TraceEntry,
+  run: WorkflowRun,
+  approval: WorkflowApproval | undefined,
+) {
+  if (step.status !== "waiting_approval") return step.status;
+  // Run and approval reads refresh separately. A terminal run's persisted
+  // diagnostic wins over a stale pending approval response.
+  if (run.status === "cancelled" && run.errorCode === "approval_denied") {
+    return "denied";
+  }
+  if (run.status === "failed" && run.errorCode === "approval_expired") {
+    return "expired";
+  }
+  if (approval && approval.status !== "pending") return approval.status;
+  if (
+    run.status === "completed" ||
+    run.status === "failed" ||
+    run.status === "cancelled"
+  ) {
+    return run.status;
+  }
+  return step.status;
 }
 
 export function WorkflowRunTrace({
@@ -71,9 +106,16 @@ export function WorkflowRunTrace({
     <div className="space-y-3" data-testid="workflow-run-trace">
       {run.executionTrace.map((step) => {
         const duration = formatDuration(step.startedAt, step.completedAt);
-        const pendingApproval = approvals.find(
-          (a) => a.stepId === step.stepId && a.status === "pending",
+        const approval = approvals.find(
+          (a) => a.runId === run.id && a.stepId === step.stepId,
         );
+        const status = stepDisplayStatus(step, run, approval);
+        const pendingApproval =
+          status === "waiting_approval" &&
+          run.status === "waiting_approval" &&
+          approval?.status === "pending"
+            ? approval
+            : undefined;
 
         return (
           <div
@@ -81,17 +123,20 @@ export function WorkflowRunTrace({
             key={step.stepId}
           >
             <div className="flex flex-wrap items-center gap-2 text-sm">
-              <StepStatusIcon status={step.status} />
+              <StepStatusIcon status={status} />
               <span className="min-w-0 flex-1 truncate font-mono text-xs font-medium">
                 {step.stepId}
               </span>
-              <StepStatusBadge status={step.status} />
+              <StepStatusBadge status={status} />
               {duration ? (
                 <span className="text-xs text-muted-foreground">
                   {duration}
                 </span>
               ) : null}
             </div>
+            {step.message ? (
+              <p className="mt-3 whitespace-pre-wrap text-sm">{step.message}</p>
+            ) : null}
             {Object.keys(step.output).length > 0 ? (
               <div className="mt-3">
                 <p className="mb-1 text-2xs font-medium uppercase tracking-[0.16em] text-muted-foreground">

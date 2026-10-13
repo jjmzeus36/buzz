@@ -96,6 +96,52 @@ where
     drop_count
 }
 
+/// Revalidate authenticated recipient identities and channel access before every
+/// local or Redis delivery, including global/open events. Missed disconnect
+/// messages cannot leave a banned session authorized indefinitely.
+pub async fn filter_fanout_by_access(
+    state: &AppState,
+    community_id: CommunityId,
+    stored_event: &StoredEvent,
+    matches: Vec<(crate::subscription::ConnId, crate::subscription::SubId)>,
+    threaded: Option<&crate::state::ThreadedChannelVisibility>,
+) -> Vec<(crate::subscription::ConnId, crate::subscription::SubId)> {
+    let candidates: Vec<_> = matches
+        .into_iter()
+        .filter_map(|(conn_id, sub_id)| {
+            if state.conn_manager.community_for_conn(conn_id) != Some(community_id) {
+                return None;
+            }
+            state
+                .conn_manager
+                .principal_for_conn(conn_id)
+                .map(|principal| (conn_id, sub_id, principal))
+        })
+        .collect();
+    let principals: Vec<_> = candidates
+        .iter()
+        .map(|(_, _, principal)| principal.clone())
+        .collect();
+    let restrictions = match state
+        .db
+        .moderation_principal_restrictions(community_id, &principals)
+        .await
+    {
+        Ok(restrictions) => restrictions,
+        Err(error) => {
+            warn!(%error, "fan-out moderation authority read failed");
+            return Vec::new();
+        }
+    };
+    let matches = candidates
+        .into_iter()
+        .zip(restrictions)
+        .filter(|(_, restriction)| !restriction.banned)
+        .map(|((conn_id, sub_id, _), _)| (conn_id, sub_id))
+        .collect();
+    filter_fanout_by_visibility(state, community_id, stored_event, matches, threaded).await
+}
+
 /// Drop recipients without access before fan-out on a private channel.
 ///
 /// Open and channel-less events skip membership filtering (open channel-scoped
@@ -112,7 +158,7 @@ where
 /// absent bundle falls back to the fresh fail-closed lookup below, never to
 /// "assume open". Membership checks stay fresh either way; the threaded value
 /// only replaces the visibility SELECT.
-pub async fn filter_fanout_by_access(
+async fn filter_fanout_by_visibility(
     state: &AppState,
     community_id: CommunityId,
     stored_event: &StoredEvent,
@@ -646,7 +692,7 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
     )
     .increment(1);
 
-    let (conn_id, pubkey_bytes, auth_pubkey, scopes, channel_ids) = {
+    let (conn_id, pubkey_bytes, auth_pubkey, scopes, channel_ids, moderation_owner) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
             AuthState::Authenticated(ctx) => (
@@ -655,6 +701,7 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
                 ctx.pubkey,
                 ctx.scopes.clone(),
                 ctx.channel_ids.clone(),
+                ctx.moderation_owner_pubkey,
             ),
             _ => {
                 reject("auth");
@@ -690,6 +737,32 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
             "invalid: AUTH events cannot be submitted via EVENT",
         ));
         return;
+    }
+
+    // Ephemeral and observer frames bypass persistent ingest; enforce the same
+    // durable identity restrictions before either special route.
+    if is_ephemeral(kind_u32) {
+        let restriction = state
+            .db
+            .moderation_principal_restriction_state(
+                conn.tenant.community(),
+                auth_pubkey.as_bytes(),
+                moderation_owner
+                    .as_ref()
+                    .map(|owner| owner.as_bytes().as_slice()),
+            )
+            .await;
+        let reason = match restriction {
+            Ok(r) if r.banned => Some(crate::moderation::BANNED.to_string()),
+            Ok(r) => r
+                .muted_until
+                .map(|until| format!("restricted: you are timed out until {}", until.timestamp())),
+            Err(_) => Some(crate::moderation::UNAVAILABLE.to_string()),
+        };
+        if let Some(reason) = reason {
+            conn.send(RelayMessage::ok(&event_id_hex, false, &reason));
+            return;
+        }
     }
 
     if kind_u32 == KIND_AGENT_OBSERVER_FRAME {
@@ -773,6 +846,7 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
     }
 
     let ingest_auth = IngestAuth::Nip42 {
+        moderation_owner,
         pubkey: auth_pubkey,
         scopes,
         channel_ids,
@@ -927,8 +1001,7 @@ async fn handle_ephemeral_event(
 
         // Direct fan-out to local WS subscribers through the guarded send path.
         // Pass channel_id=None so fan_out() uses the global subscriber index;
-        // filter_fanout_by_access no-ops for channel-less events except the
-        // author-only-kind gate.
+        // The shared gate still enforces current bans and author-only visibility.
         let stored_event = StoredEvent::new(event.clone(), None);
         fan_out_event_to_local_subscribers(&state, conn.tenant.community(), &stored_event).await;
     }
@@ -1516,6 +1589,7 @@ mod tests {
                     channel_ids: None,
                     auth_method: buzz_auth::AuthMethod::Nip42,
                     agent_owner_pubkey: None,
+                    moderation_owner_pubkey: None,
                 },
             )),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
@@ -1549,7 +1623,7 @@ mod tests {
         );
     }
 
-    mod pubsub_fanout {
+    mod pubsub_fanout_postgres_tests {
         use std::collections::HashMap;
         use std::sync::atomic::AtomicU8;
         use std::sync::Arc;
@@ -1606,7 +1680,7 @@ mod tests {
                 state,
                 sub_id,
                 Filter::new().kind(Kind::Custom(KIND_PRESENCE_UPDATE as u16)),
-                None,
+                Some(Keys::generate().public_key().to_bytes().to_vec()),
             )
         }
 
@@ -1651,6 +1725,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[ignore = "requires Postgres"]
         async fn global_presence_pubsub_event_fans_out_to_local_subscribers() {
             let state = test_state().await;
             let (_conn_id, mut rx) = register_presence_sub(&state, "presence");
@@ -1673,6 +1748,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[ignore = "requires Postgres"]
         async fn local_echo_presence_pubsub_event_is_not_delivered_twice() {
             let state = test_state().await;
             let (_conn_id, mut rx) = register_presence_sub(&state, "presence");
@@ -1697,6 +1773,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[ignore = "requires Postgres"]
         async fn local_echo_suppression_is_scoped_to_its_community() {
             // Non-interference: a local publish of event X in community A must
             // NOT suppress delivery of a *distinct* event sharing X's id arriving
@@ -1740,6 +1817,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[ignore = "requires Postgres"]
         async fn global_membership_pubsub_event_fans_out_by_p_tag() {
             let state = test_state().await;
             let target = Keys::generate();
@@ -1797,6 +1875,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[ignore = "requires Postgres"]
         async fn redis_presence_publish_reaches_second_relay_and_suppresses_origin_echo() {
             let Some(redis_url) = redis_url_if_available().await else {
                 eprintln!("skipping Redis round-trip presence fan-out test: Redis unavailable");
@@ -1882,15 +1961,14 @@ mod tests {
         /// passes a *different* actor hex, then asserts `audit_log.actor_pubkey`
         /// is the actor, not the signer.
         #[tokio::test]
+        #[ignore = "requires Postgres"]
         async fn audit_records_caller_actor_not_relay_signer_for_relay_signed_event() {
             use buzz_core::event::StoredEvent;
             use buzz_core::tenant::{CommunityId, TenantContext};
 
-            let Some((state, audit_shutdown, pool)) = super::fanout_access::audit_state().await
-            else {
-                eprintln!("skipping audit-actor provenance test: Postgres/Redis unavailable");
-                return;
-            };
+            let (state, audit_shutdown, pool) = super::fanout_access::audit_state()
+                .await
+                .expect("Postgres and Redis required by PostgreSQL test lane");
 
             // Seed a community so the audit_log FK is satisfiable.
             let community_uuid = Uuid::new_v4();
@@ -1969,16 +2047,15 @@ mod tests {
         /// blocked on the NIP-42 work: it drives the dispatch fn directly with
         /// two explicit tenants.
         #[tokio::test]
+        #[ignore = "requires Postgres"]
         async fn audit_chain_is_isolated_per_tenant_through_relay_ingest() {
             use buzz_audit::AuditService;
             use buzz_core::event::StoredEvent;
             use buzz_core::tenant::{CommunityId, TenantContext};
 
-            let Some((state, audit_shutdown, pool)) = super::fanout_access::audit_state().await
-            else {
-                eprintln!("skipping audit isolation test: Postgres/Redis unavailable");
-                return;
-            };
+            let (state, audit_shutdown, pool) = super::fanout_access::audit_state()
+                .await
+                .expect("Postgres and Redis required by PostgreSQL test lane");
 
             // Two communities on the same relay process / same Postgres.
             let mut tenants = Vec::new();
@@ -2107,6 +2184,7 @@ mod tests {
     mod fanout_access {
         mod postgres_tests {
             use super::*;
+            use crate::handlers::event::filter_fanout_by_access;
 
             #[tokio::test]
             #[ignore = "requires Postgres"]
@@ -2215,7 +2293,7 @@ mod tests {
         use tokio_util::sync::CancellationToken;
         use uuid::Uuid;
 
-        use crate::handlers::event::filter_fanout_by_access;
+        use crate::handlers::event::filter_fanout_by_visibility as filter_fanout_by_access;
         use crate::state::AppState;
 
         pub(super) fn test_config() -> crate::config::Config {
@@ -2235,14 +2313,15 @@ mod tests {
 
         /// Real-PG, real-Redis state that hands back the audit shutdown handle so
         /// a test can drain queued audit entries before asserting on `audit_log`.
-        /// `None` when Postgres or Redis is unavailable (test skips).
+        /// `None` when Postgres or Redis is unavailable; required-lane callers fail.
         pub(super) async fn audit_state() -> Option<(
             Arc<AppState>,
             crate::state::AuditShutdownHandle,
             sqlx::PgPool,
         )> {
             let mut config = test_config();
-            config.redis_url = "redis://127.0.0.1:6379".to_string();
+            config.database_url = crate::test_support::database_url();
+            config.redis_url = std::env::var("REDIS_URL").expect("isolated Redis URL");
             let pool = sqlx::PgPool::connect(&config.database_url).await.ok()?;
             // Require a real Redis so dispatch's publish_event doesn't error-log.
             let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
@@ -2533,7 +2612,7 @@ mod tests {
         use tokio_util::sync::CancellationToken;
         use uuid::Uuid;
 
-        use crate::handlers::event::filter_fanout_by_access;
+        use crate::handlers::event::filter_fanout_by_visibility as filter_fanout_by_access;
         use crate::state::AppState;
 
         async fn test_state() -> Arc<AppState> {

@@ -31,6 +31,7 @@
 //! ```
 
 pub mod action_sink;
+pub mod approval;
 pub mod error;
 pub mod executor;
 pub mod schema;
@@ -139,6 +140,8 @@ impl WorkflowEngine {
     /// owner's *current* channel authority immediately before creating a run:
     ///
     /// - the owner must still be an active member of the workflow's channel;
+    /// - the channel must be active and the owner must not be banned (including
+    ///   through a persisted agent owner) or currently timed out;
     /// - if the definition contains an exfiltration-capable action
     ///   (`call_webhook`), the owner must currently hold the `owner` or
     ///   `admin` role.
@@ -152,6 +155,34 @@ impl WorkflowEngine {
         owner_pubkey: &[u8],
         def: &WorkflowDef,
     ) -> Result<(), WorkflowError> {
+        let restriction = self
+            .db
+            .moderation_principal_restriction_state(community_id, owner_pubkey, None)
+            .await
+            .map_err(|e| {
+                WorkflowError::Unauthorized(format!(
+                    "owner moderation lookup failed (fail-closed): {e}"
+                ))
+            })?;
+        if restriction.banned || restriction.muted_until.is_some() {
+            return Err(WorkflowError::Unauthorized(
+                "workflow owner is banned or timed out".into(),
+            ));
+        }
+        let channel = self
+            .db
+            .get_channel_for_event_write(community_id, channel_id)
+            .await
+            .map_err(|e| {
+                WorkflowError::Unauthorized(format!(
+                    "owner channel lookup failed (fail-closed): {e}"
+                ))
+            })?;
+        if channel.archived_at.is_some() {
+            return Err(WorkflowError::Unauthorized(
+                "workflow channel is archived".into(),
+            ));
+        }
         let role = self
             .db
             .get_member_role(community_id, channel_id, owner_pubkey)
@@ -226,33 +257,38 @@ impl WorkflowEngine {
                 let trace_json = serde_json::Value::Array(full_trace);
                 let step_count = result.step_index as i32;
 
-                if result.approval_token.is_some() {
-                    // Approval gates are not yet implemented (WF-08).
-                    // Fail explicitly rather than creating unreachable WaitingApproval rows.
-                    tracing::warn!(
-                        run_id = %run_id,
-                        step_index = result.step_index,
-                        "Workflow hit approval gate — not yet implemented, marking as failed"
-                    );
-                    if let Err(e) = self
-                        .db
-                        .update_workflow_run(
+                if let (Some(token), Some(pending)) =
+                    (result.approval_token, result.pending_approval)
+                {
+                    if let Err(error) = self
+                        .persist_approval(
                             community_id,
                             run_id,
-                            RunStatus::Failed,
                             step_count,
                             &trace_json,
-                            Some(buzz_db::workflow::WorkflowRunFailure {
-                                code: "approval_not_supported",
-                                message: "approval gates not yet implemented — see WF-08",
-                            }),
+                            &token,
+                            pending,
                         )
                         .await
                     {
-                        tracing::error!(
-                            run_id = %run_id,
-                            "Failed to update run to Failed (approval gate): {e}"
-                        );
+                        tracing::error!(%run_id, %error, "Failed to persist workflow approval");
+                        if let Err(db_error) = self
+                            .db
+                            .update_workflow_run(
+                                community_id,
+                                run_id,
+                                RunStatus::Failed,
+                                step_count,
+                                &trace_json,
+                                Some(buzz_db::workflow::WorkflowRunFailure {
+                                    code: error.code(),
+                                    message: &error.to_string(),
+                                }),
+                            )
+                            .await
+                        {
+                            tracing::error!(%run_id, %db_error, "Failed to persist approval failure");
+                        }
                     }
                 } else {
                     tracing::info!(run_id = %run_id, "Workflow run completed");
@@ -492,6 +528,7 @@ impl WorkflowEngine {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
+            self.recover_approvals().await;
             let now = Utc::now();
 
             let workflows = match self.db.list_all_enabled_workflows().await {
