@@ -813,7 +813,9 @@ async fn get_members_with_operation(
 /// The lock is this helper's first SQL statement and remains held for subsequent
 /// authorization and mutation, including calls to the membership write helpers.
 /// Active member rows are share-locked against operator writes that do not use
-/// the advisory protocol. Callers needing a channel row lock acquire it first.
+/// the advisory protocol. Callers needing a channel row lock must first acquire
+/// the membership advisory lock, then the channel row lock, then call this helper
+/// (which reacquires the same advisory lock reentrantly).
 pub(crate) async fn get_members_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
