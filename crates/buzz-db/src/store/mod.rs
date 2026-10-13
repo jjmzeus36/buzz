@@ -63,3 +63,6 @@ pub mod usage;
 pub mod user;
 /// Workflow, run, and approval persistence.
 pub mod workflow;
+
+/// Atomic accepted NIP-29 channel commands.
+pub mod channel_command;

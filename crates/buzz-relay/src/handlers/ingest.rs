@@ -3874,6 +3874,43 @@ async fn ingest_event_inner(
         .into());
     }
 
+    // Successful commands are immutable receipts. Classify an exact signed
+    // replay after signature, principal, scopes and token-channel validation,
+    // before membership/archive checks that this command may itself change.
+    // Community lookup and full envelope/channel equality prevent a receipt
+    // from another tenant or a mismatched stored row from authorizing a retry.
+    if matches!(kind_u32, 9000..=9002) {
+        if let Some(existing) = state
+            .db
+            .get_event_by_id_for_event_write(tenant.community(), event.id.as_bytes())
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: command receipt lookup: {e}")))?
+        {
+            if existing.event != event || existing.channel_id != channel_id {
+                return Err(IngestError::Internal(
+                    "error: command receipt does not match signed source".into(),
+                )
+                .into());
+            }
+            if let Some(channel) = channel_id {
+                emit(
+                    tracer,
+                    TraceAction::WriteDuplicate {
+                        msg_id: msg_id_label(event.id.as_bytes()),
+                        channel: channel_label(channel),
+                        claimed_community: claimed_community_from_event(&event),
+                    },
+                    state_for_request(tenant, auth.pubkey()),
+                );
+            }
+            return Ok(IngestResult {
+                event_id: event_id_hex,
+                accepted: true,
+                message: "duplicate:".into(),
+            });
+        }
+    }
+
     let pubkey_bytes = auth.pubkey().to_bytes().to_vec();
     // E1 (§4.8): fetch the community-scoped channel row once per request and
     // thread it through the gates below (membership open-fallback, archived
@@ -3924,7 +3961,8 @@ async fn ingest_event_inner(
         // member/open gate here lets the owning human act on private agent channels
         // without being a member (OQ1 decision; see validate_edit_ownership /
         // validate_admin_event for per-kind enforcement).
-        let skip_membership = kind_u32 == KIND_NIP29_JOIN_REQUEST
+        let skip_membership = matches!(kind_u32, 9000..=9002)
+            || kind_u32 == KIND_NIP29_JOIN_REQUEST
             || kind_u32 == KIND_NIP29_CREATE_GROUP
             || kind_u32 == KIND_STREAM_MESSAGE_EDIT
             || kind_u32 == KIND_NIP29_EDIT_METADATA
@@ -4075,7 +4113,10 @@ async fn ingest_event_inner(
     .await
     .map_err(IngestInnerOutcome::from)??;
 
-    if crate::handlers::side_effects::is_admin_kind(kind_u32) {
+    // Canonical commands perform complete current policy under their held
+    // transaction. An unlocked preflight here can reject a concurrent exact
+    // retry after its first request removes membership or archives the channel.
+    if crate::handlers::side_effects::is_admin_kind(kind_u32) && !matches!(kind_u32, 9000..=9002) {
         keyed_early_io(
             keyed_early.as_deref(),
             crate::handlers::side_effects::validate_admin_event(tenant, kind_u32, &event, state),
@@ -4105,7 +4146,7 @@ async fn ingest_event_inner(
         .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
-    if channel_id.is_some() {
+    if channel_id.is_some() && !matches!(kind_u32, 9000..=9002) {
         // Allow kind:9002 with archived=false (unarchive operation)
         let is_unarchive = kind_u32 == KIND_NIP29_EDIT_METADATA
             && event.tags.iter().any(|t| {
@@ -4576,7 +4617,34 @@ async fn ingest_event_inner(
         });
     }
 
-    let (stored_event, was_inserted) = if let Some(profile) = profile.as_ref() {
+    let mut atomic_channel_notices = None;
+    let (stored_event, was_inserted) = if matches!(kind_u32, 9000..=9002) {
+        let channel =
+            channel_id.ok_or_else(|| IngestError::Rejected("invalid: missing channel".into()))?;
+        let committed = super::channel_commands::persist(
+            tenant,
+            state,
+            &event,
+            channel,
+            auth.moderation_owner(),
+            thread_meta.as_ref().map(|meta| meta.as_params()),
+        )
+        .await
+        .map_err(|error| match error.downcast_ref::<buzz_db::DbError>() {
+            Some(buzz_db::DbError::AccessDenied(reason)) => {
+                IngestError::Rejected(format!("restricted: {reason}"))
+            }
+            Some(buzz_db::DbError::InvalidData(reason)) => {
+                IngestError::Rejected(format!("invalid: {reason}"))
+            }
+            Some(buzz_db::DbError::ChannelNotFound(_) | buzz_db::DbError::MemberNotFound(_)) => {
+                IngestError::Rejected(format!("invalid: {error}"))
+            }
+            _ => IngestError::Internal(format!("error: channel command transaction: {error}")),
+        })?;
+        atomic_channel_notices = Some(committed.notices);
+        (committed.source, committed.inserted)
+    } else if let Some(profile) = profile.as_ref() {
         let (stored, inserted, user_created) = state
             .db
             .replace_profile_event(tenant.community(), &event, profile)
@@ -4944,7 +5012,10 @@ async fn ingest_event_inner(
         });
     }
 
-    if crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
+    if let Some(notices) = atomic_channel_notices.as_ref() {
+        super::side_effects::after_atomic_channel_command(tenant, &event, state).await;
+        super::side_effects::dispatch_atomic_channel_notices(tenant, state, notices).await;
+    } else if crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
         if let Err(e) =
             crate::handlers::side_effects::handle_side_effects(tenant, kind_u32, &event, state)
                 .await
@@ -5008,7 +5079,11 @@ async fn ingest_event_inner(
         &stored_event,
         kind_u32,
         &pubkey_hex,
-        threaded_visibility.clone(),
+        if atomic_channel_notices.is_some() {
+            None
+        } else {
+            threaded_visibility.clone()
+        },
     )
     .await;
 

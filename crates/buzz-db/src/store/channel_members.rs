@@ -175,9 +175,9 @@ pub async fn verify_channel_roster_fence_behavior(pool: &sqlx::PgPool) -> Result
     Ok(())
 }
 
-/// Take the per-channel membership lock. MUST be the first statement in the
-/// transaction that then reads roles/owner counts and writes membership, so the
-/// whole check-then-write sequence is atomic against a concurrent one.
+/// Take the per-channel membership lock before membership authority reads or
+/// channel/member row locks. Lifecycle and TTL advisory fences may precede it;
+/// the role/owner-count check and mutation remain serialized together.
 pub(crate) async fn acquire_channel_membership_lock(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,

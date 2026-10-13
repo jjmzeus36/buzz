@@ -507,8 +507,28 @@ pub async fn update_channel(
     pool: &PgPool,
     community_id: CommunityId,
     channel_id: Uuid,
-    mut updates: ChannelUpdate,
+    updates: ChannelUpdate,
 ) -> Result<ChannelRecord> {
+    let mut tx = begin_event_write_transaction(pool).await?;
+    update_channel_tx(&mut tx, community_id, channel_id, updates).await?;
+    tx.commit().await?;
+    get_channel_with_operation(
+        pool,
+        community_id,
+        channel_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await
+}
+
+/// Apply metadata on the caller's transaction; TTL changes take its existing
+/// exclusive fence before touching the channel row.
+pub(crate) async fn update_channel_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    mut updates: ChannelUpdate,
+) -> Result<()> {
     if updates.name.is_none()
         && updates.description.is_none()
         && updates.visibility.is_none()
@@ -576,42 +596,21 @@ pub async fn update_channel(
     q = q.bind(community_id.as_uuid());
     q = q.bind(channel_id);
 
-    // T1a repair: a TTL change can flip this channel's event-trigger fast
-    // path (migration 0024 reads ttl_seconds under a SHARED per-channel
-    // advisory lock). Take the same key EXCLUSIVE before the UPDATE so a
-    // concurrent event either sees the committed TTL or strictly precedes
-    // this transition — whose own deadline reset is then the latest word.
-    // Non-TTL updates don't touch the fast path and skip the lock.
     if updates.ttl_seconds.is_some() {
-        let mut tx = begin_event_write_transaction(pool).await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!(
                 "buzz_channel_ttl:{}:{}",
                 community_id.as_uuid(),
                 channel_id
             ))
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
-        let result = q.execute(&mut *tx).await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::ChannelNotFound(channel_id));
-        }
-        tx.commit().await?;
-    } else {
-        let mut connection = acquire_event_write_connection(pool).await?;
-        let result = q.execute(&mut *connection).await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::ChannelNotFound(channel_id));
-        }
     }
-
-    get_channel_with_operation(
-        pool,
-        community_id,
-        channel_id,
-        crate::observability::WriterOperation::EventWrite,
-    )
-    .await
+    let result = q.execute(&mut **tx).await?;
+    if result.rows_affected() == 0 {
+        return Err(DbError::ChannelNotFound(channel_id));
+    }
+    Ok(())
 }
 
 /// Sets the topic for a channel, recording who set it and when.
@@ -622,7 +621,20 @@ pub async fn set_topic(
     topic: &str,
     set_by: &[u8],
 ) -> Result<()> {
-    let mut connection = acquire_event_write_connection(pool).await?;
+    let mut tx = begin_event_write_transaction(pool).await?;
+    set_topic_tx(&mut tx, community_id, channel_id, topic, set_by).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Apply the same source mutation in a caller-owned transaction.
+pub(crate) async fn set_topic_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    topic: &str,
+    set_by: &[u8],
+) -> Result<()> {
     let result = sqlx::query(
         "UPDATE channels SET topic = $1, topic_set_by = $2, topic_set_at = NOW() \
          WHERE community_id = $3 AND id = $4 AND deleted_at IS NULL",
@@ -631,7 +643,7 @@ pub async fn set_topic(
     .bind(set_by)
     .bind(community_id.as_uuid())
     .bind(channel_id)
-    .execute(&mut *connection)
+    .execute(&mut **tx)
     .await?;
     if result.rows_affected() == 0 {
         return Err(DbError::ChannelNotFound(channel_id));
@@ -647,7 +659,20 @@ pub async fn set_purpose(
     purpose: &str,
     set_by: &[u8],
 ) -> Result<()> {
-    let mut connection = acquire_event_write_connection(pool).await?;
+    let mut tx = begin_event_write_transaction(pool).await?;
+    set_purpose_tx(&mut tx, community_id, channel_id, purpose, set_by).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Apply the same source mutation in a caller-owned transaction.
+pub(crate) async fn set_purpose_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    purpose: &str,
+    set_by: &[u8],
+) -> Result<()> {
     let result = sqlx::query(
         "UPDATE channels SET purpose = $1, purpose_set_by = $2, purpose_set_at = NOW() \
          WHERE community_id = $3 AND id = $4 AND deleted_at IS NULL",
@@ -656,7 +681,7 @@ pub async fn set_purpose(
     .bind(set_by)
     .bind(community_id.as_uuid())
     .bind(channel_id)
-    .execute(&mut *connection)
+    .execute(&mut **tx)
     .await?;
     if result.rows_affected() == 0 {
         return Err(DbError::ChannelNotFound(channel_id));
@@ -673,14 +698,25 @@ pub async fn archive_channel(
     community_id: CommunityId,
     channel_id: Uuid,
 ) -> Result<()> {
-    let mut connection = acquire_event_write_connection(pool).await?;
+    let mut tx = begin_event_write_transaction(pool).await?;
+    archive_channel_tx(&mut tx, community_id, channel_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Apply the same source mutation in a caller-owned transaction.
+pub(crate) async fn archive_channel_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    community_id: CommunityId,
+    channel_id: Uuid,
+) -> Result<()> {
     // First check: does the channel exist and what is its state?
     let row = sqlx::query(
         "SELECT archived_at FROM channels WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
     )
         .bind(community_id.as_uuid())
         .bind(channel_id)
-        .fetch_optional(&mut *connection)
+        .fetch_optional(&mut **tx)
         .await?;
 
     match row {
@@ -701,7 +737,7 @@ pub async fn archive_channel(
     )
     .bind(community_id.as_uuid())
     .bind(channel_id)
-    .execute(&mut *connection)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())
@@ -716,14 +752,25 @@ pub async fn unarchive_channel(
     community_id: CommunityId,
     channel_id: Uuid,
 ) -> Result<()> {
-    let mut connection = acquire_event_write_connection(pool).await?;
+    let mut tx = begin_event_write_transaction(pool).await?;
+    unarchive_channel_tx(&mut tx, community_id, channel_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Apply the same source mutation in a caller-owned transaction.
+pub(crate) async fn unarchive_channel_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    community_id: CommunityId,
+    channel_id: Uuid,
+) -> Result<()> {
     // First check: does the channel exist and what is its state?
     let row = sqlx::query(
         "SELECT archived_at FROM channels WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
     )
         .bind(community_id.as_uuid())
         .bind(channel_id)
-        .fetch_optional(&mut *connection)
+        .fetch_optional(&mut **tx)
         .await?;
 
     match row {
@@ -746,7 +793,7 @@ pub async fn unarchive_channel(
     )
     .bind(community_id.as_uuid())
     .bind(channel_id)
-    .execute(&mut *connection)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())

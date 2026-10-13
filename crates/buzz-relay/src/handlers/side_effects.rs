@@ -308,6 +308,107 @@ async fn actor_owns_any_owner_agent(
     Ok(false)
 }
 
+/// Validate immutable kind:9002 tag shape independently of current authority.
+/// Shared by legacy preflight and the transaction-held canonical command path.
+pub(crate) fn validate_metadata_tags(event: &Event) -> anyhow::Result<()> {
+    // EDIT_METADATA: require at least one recognized metadata tag.
+    const RECOGNIZED_TAGS: &[&str] = &[
+        "name",
+        "about",
+        "archived",
+        "topic",
+        "purpose",
+        "visibility",
+        "ttl",
+    ];
+    let has_recognized = event
+        .tags
+        .iter()
+        .any(|t| RECOGNIZED_TAGS.contains(&t.kind().to_string().as_str()));
+    if !has_recognized {
+        return Err(anyhow::anyhow!(
+            "kind:9002 must include at least one metadata tag (name, about, archived, topic, purpose, visibility, ttl)"
+        ));
+    }
+
+    // Validate archived values before storage.
+    for t in event.tags.iter() {
+        if t.kind().to_string() == "archived" {
+            match t.content() {
+                Some("true") | Some("false") => {}
+                Some(v) => {
+                    return Err(anyhow::anyhow!(
+                        "invalid archived value: {v} (must be \"true\" or \"false\")"
+                    ));
+                }
+                None => {
+                    return Err(anyhow::anyhow!("archived tag must have a value"));
+                }
+            }
+        }
+    }
+
+    // Validate channel names before storage. A name made entirely of
+    // display-prefix hashes becomes empty after canonicalization.
+    for t in event.tags.iter() {
+        if t.kind().to_string() == "name" {
+            match t.content() {
+                Some(v)
+                    if !buzz_core::channel::canonical_channel_name(v)
+                        .trim()
+                        .is_empty() => {}
+                _ => {
+                    return Err(anyhow::anyhow!("channel name is required"));
+                }
+            }
+        }
+    }
+
+    // Validate visibility values before storage.
+    for t in event.tags.iter() {
+        if t.kind().to_string() == "visibility" {
+            match t.content() {
+                Some("open") | Some("private") => {}
+                Some(v) => {
+                    return Err(anyhow::anyhow!(
+                        "invalid visibility value: {v} (must be \"open\" or \"private\")"
+                    ));
+                }
+                None => {
+                    return Err(anyhow::anyhow!("visibility tag must have a value"));
+                }
+            }
+        }
+    }
+
+    // Validate ttl values before storage. Empty string clears the TTL
+    // (channel becomes permanent); any other value must parse as a
+    // positive integer number of seconds. A bare tag with no value is
+    // rejected so clearing is always explicit (`["ttl", ""]`).
+    for t in event.tags.iter() {
+        if t.kind().to_string() == "ttl" {
+            match t.content() {
+                Some("") => {}
+                Some(v) => match v.parse::<i32>() {
+                    Ok(n) if n > 0 => {}
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "invalid ttl value: {v} (must be a positive integer of seconds, or empty to clear)"
+                        ));
+                    }
+                },
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "ttl tag must have a value (seconds, or empty string to clear)"
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate an admin kind event BEFORE storage.
 pub async fn validate_admin_event(
     tenant: &TenantContext,
@@ -428,100 +529,7 @@ pub async fn validate_admin_event(
             }
         }
         9002 => {
-            // EDIT_METADATA: require at least one recognized metadata tag.
-            const RECOGNIZED_TAGS: &[&str] = &[
-                "name",
-                "about",
-                "archived",
-                "topic",
-                "purpose",
-                "visibility",
-                "ttl",
-            ];
-            let has_recognized = event
-                .tags
-                .iter()
-                .any(|t| RECOGNIZED_TAGS.contains(&t.kind().to_string().as_str()));
-            if !has_recognized {
-                return Err(anyhow::anyhow!(
-                    "kind:9002 must include at least one metadata tag (name, about, archived, topic, purpose, visibility, ttl)"
-                ));
-            }
-
-            // Validate archived values before storage.
-            for t in event.tags.iter() {
-                if t.kind().to_string() == "archived" {
-                    match t.content() {
-                        Some("true") | Some("false") => {}
-                        Some(v) => {
-                            return Err(anyhow::anyhow!(
-                                "invalid archived value: {v} (must be \"true\" or \"false\")"
-                            ));
-                        }
-                        None => {
-                            return Err(anyhow::anyhow!("archived tag must have a value"));
-                        }
-                    }
-                }
-            }
-
-            // Validate channel names before storage. A name made entirely of
-            // display-prefix hashes becomes empty after canonicalization.
-            for t in event.tags.iter() {
-                if t.kind().to_string() == "name" {
-                    match t.content() {
-                        Some(v)
-                            if !buzz_core::channel::canonical_channel_name(v)
-                                .trim()
-                                .is_empty() => {}
-                        _ => {
-                            return Err(anyhow::anyhow!("channel name is required"));
-                        }
-                    }
-                }
-            }
-
-            // Validate visibility values before storage.
-            for t in event.tags.iter() {
-                if t.kind().to_string() == "visibility" {
-                    match t.content() {
-                        Some("open") | Some("private") => {}
-                        Some(v) => {
-                            return Err(anyhow::anyhow!(
-                                "invalid visibility value: {v} (must be \"open\" or \"private\")"
-                            ));
-                        }
-                        None => {
-                            return Err(anyhow::anyhow!("visibility tag must have a value"));
-                        }
-                    }
-                }
-            }
-
-            // Validate ttl values before storage. Empty string clears the TTL
-            // (channel becomes permanent); any other value must parse as a
-            // positive integer number of seconds. A bare tag with no value is
-            // rejected so clearing is always explicit (`["ttl", ""]`).
-            for t in event.tags.iter() {
-                if t.kind().to_string() == "ttl" {
-                    match t.content() {
-                        Some("") => {}
-                        Some(v) => match v.parse::<i32>() {
-                            Ok(n) if n > 0 => {}
-                            _ => {
-                                return Err(anyhow::anyhow!(
-                                    "invalid ttl value: {v} (must be a positive integer of seconds, or empty to clear)"
-                                ));
-                            }
-                        },
-                        None => {
-                            return Err(anyhow::anyhow!(
-                                "ttl tag must have a value (seconds, or empty string to clear)"
-                            ));
-                        }
-                    }
-                }
-            }
+            validate_metadata_tags(event)?;
 
             // name/about/archived/visibility/ttl require owner/admin;
             // topic/purpose allow any member.
@@ -3718,5 +3726,110 @@ mod tests {
         }];
 
         assert!(actor_is_channel_owner_or_admin(&members, &actor));
+    }
+}
+
+/// Post-commit cache/transport maintenance for atomic canonical commands.
+/// Discovery projections and all-member unarchive resubscriptions retain their
+/// existing separate recovery limitations; canonical commands are never replayed.
+pub(crate) async fn after_atomic_channel_command(
+    tenant: &TenantContext,
+    event: &Event,
+    state: &Arc<AppState>,
+) {
+    let Some(channel_id) = extract_h_tag_channel(event) else {
+        return;
+    };
+    let kind = event.kind.as_u16();
+    if matches!(kind, 9000 | 9001) {
+        if let Some(target) = extract_p_tag(event) {
+            state.invalidate_membership(tenant, channel_id, &target);
+            if kind == 9001 {
+                evict_live_channel_subscriptions(tenant, state, channel_id, &target).await;
+                state
+                    .workflow_engine
+                    .invalidate_channel_workflows(tenant.community(), channel_id);
+                // Existing rows already committed disabled. Preserve the legacy
+                // cleanup for a concurrently preauthorized workflow INSERT too.
+                disable_departed_member_workflows(tenant, state, channel_id, &target).await;
+            }
+        }
+    } else {
+        state.invalidate_all_accessible_channels(tenant);
+        state.invalidate_channel_visibility(tenant, channel_id);
+        if event
+            .tags
+            .iter()
+            .any(|t| t.kind().to_string() == "visibility" && t.content() == Some("private"))
+        {
+            if let Err(error) =
+                evict_non_member_channel_subscriptions(tenant, state, channel_id).await
+            {
+                warn!(%channel_id, %error, "Channel eviction failed; authoritative delivery gate remains active");
+            }
+        }
+        if event
+            .tags
+            .iter()
+            .any(|t| t.kind().to_string() == "archived" && t.content() == Some("false"))
+        {
+            match state
+                .db
+                .get_members_for_event_write(tenant.community(), channel_id)
+                .await
+            {
+                Ok(members) => {
+                    for member in members {
+                        if let Err(error) = emit_membership_notification(
+                            tenant,
+                            state,
+                            channel_id,
+                            &member.pubkey,
+                            &event.pubkey.to_bytes(),
+                            KIND_MEMBER_ADDED_NOTIFICATION,
+                        )
+                        .await
+                        {
+                            warn!(%channel_id, %error, "Post-unarchive resubscribe notification failed");
+                        }
+                    }
+                }
+                Err(error) => warn!(%channel_id, %error, "Post-unarchive roster lookup failed"),
+            }
+        }
+    }
+    if let Err(error) = emit_group_discovery_events(tenant, state, channel_id).await {
+        warn!(%channel_id, %error, "Post-commit discovery failed; canonical metadata intent remains recoverable");
+    }
+}
+
+/// Deliver already committed notices without re-inserting or triggering workflows.
+pub(crate) async fn dispatch_atomic_channel_notices(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    notices: &[StoredEvent],
+) {
+    for stored in notices {
+        state.mark_local_event(tenant.community(), &stored.event.id);
+        let topic = stored
+            .channel_id
+            .map(EventTopic::Channel)
+            .unwrap_or(EventTopic::Global);
+        if let Err(error) = state
+            .pubsub
+            .publish_event(tenant, topic, &stored.event)
+            .await
+        {
+            state
+                .local_event_ids
+                .invalidate(&(tenant.community(), stored.event.id.to_bytes()));
+            warn!(%error, "Committed command notice fan-out failed; history retains the notice");
+        }
+        crate::handlers::event::fan_out_event_to_local_subscribers(
+            state,
+            tenant.community(),
+            stored,
+        )
+        .await;
     }
 }

@@ -789,7 +789,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod postgres_tests {
+pub(crate) mod postgres_tests {
     //! Regression test for `e3661764` / `7899c1a8`: a workflow `send_message`
     //! that mentions a channel member by name (`@Name`) in its author-written
     //! step template must emit both the legacy `p` tag and authenticated
@@ -804,7 +804,7 @@ mod postgres_tests {
     use std::sync::Arc;
 
     /// Real-PG state mirroring `handlers::event::tests::test_state_with_redis_url`.
-    pub(super) async fn test_state() -> Arc<AppState> {
+    pub(crate) async fn test_state() -> Arc<AppState> {
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("TEST_DATABASE_URL"))
