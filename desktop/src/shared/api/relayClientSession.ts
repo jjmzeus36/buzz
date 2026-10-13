@@ -86,6 +86,7 @@ export class RelayClient {
   private authRequest: RelayAuthRequest | null = null;
   private subscriptions = new Map<string, RelaySubscription>();
   private pendingEvents = new Map<string, PendingEvent>();
+  private pendingSubscriptionCancels = new Set<() => void>();
   private eventBuffer: SubscriptionEventBufferItem[] = [];
   private flushTimeout: number | null = null;
   private reconnectListeners = new Set<() => void>();
@@ -125,6 +126,8 @@ export class RelayClient {
     this.stallWatchdog.stop();
     this.sessionEpoch++;
     this.connectionGeneration++;
+    for (const cancel of this.pendingSubscriptionCancels) cancel();
+    this.pendingSubscriptionCancels.clear();
     this.keepAliveRequested = false;
     this.relayUrl = null;
     this.hasConnectedOnce = false;
@@ -153,6 +156,7 @@ export class RelayClient {
         window.clearTimeout(sub.timeout);
         sub.reject(error);
       } else {
+        sub.resolveReady = undefined;
         clearClosedRetry(sub);
       }
       this.subscriptions.delete(subId);
@@ -444,17 +448,20 @@ export class RelayClient {
   }
 
   private async connectBypassingBackoff() {
+    const epoch = this.sessionEpoch;
     if (this.reconnectTimeout !== null) {
       window.clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
     }
     try {
       await this.ensureConnected();
-      this.reconnectWaiters.settle();
+      if (epoch === this.sessionEpoch) this.reconnectWaiters.settle();
     } catch (error) {
-      this.reconnectWaiters.settle(
-        this.normalizeRelayError(error, "Relay reconnect failed."),
-      );
+      if (epoch === this.sessionEpoch) {
+        this.reconnectWaiters.settle(
+          this.normalizeRelayError(error, "Relay reconnect failed."),
+        );
+      }
       throw error;
     }
   }
@@ -544,11 +551,13 @@ export class RelayClient {
       inbound.receive(delivery),
     );
     try {
-      if (!this.relayUrl) {
-        this.relayUrl = await getRelayWsUrl();
+      const relayUrl = this.relayUrl ?? (await getRelayWsUrl());
+      if (generation !== this.connectionGeneration) {
+        throw new Error("Relay connection attempt was superseded.");
       }
+      this.relayUrl = relayUrl;
       const wsId = await invoke<number>("plugin:websocket|connect", {
-        url: this.relayUrl,
+        url: relayUrl,
         onMessage: this.onMessageChannel,
         config: {},
       });
@@ -573,6 +582,9 @@ export class RelayClient {
       await Promise.race([drain, authentication, inbound.overflow]);
       await drain;
       await authentication;
+      if (generation !== this.connectionGeneration) {
+        throw new Error("Relay connection attempt was superseded.");
+      }
       this.stabilityTimer = window.setTimeout(() => {
         this.stabilityTimer = null;
         this.reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
@@ -580,6 +592,9 @@ export class RelayClient {
 
       this.connectionStateEmitter.set("connected");
       await this.replayLiveSubscriptions();
+      if (generation !== this.connectionGeneration) {
+        throw new Error("Relay connection attempt was superseded.");
+      }
       this.stallWatchdog.start();
       this.emitReconnectIfNeeded();
       return generation;
@@ -601,13 +616,36 @@ export class RelayClient {
     onReady?: (readiness: LiveSubscriptionReadiness) => void,
     readinessTimeoutMs = 250,
   ) {
+    const epoch = this.sessionEpoch;
     await this.ensureConnected();
+    if (epoch !== this.sessionEpoch) {
+      throw new Error("Relay subscription cancelled by a session change.");
+    }
 
     const subId = `live-${crypto.randomUUID()}`;
+    const subscription: Extract<RelaySubscription, { mode: "live" }> = {
+      mode: "live",
+      filter,
+      onEvent,
+    };
+    const isOwned = () =>
+      epoch === this.sessionEpoch &&
+      this.subscriptions.get(subId) === subscription;
+    let cancelSubscribe = () => {};
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      cancelSubscribe = () => {
+        window.clearTimeout(fallbackTimeout);
+        reject(new Error("Relay subscription cancelled by a session change."));
+      };
+    });
     let resolveReady = (_readiness: LiveSubscriptionReadiness) => {};
     const ready = new Promise<void>((resolve) => {
       resolveReady = (readiness) => {
         window.clearTimeout(fallbackTimeout);
+        if (!isOwned()) {
+          cancelSubscribe();
+          return;
+        }
         onReady?.(readiness);
         resolve();
       };
@@ -616,34 +654,42 @@ export class RelayClient {
       () => resolveReady("timeout"),
       readinessTimeoutMs,
     );
-
-    this.subscriptions.set(subId, {
-      mode: "live",
-      filter,
-      onEvent,
-      resolveReady,
-    });
+    subscription.resolveReady = resolveReady;
+    this.subscriptions.set(subId, subscription);
+    this.pendingSubscriptionCancels.add(cancelSubscribe);
 
     try {
-      await this.sendRawWithReconnectRetry(
-        ["REQ", subId, filter],
-        "Failed to restore relay subscription.",
-      );
+      await Promise.race([
+        Promise.all([
+          this.sendRawWithReconnectRetry(
+            subId,
+            filter,
+            "Failed to restore relay subscription.",
+          ),
+          ready,
+        ]),
+        cancelled,
+      ]);
+      if (!isOwned()) {
+        throw new Error("Relay subscription was cancelled.");
+      }
     } catch (error) {
-      window.clearTimeout(fallbackTimeout);
-      this.subscriptions.delete(subId);
+      if (isOwned()) {
+        this.subscriptions.delete(subId);
+        clearClosedRetry(subscription);
+      }
       throw error;
+    } finally {
+      window.clearTimeout(fallbackTimeout);
+      if (!isOwned()) subscription.resolveReady = undefined;
+      this.pendingSubscriptionCancels.delete(cancelSubscribe);
     }
-    await ready;
 
     return async () => {
-      const active = this.subscriptions.get(subId);
-      if (active?.mode !== "live") {
-        return;
-      }
-
+      if (!isOwned()) return;
       this.subscriptions.delete(subId);
-      clearClosedRetry(active);
+      subscription.resolveReady = undefined;
+      clearClosedRetry(subscription);
       await this.closeSubscription(subId);
     };
   }
@@ -687,24 +733,73 @@ export class RelayClient {
   }
 
   private async sendRawWithReconnectRetry(
-    payload: unknown[],
+    subId: string,
+    filter: RelaySubscriptionFilter,
     fallbackMessage: string,
   ) {
+    const epoch = this.sessionEpoch;
+    const subscription = this.subscriptions.get(subId);
+    const isOwned = () =>
+      subscription !== undefined &&
+      epoch === this.sessionEpoch &&
+      this.subscriptions.get(subId) === subscription;
+    const assertOwned = () => {
+      if (!isOwned()) throw new Error("Relay subscription was cancelled.");
+    };
+    const send = async (generation: number) => {
+      assertOwned();
+      if (generation !== this.connectionGeneration) {
+        throw new Error("Relay subscription connection was superseded.");
+      }
+      await this.sendRaw(["REQ", subId, filter]);
+      // A retired in-flight REQ may succeed after its CLOSE. Converge only
+      // on its original transport, and never close a replacement entry.
+      if (
+        !isOwned() &&
+        epoch === this.sessionEpoch &&
+        generation === this.connectionGeneration &&
+        !this.subscriptions.has(subId)
+      ) {
+        await this.closeSubscription(subId);
+      }
+      assertOwned();
+    };
+
+    const generation = this.connectionGeneration;
     try {
-      await this.sendRaw(payload);
+      await send(generation);
     } catch (error) {
-      const normalizedError = this.recoverFromSocketFailure(
-        error,
-        fallbackMessage,
-      );
+      assertOwned();
+      const normalizedError = this.normalizeRelayError(error, fallbackMessage);
+      // A late failure from an older socket cannot reset its replacement.
+      if (generation === this.connectionGeneration) {
+        this.recoverFromSocketFailure(normalizedError, fallbackMessage);
+      }
+      // Reset can retire history entries or invoke a caller that disconnects.
+      assertOwned();
+      let retryGeneration: number;
       try {
-        await this.ensureConnected();
-        await this.sendRaw(payload);
+        retryGeneration = await this.ensureConnected();
       } catch (retryError) {
-        throw this.recoverFromSocketFailure(
-          retryError,
-          normalizedError.message,
-        );
+        assertOwned();
+        // Connection establishment owns its own generation-scoped reset.
+        throw this.normalizeRelayError(retryError, normalizedError.message);
+      }
+      assertOwned();
+      try {
+        await send(retryGeneration);
+      } catch (retryError) {
+        assertOwned();
+        if (retryGeneration === this.connectionGeneration) {
+          throw this.recoverFromSocketFailure(
+            retryError,
+            normalizedError.message,
+          );
+        }
+        // Live replay owns the desired entry on the newer connection. Wait
+        // for it instead of failing setup and deleting that restored entry.
+        await this.ensureConnected();
+        assertOwned();
       }
     }
   }
@@ -806,7 +901,8 @@ export class RelayClient {
         message: typeof rest[1] === "string" ? rest[1] : "",
         sendReq: (subId, filter) =>
           this.sendRawWithReconnectRetry(
-            ["REQ", subId, filter],
+            subId,
+            filter,
             "Failed to restore relay subscription after CLOSED.",
           ),
         closeSubscription: (subId) => this.closeSubscription(subId),
@@ -933,7 +1029,9 @@ export class RelayClient {
         error instanceof Error
           ? error
           : new Error("Failed to restore relay subscriptions.");
-      this.resetConnection(reconnectError);
+      if (generation === this.connectionGeneration) {
+        this.resetConnection(reconnectError);
+      }
       throw reconnectError;
     }
   }
@@ -960,11 +1058,16 @@ export class RelayClient {
       RECONNECT_MAX_DELAY_MS,
     );
 
+    const epoch = this.sessionEpoch;
     this.reconnectTimeout = window.setTimeout(() => {
+      if (epoch !== this.sessionEpoch) return;
       this.reconnectTimeout = null;
       void this.ensureConnected()
-        .then(() => this.reconnectWaiters.settle())
+        .then(() => {
+          if (epoch === this.sessionEpoch) this.reconnectWaiters.settle();
+        })
         .catch((error) => {
+          if (epoch !== this.sessionEpoch) return;
           this.reconnectWaiters.settle(
             this.normalizeRelayError(error, "Relay reconnect failed."),
           );

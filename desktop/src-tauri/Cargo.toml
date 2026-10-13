@@ -4,6 +4,8 @@
 # expands to a set that excludes this crate, and its gates pass green-and-empty
 # over a real defect. Verified: Sami Arm A/D, Dawn `.scratch/armA`.
 members = ["crates/buzz-terminal"]
+# Keep unmodified upstream source outside workspace formatting/lint policy.
+exclude = ["vendor/neteq"]
 
 [package]
 name = "buzz-desktop"
@@ -88,7 +90,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 bytes = "1"
 futures-util = "0.3"
 opus = "0.3"
-neteq = { version = "0.8", default-features = false }
+neteq = { version = "=0.8.3", path = "vendor/neteq", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

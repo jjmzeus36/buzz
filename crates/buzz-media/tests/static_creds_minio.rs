@@ -20,6 +20,7 @@
 
 use buzz_media::config::MediaConfig;
 use buzz_media::storage::MediaStorage;
+use futures_util::StreamExt;
 
 fn minio_config() -> MediaConfig {
     MediaConfig {
@@ -73,6 +74,21 @@ async fn static_creds_round_trip_against_minio() {
     // GET round-trips the bytes
     let got = storage.get(&key).await.expect("get should succeed");
     assert_eq!(got, body);
+
+    // Bodyless ranged GET signing changed in rust-s3 0.38. Exercise the real
+    // storage seam so a compatible backend cannot hide a client regression.
+    let range = storage
+        .get_range(&key, 4, 12)
+        .await
+        .expect("ranged get should succeed");
+    assert_eq!(range, &body[4..=12]);
+
+    let mut stream = storage.get_stream(&key).await.expect("stream should open");
+    let mut streamed = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        streamed.extend_from_slice(&chunk.expect("stream chunk"));
+    }
+    assert_eq!(streamed, body);
 
     // DELETE, then HEAD reports absence
     storage.delete(&key).await.expect("delete should succeed");

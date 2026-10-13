@@ -12,6 +12,9 @@ pub mod archived_identities;
 pub mod channel;
 /// Channel membership and roster persistence.
 pub mod channel_members;
+/// Locked relay-authored channel metadata snapshots.
+pub mod channel_metadata;
+mod channel_topic_authority;
 /// Community lifecycle and host-map persistence.
 pub mod community;
 /// Durable whole-community deletion lifecycle and PostgreSQL adapter.
@@ -26,6 +29,10 @@ pub mod feed;
 pub mod git_repo;
 /// Keyed kind:9 event reservation and insert (NIP-MI).
 pub mod idempotency;
+/// Verified media baselines and durable quota admission.
+pub mod media_quota;
+/// Durable recovery of canonical channel metadata publication.
+pub mod metadata_refresh;
 /// Community moderation: reports, bans/timeouts, audit actions.
 pub mod moderation;
 /// Monthly table partition management.

@@ -814,6 +814,74 @@ pub async fn reap_expired_ephemeral_channels(pool: &PgPool) -> Result<Vec<Reaped
 }
 
 impl Db {
+    /// Atomically update a topic with live member authority and persist its
+    /// relay-signed notification. Channel/member and moderation/owner-mapping locks
+    /// serialize revocation against authorization through source commit; a failed
+    /// event insert rolls back the topic.
+    pub async fn set_topic_with_member_event(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        topic: &str,
+        actor: &[u8],
+        notification: &nostr::Event,
+    ) -> Result<(buzz_core::StoredEvent, bool)> {
+        let mut tx = self.begin_event_write_transaction().await?;
+        // Take the deletion and TTL advisory fences before row locks, matching
+        // deletion/TTL writers. The deferred event trigger also takes the TTL
+        // fence; acquiring it after the channel row would invert that order.
+        sqlx::query("SELECT assert_community_write_allowed($1)")
+            .bind(community_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))")
+            .bind(format!(
+                "buzz_channel_ttl:{}:{}",
+                community_id.as_uuid(),
+                channel_id
+            ))
+            .execute(&mut *tx)
+            .await?;
+        let authorized: Option<bool> = sqlx::query_scalar(
+            "SELECT TRUE FROM channels c JOIN channel_members m \
+             ON m.community_id = c.community_id AND m.channel_id = c.id \
+             WHERE c.community_id = $1 AND c.id = $2 AND m.pubkey = $3 \
+             AND c.deleted_at IS NULL AND c.archived_at IS NULL AND m.removed_at IS NULL \
+             FOR UPDATE OF c FOR SHARE OF m",
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .bind(actor)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if authorized != Some(true) {
+            return Err(DbError::AccessDenied(
+                "topic requires current membership in an active channel".into(),
+            ));
+        }
+        super::channel_topic_authority::lock_unrestricted_principal(&mut tx, community_id, actor)
+            .await?;
+        sqlx::query(
+            "UPDATE channels SET topic = $3, topic_set_by = $4, topic_set_at = NOW() \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .bind(topic)
+        .bind(actor)
+        .execute(&mut *tx)
+        .await?;
+        let result = crate::event::insert_event_in_transaction(
+            &mut tx,
+            community_id,
+            notification,
+            Some(channel_id),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
     /// Creates a new channel, bootstraps the creator as owner, and returns the record.
     #[allow(clippy::too_many_arguments)]
     #[datastore_span(name = "create_channel", system = "postgresql")]

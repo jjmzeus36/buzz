@@ -29,12 +29,22 @@ else
     EXE=""
 fi
 
+# MSYS file tests resolve a suffixless name to a .exe alias. Match actual
+# directory entries first so a Unix target cannot package Windows-only files.
+source_entries=("$SRC_DIR"/*)
 missing=()
 for bin in "${SIDECARS[@]}"; do
-    [[ -f "$SRC_DIR/${bin}${EXE}" ]] || missing+=("${bin}${EXE}")
+    present=false
+    for source in "${source_entries[@]}"; do
+        if [[ "$source" == "$SRC_DIR/${bin}${EXE}" && -f "$source" && -s "$source" ]]; then
+            present=true
+            break
+        fi
+    done
+    [[ "$present" == true ]] || missing+=("${bin}${EXE}")
 done
 if [[ ${#missing[@]} -gt 0 ]]; then
-    echo "Error: missing release binaries in $SRC_DIR: ${missing[*]}" >&2
+    echo "Error: missing or empty release binaries in $SRC_DIR: ${missing[*]}" >&2
     echo "Run '$BUILD_HINT' first." >&2
     exit 1
 fi

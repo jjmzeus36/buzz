@@ -156,6 +156,7 @@ desktop-tauri-fmt:
 
 # Check desktop Tauri Rust formatting
 desktop-tauri-fmt-check:
+    node scripts/verify-vendored-neteq.mjs
     cargo fmt --manifest-path {{desktop_tauri_manifest}} --all -- --check
 
 # Format all code (Rust + Tauri Rust + Dart)
@@ -186,16 +187,18 @@ _ensure-services:
     pg=$(docker inspect --format '{{"{{"}}.State.Health.Status{{"}}"}}' buzz-postgres 2>/dev/null || echo "not_found")
     redis=$(docker inspect --format '{{"{{"}}.State.Health.Status{{"}}"}}' buzz-redis 2>/dev/null || echo "not_found")
     if [[ "$pg" == "healthy" && "$redis" == "healthy" ]]; then
+        bash ./scripts/ensure-s3-fixture.sh
         echo "Services already healthy"
         exit 0
     fi
     echo "Starting services..."
-    docker compose up -d || true
+    docker compose up -d
     echo -n "Waiting for services"
     for i in $(seq 1 40); do
         pg=$(docker inspect --format '{{"{{"}}.State.Health.Status{{"}}"}}' buzz-postgres 2>/dev/null || echo "not_found")
         redis=$(docker inspect --format '{{"{{"}}.State.Health.Status{{"}}"}}' buzz-redis 2>/dev/null || echo "not_found")
         if [[ "$pg" == "healthy" && "$redis" == "healthy" ]]; then
+            bash ./scripts/ensure-s3-fixture.sh
             echo " ready"
             exit 0
         fi
@@ -276,15 +279,14 @@ desktop-release-build target="aarch64-apple-darwin":
     #!/usr/bin/env bash
     set -euo pipefail
     TARGET={{target}}
-    mkdir -p desktop/src-tauri/binaries
-    touch "desktop/src-tauri/binaries/buzz-acp-$TARGET"
-    touch "desktop/src-tauri/binaries/buzz-agent-$TARGET"
+    PACKAGES=(buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz-cli)
     if [[ "$TARGET" != *windows* ]]; then
-        touch "desktop/src-tauri/binaries/buzz-backend-kubernetes-$TARGET"
+        PACKAGES+=(buzz-backend-kubernetes)
     fi
-    touch "desktop/src-tauri/binaries/buzz-dev-mcp-$TARGET"
-    touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET"
-    touch "desktop/src-tauri/binaries/buzz-$TARGET"
+    BUILD_ARGS=()
+    for package in "${PACKAGES[@]}"; do BUILD_ARGS+=(-p "$package"); done
+    cargo build --locked --release --target "$TARGET" "${BUILD_ARGS[@]}"
+    bash ./scripts/bundle-sidecars.sh "$TARGET"
     pnpm install
     cd {{desktop_dir}} && pnpm tauri build --features mesh-llm --target {{target}}
 
@@ -368,6 +370,10 @@ test-unit:
         # already runs it.
         cargo test -p buzz-auth --doc
         cargo nextest run -p buzz-voice --lib
+        cargo nextest run -p buzz-media --test stream_errors --no-tests=fail
+        # Media validators and quota production uploads use a loopback fixture;
+        # live S3 tests remain ignored and run in their dedicated lane.
+        cargo nextest run -p buzz-media --lib --tests
         cargo nextest run -p buzz-cli
         # buzz-acp owns the relay-to-agent trust boundary. Run its tests here so
         # forged relay events cannot regain a path into agent routing unnoticed.
@@ -490,6 +496,7 @@ test-unit:
         cargo nextest run -p buzz-acp --lib
     else
         ./scripts/run-tests.sh unit
+        cargo test -p buzz-media --lib --tests
     fi
 
 # Run integration tests only (starts services if needed)

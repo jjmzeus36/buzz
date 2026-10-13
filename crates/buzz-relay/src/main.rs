@@ -738,6 +738,12 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     let wf_cron = Arc::clone(&workflow_engine);
     tokio::spawn(async move { wf_cron.run().await });
 
+    let metadata_refresh_cancel = CancellationToken::new();
+    let metadata_refresh_task = tokio::spawn(buzz_relay::metadata_refresh::run(
+        Arc::clone(&state),
+        metadata_refresh_cancel.clone(),
+    ));
+
     // Ephemeral channel reaper — archives channels whose TTL deadline has passed.
     // Runs every 60s, matching the workflow cron loop pattern. The SQL UPDATE
     // uses `archived_at IS NULL` as a guard, so concurrent runs from multiple
@@ -1256,6 +1262,10 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
 
     serve(router, health_router, Arc::clone(&state)).await?;
     state.community_revalidator_cancel.cancel();
+    metadata_refresh_cancel.cancel();
+    if let Err(error) = metadata_refresh_task.await {
+        tracing::warn!(%error, "Canonical metadata recovery task exited abnormally");
+    }
 
     // Signal the audit worker to stop accepting, flush buffered entries, and
     // exit. Uses a CancellationToken so it works regardless of how many

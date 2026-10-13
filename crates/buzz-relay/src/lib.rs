@@ -30,6 +30,8 @@ pub mod invite_token;
 pub mod lifecycle;
 /// Inter-relay mesh startup wiring (`BUZZ_MESH` seam).
 pub mod mesh_boot;
+/// Durable canonical channel metadata projection recovery.
+pub mod metadata_refresh;
 /// Prometheus metrics: recorder, upkeep, HTTP middleware.
 pub mod metrics;
 /// NIP-11 relay information document.

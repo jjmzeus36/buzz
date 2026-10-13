@@ -2,6 +2,15 @@
 
 ## Automated Tests
 
+Media quota acceptance uses a loopback S3 fixture with synthetic credentials
+and the isolated PostgreSQL runner. Run `cargo test -p buzz-media --test
+quota_admission`, then `scripts/postgres-test-run.sh -p buzz-db --lib -E
+'test(quota_)'`. Set only the runner's dedicated `BUZZ_POSTGRES_ADMIN_URL`,
+`PGHOST`, `PGPORT`, `PGUSER`, and `PGPASSWORD`; never target an operator or
+shared development database. The runner supplies one database per test and
+exercises both desired schema and migration-owned quota tests. See
+[media quotas](docs/media-quotas.md) for the disabled-default operator contract.
+
 ```bash
 just test-unit          # unit tests — no infrastructure needed
 just test               # unit + integration (starts Docker if needed)

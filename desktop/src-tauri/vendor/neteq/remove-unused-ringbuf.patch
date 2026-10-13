@@ -1,0 +1,12 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -142,9 +142,6 @@
+ optional = true
+ default-features = false
+ 
+-[dependencies.ringbuf]
+-version = "0.3"
+-
+ [dependencies.serde]
+ version = "1.0"
+ features = ["derive"]

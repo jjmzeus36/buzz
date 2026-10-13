@@ -721,7 +721,22 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 46);
+        assert_eq!(migrations.len(), 48);
+        assert_eq!(migrations[45].version, 46);
+        assert_eq!(migrations[46].version, 47);
+        assert_eq!(migrations[47].version, 48);
+        assert!(migrations[47]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE channel_metadata_refresh"));
+        assert!(migrations[46]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE media_quota_accounts"));
+        assert!(migrations[46]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE media_quota_objects"));
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -2020,6 +2035,13 @@ mod postgres_tests {
         expected_fences.remove("product_feedback");
         expected_fences.remove("rate_limit_violations");
         expected_fences.insert("event_idempotency_keys".to_owned());
+        expected_fences.insert("media_quota_accounts".to_owned());
+        expected_fences.insert("media_quota_objects".to_owned());
+        let metadata_refresh_migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 48)
+            .expect("embedded metadata recovery migration");
+        expected_fences.extend(surface(metadata_refresh_migration.sql.as_ref()).fence_attachments);
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"
@@ -2687,10 +2709,9 @@ mod postgres_tests {
         let migrated = PgPool::connect(&format!("{base_prefix}/{migrated_db}"))
             .await
             .expect("connect migrated probe database");
-        MIGRATOR
-            .run_to(45, &migrated)
+        run_migrations(&migrated)
             .await
-            .expect("apply migrations 1-45");
+            .expect("apply all current migrations");
 
         let extras_result = async {
             sqlx::query(
@@ -3116,6 +3137,143 @@ mod postgres_tests {
             errors.extend(drop_probe_databases(&admin, &desired_db, &migrated_db).await);
             panic!("{}", errors.join("; "));
         }
+
+        // Exercise the actual desired-state pgschema + repeated reconciliation
+        // path against all migrations, including approval checkpoints and quotas.
+        for table in [
+            "workflow_approvals",
+            "media_quota_accounts",
+            "media_quota_objects",
+        ] {
+            let migrated_columns = columns(&migrated, table).await;
+            assert!(
+                !migrated_columns.is_empty(),
+                "empty catalog parity must not pass for {table}"
+            );
+            assert_eq!(
+                columns(&desired, table).await,
+                migrated_columns,
+                "column parity for {table} through0047"
+            );
+            assert_eq!(
+                index_shapes(&desired, table).await,
+                index_shapes(&migrated, table).await,
+                "index-shape parity for {table} through0047"
+            );
+            assert_eq!(
+                constraints(&desired, table).await,
+                constraints(&migrated, table).await,
+                "constraint parity for {table} through0047"
+            );
+            assert_eq!(
+                triggers(&desired, table).await,
+                triggers(&migrated, table).await,
+                "trigger parity for {table} through0047"
+            );
+        }
+        for pool in [&desired, &migrated] {
+            let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM media_quota_accounts")
+                .fetch_one(pool)
+                .await
+                .expect("read initial quota accounts");
+            let objects: i64 = sqlx::query_scalar("SELECT count(*) FROM media_quota_objects")
+                .fetch_one(pool)
+                .await
+                .expect("read initial quota objects");
+            assert_eq!(
+                (accounts, objects),
+                (0, 0),
+                "neither bootstrap may invent historical ownership"
+            );
+            let fences: Vec<(String, String, String)> = sqlx::query_as("SELECT c.relname,t.tgname,t.tgenabled::text FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid WHERE c.relname IN ('media_quota_accounts','media_quota_objects') AND NOT t.tgisinternal ORDER BY c.relname,t.tgname")
+                .fetch_all(pool).await.expect("read live quota fences");
+            assert_eq!(
+                fences,
+                vec![
+                    (
+                        "media_quota_accounts".into(),
+                        "community_write_fence_media_quota_accounts".into(),
+                        "O".into()
+                    ),
+                    (
+                        "media_quota_objects".into(),
+                        "community_write_fence_media_quota_objects".into(),
+                        "O".into()
+                    )
+                ],
+                "both quota fences must exist and be enabled"
+            );
+            let checkpoint: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='workflow_approvals' AND column_name='checkpoint' AND data_type='jsonb')")
+                .fetch_one(pool).await.expect("read0046 checkpoint column");
+            let recovery_index: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND tablename='workflow_approvals' AND indexname='idx_workflow_approvals_recovery')")
+                .fetch_one(pool).await.expect("read0046 approval recovery index");
+            assert!(
+                checkpoint && recovery_index,
+                "0046 checkpoint and recovery index must survive0047"
+            );
+        }
+        for signature in [
+            "community_write_allowed(uuid)",
+            "assert_community_write_allowed(uuid)",
+            "enforce_community_write_fence()",
+            "attach_community_write_fence(regclass)",
+        ] {
+            let desired_body: String =
+                sqlx::query_scalar("SELECT pg_get_functiondef(to_regprocedure($1))")
+                    .bind(signature)
+                    .fetch_one(&desired)
+                    .await
+                    .expect("read desired fence function");
+            let migrated_body: String =
+                sqlx::query_scalar("SELECT pg_get_functiondef(to_regprocedure($1))")
+                    .bind(signature)
+                    .fetch_one(&migrated)
+                    .await
+                    .expect("read migrated fence function");
+            // Historical migrations retain their original explanatory comments.
+            // Compare executable definitions without discarding SQL literals or code.
+            let without_comments = |body: &str| {
+                body.lines()
+                    .filter(|line| !line.trim_start().starts_with("--"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            assert_eq!(
+                without_comments(&desired_body),
+                without_comments(&migrated_body),
+                "live quota fence function parity for {signature}"
+            );
+        }
+        const METADATA_QUEUE: &str = "channel_metadata_refresh";
+        assert_eq!(
+            columns(&desired, METADATA_QUEUE).await,
+            columns(&migrated, METADATA_QUEUE).await
+        );
+        assert_eq!(
+            index_shapes(&desired, METADATA_QUEUE).await,
+            index_shapes(&migrated, METADATA_QUEUE).await
+        );
+        assert_eq!(
+            constraints(&desired, METADATA_QUEUE).await,
+            constraints(&migrated, METADATA_QUEUE).await
+        );
+        for table in [METADATA_QUEUE, "channels", "channel_members"] {
+            assert_eq!(
+                triggers(&desired, table).await,
+                triggers(&migrated, table).await,
+                "metadata source/fence triggers differ for {table}"
+            );
+        }
+        async fn metadata_functions(pool: &PgPool) -> Vec<(String, String)> {
+            sqlx::query_as("SELECT proname::text, pg_get_functiondef(oid) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('request_channel_metadata_refresh', 'refresh_channel_ttl_after_event_insert') ORDER BY proname")
+                .fetch_all(pool).await.expect("metadata recovery function bodies")
+        }
+        let migrated_metadata_functions = metadata_functions(&migrated).await;
+        assert_eq!(migrated_metadata_functions.len(), 2);
+        assert_eq!(
+            metadata_functions(&desired).await,
+            migrated_metadata_functions
+        );
 
         const IDEMPOTENCY_TABLE: &str = "event_idempotency_keys";
         const REAPER_CURSOR_TABLE: &str = "event_idempotency_reaper_cursor";
