@@ -46,7 +46,7 @@ path = "tests/bin/auth_worker.rs"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "process", "time", "net"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+serde-saphyr = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls", "form"] }
 rmcp = { version = "1", default-features = false, features = ["client", "transport-child-process"] }
 arc-swap = "1"
@@ -65,7 +65,7 @@ webbrowser = "1"
 dirs = "6"
 # Cross-process advisory file lock (flock on Unix, LockFileEx on Windows) for
 # the auth coordinator's single-flight. Kept off std's `File::try_lock` so the
-# crate stays buildable on the repo's declared 1.88 MSRV (those std APIs are
+# crate stays buildable on the repo's declared 1.89 MSRV (those std APIs are
 # 1.89+).
 fs2 = "0.4"
 

@@ -131,6 +131,35 @@ mod tests {
     /// Tested on the pure computation: mutating the process PATH here would
     /// race every other test in the binary.
     #[test]
+    fn maintained_kubeconfig_parser_preserves_context_and_exec_fields() {
+        let yaml = "apiVersion: v1\nkind: Config\ncurrent-context: synthetic\nclusters:\n- name: fixture\n  cluster:\n    server: https://127.0.0.1:1\n    insecure-skip-tls-verify: false\ncontexts:\n- name: synthetic\n  context: {cluster: fixture, user: fixture-user, namespace: owned}\nusers:\n- name: fixture-user\n  user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: synthetic-not-executed\n      args: [one, two]\n      interactiveMode: Never\n";
+        let parsed = Kubeconfig::from_yaml(yaml).unwrap();
+        assert_eq!(parsed.current_context.as_deref(), Some("synthetic"));
+        assert_eq!(
+            parsed.contexts[0]
+                .context
+                .as_ref()
+                .unwrap()
+                .namespace
+                .as_deref(),
+            Some("owned")
+        );
+        let exec = parsed.auth_infos[0]
+            .auth_info
+            .as_ref()
+            .unwrap()
+            .exec
+            .as_ref()
+            .unwrap();
+        assert_eq!(exec.command.as_deref(), Some("synthetic-not-executed"));
+        assert_eq!(
+            exec.args.as_deref(),
+            Some(["one".to_string(), "two".to_string()].as_slice())
+        );
+        assert!(Kubeconfig::from_yaml("clusters: [\n").is_err());
+    }
+
+    #[test]
     fn plugin_directories_are_prepended_in_order() {
         let joined = prepended_path(
             Some(Path::new("/tmp/fake-home")),

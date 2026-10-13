@@ -1,0 +1,1496 @@
+use super::test_support::*;
+use super::*;
+use crate::inference::skippy::{SkippyTelemetryOptions, StageWireDType};
+use crate::plugin::{MeshConfig, ReasoningBudget, RequestDefaultsConfig};
+use serde_json::Value;
+use skippy_protocol::{LoadMode, StageKvCacheMode, StageKvCachePayload};
+use skippy_server::{EmbeddedReasoningEnabled, EmbeddedReasoningFormat};
+use std::path::Path;
+use tempfile::NamedTempFile;
+
+const FULL_SURFACE_VALID_FIXTURE: &str =
+    include_str!("../../../../tests/fixtures/skippy_full_surface_valid.toml");
+const FULL_SURFACE_INVALID_FIXTURE: &str =
+    include_str!("../../../../tests/fixtures/skippy_full_surface_invalid.toml");
+
+fn resolve_qwen_config_with_request_defaults(
+    mesh_config: &MeshConfig,
+    model_path: &Path,
+    request_defaults: Option<&RequestDefaultsConfig>,
+) -> ResolvedSkippyConfig {
+    resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path,
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults,
+        package_generation: None,
+    })
+    .expect("qwen config should resolve")
+}
+
+fn assert_request_override_keeps_load_time_config(
+    without_request: &ResolvedSkippyConfig,
+    with_request: &ResolvedSkippyConfig,
+) {
+    assert_eq!(without_request.model_fit, with_request.model_fit);
+    assert_eq!(without_request.hardware, with_request.hardware);
+    assert_eq!(without_request.skippy, with_request.skippy);
+}
+
+fn assert_stage_configs_match_for_request_override(
+    without_request: &ResolvedSkippyConfig,
+    with_request: &ResolvedSkippyConfig,
+) {
+    let baseline_stage = without_request
+        .to_stage_config(Some(fake_package_identity(28)), LoadMode::RuntimeSlice)
+        .expect("baseline stage config should build");
+    let override_stage = with_request
+        .to_stage_config(Some(fake_package_identity(28)), LoadMode::RuntimeSlice)
+        .expect("override stage config should build");
+
+    assert_eq!(baseline_stage.model_id, override_stage.model_id);
+    assert_eq!(baseline_stage.model_path, override_stage.model_path);
+    assert_eq!(baseline_stage.ctx_size, override_stage.ctx_size);
+    assert_eq!(baseline_stage.lane_count, override_stage.lane_count);
+    assert_eq!(baseline_stage.n_batch, override_stage.n_batch);
+    assert_eq!(baseline_stage.n_ubatch, override_stage.n_ubatch);
+    assert_eq!(baseline_stage.n_gpu_layers, override_stage.n_gpu_layers);
+    assert_eq!(baseline_stage.cache_type_k, override_stage.cache_type_k);
+    assert_eq!(baseline_stage.cache_type_v, override_stage.cache_type_v);
+    assert_eq!(
+        baseline_stage.flash_attn_type,
+        override_stage.flash_attn_type
+    );
+    assert_eq!(
+        baseline_stage.selected_device,
+        override_stage.selected_device
+    );
+    assert_eq!(baseline_stage.load_mode, override_stage.load_mode);
+}
+
+fn assert_openai_args_use_request_time_defaults(
+    without_request: &ResolvedSkippyConfig,
+    with_request: &ResolvedSkippyConfig,
+) {
+    let baseline_openai = without_request
+        .to_embedded_openai_args(4096, true)
+        .expect("baseline openai args should build");
+    let override_openai = with_request
+        .to_embedded_openai_args(4096, true)
+        .expect("override openai args should build");
+
+    assert_eq!(baseline_openai.default_max_tokens, 128);
+    assert_eq!(override_openai.default_max_tokens, 32);
+}
+
+struct FullSurfaceFixture {
+    mesh_config: MeshConfig,
+    explicit_model: NamedTempFile,
+    defaults_model: NamedTempFile,
+    _projector_file: NamedTempFile,
+}
+
+fn full_surface_fixture_with_model_paths() -> FullSurfaceFixture {
+    let mut mesh_config = parse_config(FULL_SURFACE_VALID_FIXTURE);
+    let explicit_model = temp_model_file();
+    let defaults_model = temp_model_file();
+    let projector_file = NamedTempFile::new().expect("temp projector");
+
+    mesh_config.models[0]
+        .hardware
+        .as_mut()
+        .expect("explicit hardware")
+        .model_path = Some(explicit_model.path().display().to_string());
+    mesh_config.models[0]
+        .hardware
+        .as_mut()
+        .expect("explicit hardware")
+        .mmproj = Some(projector_file.path().display().to_string());
+    mesh_config.models[0]
+        .multimodal
+        .as_mut()
+        .expect("explicit multimodal")
+        .mmproj = Some(projector_file.path().display().to_string());
+    mesh_config.models[1]
+        .hardware
+        .as_mut()
+        .expect("defaults hardware")
+        .model_path = Some(defaults_model.path().display().to_string());
+
+    FullSurfaceFixture {
+        mesh_config,
+        explicit_model,
+        defaults_model,
+        _projector_file: projector_file,
+    }
+}
+
+fn resolve_explicit_full_surface_config(
+    fixture: &FullSurfaceFixture,
+    request_defaults: &RequestDefaultsConfig,
+) -> ResolvedSkippyConfig {
+    resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &fixture.mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: fixture.explicit_model.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: Some(12 * 1024 * 1024 * 1024),
+        request_defaults: Some(request_defaults),
+        package_generation: None,
+    })
+    .expect("explicit model should resolve")
+}
+
+fn resolve_defaults_full_surface_config(fixture: &FullSurfaceFixture) -> ResolvedSkippyConfig {
+    resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &fixture.mesh_config,
+        model_id: "ggml-org/gemma-3-270m-it-GGUF:Q8_0",
+        model_path: fixture.defaults_model.path(),
+        model_bytes: 2 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: Some(12 * 1024 * 1024 * 1024),
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("defaults-only model should resolve")
+}
+
+fn assert_explicit_full_surface_resolution(explicit: &ResolvedSkippyConfig) {
+    assert_eq!(explicit.model_fit.ctx_size, 16384);
+    assert_eq!(explicit.model_fit.batch, 1024);
+    assert_eq!(explicit.model_fit.ubatch, 128);
+    assert_eq!(explicit.hardware.device.as_deref(), Some("CUDA1"));
+    assert_eq!(explicit.hardware.stage_layer_start, Some(12));
+    assert_eq!(explicit.hardware.stage_layer_end, Some(24));
+    assert_eq!(explicit.throughput.parallel, 3);
+    assert_eq!(explicit.throughput.threads, Some(10));
+    assert_eq!(explicit.throughput.threads_batch, Some(6));
+    assert_eq!(explicit.request_defaults.temperature, Some(0.7));
+    assert_eq!(explicit.request_defaults.max_tokens, 256);
+}
+
+fn assert_explicit_full_surface_stage_config(explicit: &ResolvedSkippyConfig) {
+    let stage = explicit
+        .to_stage_config(Some(fake_package_identity(32)), LoadMode::RuntimeSlice)
+        .expect("stage config should build");
+    assert_eq!((stage.layer_start, stage.layer_end), (12, 24));
+    assert_eq!(stage.n_batch, Some(1024));
+    assert_eq!(stage.n_ubatch, Some(128));
+    assert_eq!(stage.n_gpu_layers, 99);
+}
+
+fn assert_explicit_full_surface_runtime_options(explicit: &ResolvedSkippyConfig) {
+    let runtime = explicit
+        .to_embedded_runtime_options(
+            &SkippyTelemetryOptions::off(),
+            Some(fake_package_identity(32)),
+            LoadMode::RuntimeSlice,
+        )
+        .expect("embedded runtime options should build");
+    assert_eq!(runtime.n_threads, Some(10));
+    assert_eq!(runtime.n_threads_batch, Some(6));
+    assert_eq!(runtime.config.layer_start, 12);
+    assert_eq!(runtime.config.layer_end, 24);
+}
+
+fn assert_explicit_full_surface_openai_args(explicit: &ResolvedSkippyConfig) {
+    let openai = explicit
+        .to_embedded_openai_args(4096, true)
+        .expect("embedded openai args should build");
+    assert_eq!(openai.prefill_chunk_policy, "schedule");
+    assert_eq!(openai.prefill_chunk_size, 128);
+    assert_eq!(
+        openai.prefill_chunk_schedule.as_deref(),
+        Some("128,256,384")
+    );
+    assert_eq!(openai.speculative_window, 8);
+    assert_eq!(openai.draft_n_gpu_layers, Some(12));
+    assert_eq!(openai.default_max_tokens, 256);
+}
+
+fn assert_defaults_full_surface_resolution(omitted: &ResolvedSkippyConfig) {
+    assert_eq!(omitted.model_fit.ctx_size, 8192);
+    assert_eq!(omitted.model_fit.batch, 512);
+    assert_eq!(omitted.model_fit.ubatch, 128);
+    assert_eq!(omitted.hardware.device.as_deref(), Some("CUDA2"));
+    assert_eq!(omitted.throughput.parallel, 2);
+    assert_eq!(omitted.request_defaults.temperature, Some(0.2));
+    assert_eq!(omitted.request_defaults.max_tokens, 128);
+
+    let single_stage = omitted
+        .to_model_load_options(SkippyTelemetryOptions::off())
+        .expect("defaults-only model should remain single-stage safe");
+    assert_eq!(single_stage.ctx_size, 8192);
+    assert_eq!(single_stage.n_batch, Some(512));
+    assert_eq!(single_stage.n_ubatch, Some(128));
+    assert!(
+        single_stage.package_identity.is_some(),
+        "single-stage load should preserve precomputed package identity"
+    );
+}
+
+#[test]
+fn resolver_applies_precedence_and_keeps_request_defaults_out_of_stage_config() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.model_fit]
+ctx_size = 8192
+batch = 512
+ubatch = 128
+cache_type_v = "q8_0"
+
+[defaults.hardware]
+device = "CUDA0"
+mmap = true
+mlock = false
+
+[defaults.throughput]
+parallel = 2
+
+[defaults.skippy]
+activation_wire_dtype = "q8"
+
+[defaults.request_defaults]
+temperature = 0.2
+max_tokens = 128
+
+[[models]]
+model = "ggml-org/gemma-3-270m-it-GGUF:Q8_0"
+
+[models.model_fit]
+ctx_size = 16384
+batch = 1024
+cache_type_k = "f16"
+
+[models.hardware]
+device = "CUDA1"
+mmap = false
+mlock = true
+
+[models.throughput]
+parallel = 3
+
+[models.skippy]
+activation_wire_dtype = "f32"
+
+[models.request_defaults]
+temperature = 0.4
+"#,
+    );
+    let request_defaults = RequestDefaultsConfig {
+        temperature: Some(0.7),
+        max_tokens: Some(256),
+        reasoning_budget: Some(ReasoningBudget::Integer(512)),
+        ..Default::default()
+    };
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "ggml-org/gemma-3-270m-it-GGUF:Q8_0",
+        model_path: model_file.path(),
+        model_bytes: 8 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: Some(16 * 1024 * 1024 * 1024),
+        request_defaults: Some(&request_defaults),
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.model_fit.ctx_size, 16384);
+    assert_eq!(resolved.model_fit.batch, 1024);
+    assert_eq!(resolved.model_fit.ubatch, 128);
+    assert_eq!(resolved.hardware.device.as_deref(), Some("CUDA1"));
+    assert_eq!(resolved.hardware.mmap, Some(false));
+    assert!(resolved.hardware.mlock);
+    assert_eq!(resolved.throughput.parallel, 3);
+    assert_eq!(resolved.skippy.activation_wire_dtype, StageWireDType::F32);
+    assert_eq!(resolved.request_defaults.max_tokens, 256);
+    assert_eq!(resolved.request_defaults.temperature, Some(0.7));
+    assert_eq!(
+        resolved.request_defaults.reasoning_budget,
+        Some(ReasoningBudget::Integer(512))
+    );
+
+    let stage_config = resolved
+        .to_stage_config(Some(fake_package_identity(28)), LoadMode::RuntimeSlice)
+        .expect("stage config should build");
+    assert_eq!(stage_config.mmap, Some(false));
+    assert!(stage_config.mlock);
+    let serialized: Value = serde_json::to_value(&stage_config).expect("stage config json");
+    let object = serialized.as_object().expect("stage config object");
+    assert!(!object.contains_key("request_defaults"));
+    assert!(!object.contains_key("temperature"));
+    assert_eq!(object.get("ctx_size").and_then(Value::as_u64), Some(16384));
+}
+
+#[test]
+fn resolver_carries_memory_load_controls_into_single_stage_options() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.hardware]
+mmap = false
+mlock = true
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 2 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("config should resolve");
+
+    let load_options = resolved
+        .to_model_load_options(SkippyTelemetryOptions::off())
+        .expect("model load options should build");
+
+    assert_eq!(resolved.hardware.mmap, Some(false));
+    assert!(resolved.hardware.mlock);
+    assert_eq!(load_options.mmap, Some(false));
+    assert!(load_options.mlock);
+}
+
+#[test]
+fn resolver_macro_expands_kv_cache_tuning_profile_and_safety_margin() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.model_fit]
+kv_cache_policy = "saver"
+
+[defaults.hardware]
+safety_margin_gb = 1.5
+
+[defaults.throughput]
+tuning_profile = "throughput"
+"#,
+    );
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: Path::new("/models/qwen.gguf"),
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: Some(12 * 1024 * 1024 * 1024),
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.model_fit.kv_cache_policy, "saver");
+    assert_eq!(resolved.model_fit.cache_type_k, "q8_0");
+    assert_eq!(resolved.model_fit.cache_type_v, "q8_0");
+    assert_eq!(resolved.model_fit.kv_offload, "true");
+    assert_eq!(resolved.throughput.tuning_profile, "throughput");
+    assert_eq!(resolved.model_fit.batch, 1024);
+    assert_eq!(resolved.model_fit.ubatch, 256);
+    assert_eq!(resolved.throughput.parallel, 2);
+    assert_eq!(resolved.throughput.continuous_batching, "true");
+    assert_eq!(resolved.hardware.fit_target_mib, Some(10_752));
+}
+
+#[test]
+fn resolver_treats_auto_cache_type_as_policy_selected_cache_type() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.model_fit]
+kv_cache_policy = "saver"
+cache_type_k = "auto"
+cache_type_v = "auto"
+"#,
+    );
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: Path::new("/models/qwen.gguf"),
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.model_fit.kv_cache_policy, "saver");
+    assert_eq!(resolved.model_fit.cache_type_k, "q8_0");
+    assert_eq!(resolved.model_fit.cache_type_v, "q8_0");
+}
+
+#[test]
+fn resolver_treats_auto_cache_type_case_insensitively() {
+    // Test uppercase "AUTO"
+    let mesh_config_upper = parse_config(
+        r#"
+[defaults.model_fit]
+kv_cache_policy = "saver"
+cache_type_k = "AUTO"
+cache_type_v = "AUTO"
+"#,
+    );
+
+    let resolved_upper = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config_upper,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: Path::new("/models/qwen.gguf"),
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved_upper.model_fit.kv_cache_policy, "saver");
+    assert_eq!(resolved_upper.model_fit.cache_type_k, "q8_0");
+    assert_eq!(resolved_upper.model_fit.cache_type_v, "q8_0");
+
+    // Test mixed-case "Auto"
+    let mesh_config_mixed = parse_config(
+        r#"
+[defaults.model_fit]
+kv_cache_policy = "saver"
+cache_type_k = "Auto"
+cache_type_v = "Auto"
+"#,
+    );
+
+    let resolved_mixed = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config_mixed,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: Path::new("/models/qwen.gguf"),
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved_mixed.model_fit.kv_cache_policy, "saver");
+    assert_eq!(resolved_mixed.model_fit.cache_type_k, "q8_0");
+    assert_eq!(resolved_mixed.model_fit.cache_type_v, "q8_0");
+
+    // Test mixed-case "AuTo"
+    let mesh_config_mixed2 = parse_config(
+        r#"
+[defaults.model_fit]
+kv_cache_policy = "saver"
+cache_type_k = "AuTo"
+cache_type_v = "AuTo"
+"#,
+    );
+
+    let resolved_mixed2 = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config_mixed2,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: Path::new("/models/qwen.gguf"),
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved_mixed2.model_fit.kv_cache_policy, "saver");
+    assert_eq!(resolved_mixed2.model_fit.cache_type_k, "q8_0");
+    assert_eq!(resolved_mixed2.model_fit.cache_type_v, "q8_0");
+}
+
+#[test]
+fn per_model_kv_macro_beats_global_explicit_cache_fields_unless_model_explicit_exists() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.model_fit]
+cache_type_k = "f16"
+cache_type_v = "f16"
+kv_offload = false
+
+[[models]]
+model = "Qwen/Qwen3-0.6B:Q4_K_M"
+
+[models.model_fit]
+kv_cache_policy = "saver"
+cache_type_v = "q4_0"
+"#,
+    );
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: Path::new("/models/qwen.gguf"),
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.model_fit.kv_cache_policy, "saver");
+    assert_eq!(resolved.model_fit.cache_type_k, "q8_0");
+    assert_eq!(resolved.model_fit.cache_type_v, "q4_0");
+    assert_eq!(resolved.model_fit.kv_offload, "true");
+}
+
+#[test]
+fn per_model_throughput_macro_beats_global_explicit_fields_unless_model_explicit_exists() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.model_fit]
+batch = 64
+ubatch = 32
+
+[defaults.throughput]
+parallel = 7
+continuous_batching = false
+
+[[models]]
+model = "Qwen/Qwen3-0.6B:Q4_K_M"
+
+[models.model_fit]
+ubatch = 999
+
+[models.throughput]
+tuning_profile = "throughput"
+parallel = 11
+"#,
+    );
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: Path::new("/models/qwen.gguf"),
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.throughput.tuning_profile, "throughput");
+    assert_eq!(resolved.model_fit.batch, 1024);
+    assert_eq!(resolved.model_fit.ubatch, 999);
+    assert_eq!(resolved.throughput.parallel, 11);
+    assert_eq!(resolved.throughput.continuous_batching, "true");
+}
+
+#[test]
+fn request_overrides_change_request_time_defaults_without_mutating_load_time_stage_config() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.model_fit]
+ctx_size = 4096
+
+[defaults.request_defaults]
+temperature = 0.2
+max_tokens = 128
+"#,
+    );
+    let model_file = temp_model_file();
+    let request_defaults = RequestDefaultsConfig {
+        temperature: Some(0.9),
+        max_tokens: Some(32),
+        ..Default::default()
+    };
+    let without_request =
+        resolve_qwen_config_with_request_defaults(&mesh_config, model_file.path(), None);
+    let with_request = resolve_qwen_config_with_request_defaults(
+        &mesh_config,
+        model_file.path(),
+        Some(&request_defaults),
+    );
+
+    assert_request_override_keeps_load_time_config(&without_request, &with_request);
+    assert_eq!(without_request.request_defaults.temperature, Some(0.2));
+    assert_eq!(with_request.request_defaults.temperature, Some(0.9));
+    assert_eq!(without_request.request_defaults.max_tokens, 128);
+    assert_eq!(with_request.request_defaults.max_tokens, 32);
+    assert_stage_configs_match_for_request_override(&without_request, &with_request);
+    assert_openai_args_use_request_time_defaults(&without_request, &with_request);
+}
+
+#[test]
+fn supported_request_defaults_translate_into_embedded_openai_args() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.request_defaults]
+presence_penalty = 1.0
+frequency_penalty = 0.5
+seed = 7
+logit_bias = { "12" = -4.0 }
+repeat_last_n = 32
+reasoning_format = "deepseek-legacy"
+reasoning_enabled = "on"
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    let openai = resolved
+        .to_embedded_openai_args(4096, true)
+        .expect("embedded OpenAI args should build");
+    assert_eq!(openai.request_defaults.presence_penalty, Some(1.0));
+    assert_eq!(openai.request_defaults.frequency_penalty, Some(0.5));
+    assert_eq!(openai.request_defaults.seed, Some(7));
+    assert_eq!(openai.request_defaults.repeat_last_n, Some(32));
+    assert_eq!(
+        openai.request_defaults.reasoning_format,
+        Some(EmbeddedReasoningFormat::DeepseekLegacy)
+    );
+    assert_eq!(
+        openai.request_defaults.reasoning_enabled,
+        Some(EmbeddedReasoningEnabled::Enabled)
+    );
+    assert_eq!(
+        openai
+            .request_defaults
+            .logit_bias
+            .as_ref()
+            .and_then(|value| value.get("12"))
+            .and_then(serde_json::Value::as_f64),
+        Some(-4.0)
+    );
+
+    let stage_config = resolved
+        .to_stage_config(Some(fake_package_identity(28)), LoadMode::RuntimeSlice)
+        .expect("stage config should build");
+    let serialized = serde_json::to_value(&stage_config).expect("stage config json");
+    let object = serialized.as_object().expect("stage config object");
+    assert!(!object.contains_key("presence_penalty"));
+    assert!(!object.contains_key("repeat_last_n"));
+    assert!(!object.contains_key("logit_bias"));
+}
+
+#[test]
+fn unsupported_request_defaults_fail_closed_during_resolution() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.request_defaults]
+chat_template = "unsafe-template"
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let err = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("defaults.request_defaults.chat_template"));
+}
+
+#[test]
+fn family_policy_beats_builtin_wire_dtype_when_config_is_unset() {
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &MeshConfig::default(),
+        model_id: "ggml-org/gemma-3-270m-it-GGUF:Q8_0",
+        model_path: Path::new("/models/gemma.gguf"),
+        model_bytes: 2 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.skippy.activation_wire_dtype, StageWireDType::F32);
+}
+
+#[test]
+fn inkling_family_defaults_to_f32_wire_and_q4_kv() {
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &MeshConfig::default(),
+        model_id: "meshllm/inkling-UD-Q2_K_XL-layers",
+        model_path: Path::new("/models/inkling.gguf"),
+        model_bytes: 316 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.skippy.activation_wire_dtype, StageWireDType::F32);
+    assert_eq!(resolved.model_fit.cache_type_k, "q4_0");
+    assert_eq!(resolved.model_fit.cache_type_v, "q4_0");
+}
+
+#[test]
+fn inkling_family_kv_default_beats_generic_saver_macro() {
+    let mesh_config = parse_config(
+        r#"
+[[models]]
+model = "meshllm/inkling-UD-Q2_K_XL-layers"
+
+[models.model_fit]
+kv_cache_policy = "saver"
+"#,
+    );
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "meshllm/inkling-UD-Q2_K_XL-layers",
+        model_path: Path::new("/models/inkling.gguf"),
+        model_bytes: 316 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.model_fit.cache_type_k, "q4_0");
+    assert_eq!(resolved.model_fit.cache_type_v, "q4_0");
+}
+
+#[test]
+fn explicit_inkling_kv_override_beats_family_default() {
+    let mesh_config = parse_config(
+        r#"
+[[models]]
+model = "meshllm/inkling-UD-Q2_K_XL-layers"
+cache_type_k = "q8_0"
+cache_type_v = "q8_0"
+"#,
+    );
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "meshllm/inkling-UD-Q2_K_XL-layers",
+        model_path: Path::new("/models/inkling.gguf"),
+        model_bytes: 316 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.model_fit.cache_type_k, "q8_0");
+    assert_eq!(resolved.model_fit.cache_type_v, "q8_0");
+}
+
+#[test]
+fn explicit_global_inkling_kv_override_beats_family_default() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.model_fit]
+cache_type_k = "q8_0"
+cache_type_v = "q8_0"
+
+[[models]]
+model = "meshllm/inkling-UD-Q2_K_XL-layers"
+"#,
+    );
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "meshllm/inkling-UD-Q2_K_XL-layers",
+        model_path: Path::new("/models/inkling.gguf"),
+        model_bytes: 316 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.model_fit.cache_type_k, "q8_0");
+    assert_eq!(resolved.model_fit.cache_type_v, "q8_0");
+}
+
+#[test]
+fn family_policy_wires_prefix_cache_by_default_for_supported_models() {
+    let model_file = temp_model_file();
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &MeshConfig::default(),
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("config should resolve");
+
+    let stage_config = resolved
+        .to_stage_config(Some(fake_package_identity(24)), LoadMode::RuntimeSlice)
+        .expect("stage config should build");
+    let kv_cache = stage_config
+        .kv_cache
+        .expect("supported family should enable prefix cache by default");
+
+    assert_eq!(kv_cache.mode, StageKvCacheMode::LookupRecord);
+    assert_eq!(kv_cache.payload, StageKvCachePayload::ResidentKv);
+    assert!(kv_cache.max_entries > 0);
+    assert!(kv_cache.max_bytes > 0);
+}
+
+#[test]
+fn explicit_prefix_cache_disable_overrides_supported_family_default() {
+    let model_file = temp_model_file();
+    let config = parse_config(
+        r#"
+[defaults.model_fit.prefix_cache]
+enabled = false
+"#,
+    );
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("config should resolve");
+
+    let stage_config = resolved
+        .to_stage_config(Some(fake_package_identity(24)), LoadMode::RuntimeSlice)
+        .expect("stage config should build");
+    let kv_cache = stage_config
+        .kv_cache
+        .expect("explicit disable must survive family-default materialization");
+
+    assert_eq!(kv_cache.mode, StageKvCacheMode::Disabled);
+}
+
+#[test]
+fn staged_controls_propagate_into_stage_config_and_embedded_openai_args() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.model_fit]
+prompt_cache = true
+
+[defaults.model_fit.prefix_cache]
+enabled = true
+max_entries = 9
+min_tokens = 96
+shared_stride_tokens = 48
+shared_record_limit = 3
+payload_mode = "resident-kv"
+
+[defaults.skippy]
+activation_wire_dtype = "q8"
+prefill_chunking = "schedule"
+prefill_chunk_size = 128
+prefill_chunk_schedule = "128,256,384"
+
+[defaults.speculative]
+mode = "draft"
+draft_model_path = "/models/qwen3-draft.gguf"
+draft_selection_policy = "manual"
+pairing_fault = "fail-open"
+draft_max_tokens = 8
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("config should resolve");
+
+    let stage_config = resolved
+        .to_stage_config(Some(fake_package_identity(24)), LoadMode::RuntimeSlice)
+        .expect("stage config should build");
+    let kv_cache = stage_config
+        .kv_cache
+        .expect("kv cache should be configured");
+    assert_eq!(kv_cache.max_entries, 9);
+    assert_eq!(kv_cache.min_tokens, 96);
+    assert_eq!(kv_cache.shared_prefix_stride_tokens, 48);
+    assert_eq!(kv_cache.shared_prefix_record_limit, 3);
+    assert_eq!(kv_cache.payload, StageKvCachePayload::ResidentKv);
+
+    let openai = resolved
+        .to_embedded_openai_args(4096, true)
+        .expect("embedded args should build");
+    assert_eq!(openai.prefill_chunk_policy, "schedule");
+    assert_eq!(openai.prefill_chunk_size, 128);
+    assert_eq!(
+        openai.prefill_chunk_schedule.as_deref(),
+        Some("128,256,384")
+    );
+    assert_eq!(openai.speculative_window, 8);
+    assert_eq!(
+        openai.draft_model_path.as_deref(),
+        Some(Path::new("/models/qwen3-draft.gguf"))
+    );
+    assert_eq!(
+        openai.wire_dtype,
+        skippy_protocol::binary::WireActivationDType::Q8
+    );
+}
+
+#[test]
+fn layer_package_translation_does_not_treat_hf_ref_as_direct_gguf() {
+    let config = MeshConfig::default();
+    let package_ref = "hf://meshllm/Qwen3-8B-Q4_K_M-layers";
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &config,
+        model_id: "meshllm/Qwen3-8B-Q4_K_M-layers",
+        model_path: Path::new(package_ref),
+        model_bytes: 5 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    let options = resolved
+        .to_embedded_runtime_options(
+            &SkippyTelemetryOptions::off(),
+            Some(fake_hf_package_identity(36)),
+            LoadMode::LayerPackage,
+        )
+        .unwrap();
+
+    assert_eq!(options.config.load_mode, LoadMode::LayerPackage);
+    assert_eq!(options.config.model_path.as_deref(), Some(package_ref));
+    let kv_cache = options
+        .config
+        .kv_cache
+        .expect("packaged supported family should retain its cache policy");
+    assert_eq!(kv_cache.mode, StageKvCacheMode::LookupRecord);
+    assert_eq!(kv_cache.payload, StageKvCachePayload::ResidentKv);
+    assert_eq!(kv_cache.max_bytes, 0);
+}
+
+#[test]
+fn inkling_layer_package_retains_recurrent_cache_policy_before_materialization() {
+    let config = MeshConfig::default();
+    let package_ref = "hf://meshllm/inkling-UD-Q2_K_XL-layers";
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &config,
+        model_id: "meshllm/inkling-UD-Q2_K_XL-layers",
+        model_path: Path::new(package_ref),
+        model_bytes: 316 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("Inkling package config should resolve");
+
+    let stage = resolved
+        .to_stage_config(Some(fake_hf_package_identity(66)), LoadMode::LayerPackage)
+        .expect("Inkling package stage config should build");
+    let kv_cache = stage
+        .kv_cache
+        .expect("Inkling package should retain its recurrent cache policy");
+
+    assert_eq!(kv_cache.mode, StageKvCacheMode::LookupRecord);
+    assert_eq!(kv_cache.payload, StageKvCachePayload::KvRecurrent);
+    assert!(kv_cache.max_entries > 0);
+    assert!(kv_cache.max_entries <= 16);
+    assert_eq!(kv_cache.max_bytes, 0);
+    assert_eq!(kv_cache.min_tokens, 256);
+}
+
+#[test]
+fn speculative_auto_selection_policy_without_draft_source_resolves_disabled() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+mode = "auto"
+draft_selection_policy = "auto"
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("auto draft selection policy should not force draft resolution");
+
+    assert_eq!(resolved.speculative.mode, "disabled");
+    assert!(resolved.speculative.draft_model_path.is_none());
+    assert!(!resolved.speculative.explicit);
+}
+
+#[test]
+fn speculative_draft_translates_for_direct_embedded_openai() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+mode = "draft"
+draft_model_path = "/models/qwen3-draft.gguf"
+draft_selection_policy = "manual"
+pairing_fault = "fail_open"
+draft_max_tokens = 8
+draft_min_tokens = 2
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("draft speculative config should resolve");
+
+    resolved
+        .to_model_load_options(SkippyTelemetryOptions::off())
+        .expect("direct model load options should allow draft speculation");
+    let openai = resolved
+        .to_embedded_openai_args(0, false)
+        .expect("direct embedded OpenAI args should allow draft");
+    assert_eq!(openai.speculative_window, 8);
+    assert_eq!(
+        openai.draft_model_path.as_deref(),
+        Some(Path::new("/models/qwen3-draft.gguf"))
+    );
+    assert_eq!(openai.draft_n_gpu_layers, None);
+}
+
+#[test]
+fn benchmark_shaped_model_entry_draft_translates_for_direct_embedded_openai() {
+    let mesh_config = parse_config(
+        r#"
+[[models]]
+model = "Qwen/Qwen3-0.6B:Q4_K_M"
+
+[models.hardware]
+model_path = "/models/qwen3.gguf"
+
+[models.speculative]
+strategy = "disabled"
+mode = "draft"
+draft_model_path = "/models/qwen3-draft.gguf"
+draft_selection_policy = "manual"
+pairing_fault = "fail_closed"
+draft_max_tokens = 4
+draft_min_tokens = 0
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("benchmark-shaped draft speculative config should resolve");
+
+    assert_eq!(resolved.speculative.mode, "draft");
+    assert_eq!(resolved.speculative.pairing_fault, "fail_closed");
+    let openai = resolved
+        .to_embedded_openai_args(0, false)
+        .expect("direct embedded OpenAI args should allow benchmark draft");
+    assert_eq!(openai.speculative_window, 4);
+    assert_eq!(
+        openai.draft_model_path.as_deref(),
+        Some(Path::new("/models/qwen3-draft.gguf"))
+    );
+}
+
+#[test]
+fn benchmark_shaped_hf_identity_row_matches_by_pinned_model_path_after_canonicalization() {
+    let model_file = temp_model_file();
+    let toml = format!(
+        r#"
+[[models]]
+model = "Qwen/Qwen3-GGUF@sha/qwen3-q4_k_m.gguf"
+
+[models.hardware]
+model_path = "{}"
+
+[models.speculative]
+strategy = "disabled"
+mode = "draft"
+draft_model_path = "/models/qwen3-draft.gguf"
+draft_selection_policy = "manual"
+pairing_fault = "fail_closed"
+draft_max_tokens = 4
+"#,
+        model_file.path().display()
+    );
+    let mesh_config = parse_config(&toml);
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-GGUF:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("benchmark HF identity row should match by pinned model_path");
+
+    let openai = resolved
+        .to_embedded_openai_args(0, false)
+        .expect("direct embedded OpenAI args should include draft");
+    assert_eq!(openai.speculative_window, 4);
+    assert_eq!(
+        openai.draft_model_path.as_deref(),
+        Some(Path::new("/models/qwen3-draft.gguf"))
+    );
+}
+
+#[test]
+fn staged_only_controls_fail_closed_for_single_stage_loads() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.skippy]
+prefill_chunk_size = 128
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("config should resolve");
+
+    let err = resolved
+        .to_model_load_options(SkippyTelemetryOptions::off())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("prefill chunk controls require staged serving"));
+}
+
+#[test]
+fn incompatible_draft_pairing_warn_disable_turns_speculation_off() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+mode = "draft"
+draft_model_path = "/models/llama-draft.gguf"
+draft_selection_policy = "manual"
+pairing_fault = "warn_disable"
+draft_max_tokens = 8
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("warn_disable should resolve");
+
+    assert_eq!(resolved.speculative.mode, "disabled");
+    assert!(resolved.speculative.draft_model_path.is_none());
+}
+
+#[test]
+fn incompatible_draft_pairing_fail_closed_rejects_before_launch() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+mode = "draft"
+draft_model_path = "/models/llama-draft.gguf"
+draft_selection_policy = "manual"
+pairing_fault = "fail_closed"
+draft_max_tokens = 8
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let err = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("incompatible speculative draft pairing"));
+}
+
+#[test]
+fn manual_stage_layer_range_is_staged_only_and_reaches_stage_config() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.hardware]
+stage_layer_start = 12
+stage_layer_end = 24
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("config should resolve");
+
+    let err = resolved
+        .to_model_load_options(SkippyTelemetryOptions::off())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("staged-only controls"));
+
+    let stage_config = resolved
+        .to_stage_config(Some(fake_package_identity(32)), LoadMode::RuntimeSlice)
+        .expect("stage config should preserve explicit layer range");
+    assert_eq!((stage_config.layer_start, stage_config.layer_end), (12, 24));
+}
+
+#[test]
+fn benchmark_speculative_thresholds_are_now_accepted() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+draft_acceptance_threshold = 0.5
+draft_split_probability = 0.3
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("draft_acceptance_threshold and draft_split_probability should be accepted");
+
+    // They are schema-level only for now; the resolver accepts and stores them
+    // on the resolved config, which the benchmark tune path writes into trial configs.
+    assert_eq!(resolved.speculative.mode, "disabled");
+}
+
+#[test]
+fn schema_only_speculative_fields_fail_with_field_specific_runtime_diagnostics() {
+    let cases = [
+        (
+            r#"
+[defaults.speculative]
+draft_hf_repo = "mesh/test-draft"
+draft_hf_file = "draft.gguf"
+"#,
+            "speculative.draft_hf_repo",
+        ),
+        (
+            r#"
+[defaults.speculative]
+draft_device = "CUDA0"
+"#,
+            "speculative.draft_device",
+        ),
+        (
+            r#"
+[defaults.speculative]
+draft_threads = 2
+"#,
+            "speculative.draft_threads",
+        ),
+        (
+            r#"
+[defaults.speculative]
+draft_cache_type_k = "q8_0"
+"#,
+            "speculative.draft_cache_type_k",
+        ),
+        (
+            r#"
+[defaults.speculative]
+draft_cache_type_v = "q8_0"
+"#,
+            "speculative.draft_cache_type_v",
+        ),
+        (
+            r#"
+[defaults.speculative]
+spec_default = true
+"#,
+            "speculative.spec_default",
+        ),
+    ];
+
+    for (toml, field) in cases {
+        let mesh_config = parse_config(toml);
+        let model_file = temp_model_file();
+
+        let err = resolve_skippy_config(SkippyConfigResolveRequest {
+            mesh_config: &mesh_config,
+            model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+            model_path: model_file.path(),
+            model_bytes: 4 * 1024 * 1024 * 1024,
+            allocatable_memory_bytes: None,
+            request_defaults: None,
+            package_generation: None,
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains(field) && err.contains("not supported by the embedded runtime"),
+            "{field} diagnostic should be explicit, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn integrated_full_surface_fixture_resolves_defaults_overrides_staged_and_runtime_paths() {
+    let fixture = full_surface_fixture_with_model_paths();
+    let request_defaults = RequestDefaultsConfig {
+        temperature: Some(0.7),
+        max_tokens: Some(256),
+        ..Default::default()
+    };
+
+    let explicit = resolve_explicit_full_surface_config(&fixture, &request_defaults);
+    assert_explicit_full_surface_resolution(&explicit);
+    assert_explicit_full_surface_stage_config(&explicit);
+    assert_explicit_full_surface_runtime_options(&explicit);
+    assert_explicit_full_surface_openai_args(&explicit);
+
+    let omitted = resolve_defaults_full_surface_config(&fixture);
+    assert_defaults_full_surface_resolution(&omitted);
+}
+
+#[test]
+fn resolver_rejects_gpu_layers_i32_overflow() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.hardware]
+gpu_layers = 2147483648
+
+[[models]]
+model = "Qwen/Qwen3-0.6B:Q4_K_M"
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let error = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 2 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("hardware.gpu_layers must fit in a 32-bit signed integer"));
+}
+
+#[test]
+fn resolver_rejects_unsupported_hardware_controls_that_cannot_reach_launch() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.hardware]
+placement = "auto"
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let error = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 2 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("defaults.hardware.placement"));
+}
+
+#[test]
+fn integrated_invalid_fixture_fails_closed_for_request_defaults_and_single_stage_staged_knobs() {
+    let repaired_batch = FULL_SURFACE_INVALID_FIXTURE.replace("batch = 0", "batch = 64");
+    let repaired_device = format!(
+        "{repaired_batch}\ndevice = \"CUDA0\"\n",
+        repaired_batch = repaired_batch.trim_end()
+    );
+
+    let unsupported_request = parse_config(&repaired_device);
+    let model_file = temp_model_file();
+    let unsupported_error = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &unsupported_request,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 2 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(unsupported_error.contains("defaults.request_defaults.chat_template"));
+
+    let staged_only_config = parse_config(&repaired_device.replace(
+        "\n[defaults.request_defaults]\nchat_template = \"unsafe-template\"\n",
+        "\n",
+    ));
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &staged_only_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 2 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("staged-only config should resolve before translation gating");
+    let staged_only_error = resolved
+        .to_model_load_options(SkippyTelemetryOptions::off())
+        .unwrap_err()
+        .to_string();
+    assert!(staged_only_error.contains("prefill chunk controls require staged serving"));
+}

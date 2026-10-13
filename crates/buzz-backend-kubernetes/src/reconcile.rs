@@ -1057,7 +1057,7 @@ mod tests {
         let id = identity();
         let cfg = config();
         let mut dying = our_pod(&id, &cfg, Some(running()));
-        dying.metadata.deletion_timestamp = Some(Time(Utc::now()));
+        dying.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::now()));
         let fake = Fake::default().with_pod(dying);
         fake.on_poll.borrow_mut().push({
             let name = id.pod_name();
