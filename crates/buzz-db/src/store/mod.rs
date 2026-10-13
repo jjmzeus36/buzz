@@ -29,6 +29,8 @@ pub mod feed;
 pub mod git_repo;
 /// Keyed kind:9 event reservation and insert (NIP-MI).
 pub mod idempotency;
+/// Durable recovery of canonical channel metadata publication.
+pub mod metadata_refresh;
 /// Community moderation: reports, bans/timeouts, audit actions.
 pub mod moderation;
 /// Monthly table partition management.

@@ -721,7 +721,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 46);
+        assert_eq!(migrations.len(), 47);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -2020,6 +2020,11 @@ mod postgres_tests {
         expected_fences.remove("product_feedback");
         expected_fences.remove("rate_limit_violations");
         expected_fences.insert("event_idempotency_keys".to_owned());
+        let metadata_refresh_migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 48)
+            .expect("embedded metadata recovery migration");
+        expected_fences.extend(surface(metadata_refresh_migration.sql.as_ref()).fence_attachments);
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"
@@ -2687,10 +2692,9 @@ mod postgres_tests {
         let migrated = PgPool::connect(&format!("{base_prefix}/{migrated_db}"))
             .await
             .expect("connect migrated probe database");
-        MIGRATOR
-            .run_to(45, &migrated)
+        run_migrations(&migrated)
             .await
-            .expect("apply migrations 1-45");
+            .expect("apply all current migrations");
 
         let extras_result = async {
             sqlx::query(
@@ -3116,6 +3120,37 @@ mod postgres_tests {
             errors.extend(drop_probe_databases(&admin, &desired_db, &migrated_db).await);
             panic!("{}", errors.join("; "));
         }
+
+        const METADATA_QUEUE: &str = "channel_metadata_refresh";
+        assert_eq!(
+            columns(&desired, METADATA_QUEUE).await,
+            columns(&migrated, METADATA_QUEUE).await
+        );
+        assert_eq!(
+            index_shapes(&desired, METADATA_QUEUE).await,
+            index_shapes(&migrated, METADATA_QUEUE).await
+        );
+        assert_eq!(
+            constraints(&desired, METADATA_QUEUE).await,
+            constraints(&migrated, METADATA_QUEUE).await
+        );
+        for table in [METADATA_QUEUE, "channels", "channel_members"] {
+            assert_eq!(
+                triggers(&desired, table).await,
+                triggers(&migrated, table).await,
+                "metadata source/fence triggers differ for {table}"
+            );
+        }
+        async fn metadata_functions(pool: &PgPool) -> Vec<(String, String)> {
+            sqlx::query_as("SELECT proname::text, pg_get_functiondef(oid) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('request_channel_metadata_refresh', 'refresh_channel_ttl_after_event_insert') ORDER BY proname")
+                .fetch_all(pool).await.expect("metadata recovery function bodies")
+        }
+        let migrated_metadata_functions = metadata_functions(&migrated).await;
+        assert_eq!(migrated_metadata_functions.len(), 2);
+        assert_eq!(
+            metadata_functions(&desired).await,
+            migrated_metadata_functions
+        );
 
         const IDEMPOTENCY_TABLE: &str = "event_idempotency_keys";
         const REAPER_CURSOR_TABLE: &str = "event_idempotency_reaper_cursor";

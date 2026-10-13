@@ -15,6 +15,8 @@ mod postgres_tests;
 #[cfg(test)]
 mod race_postgres_tests;
 #[cfg(test)]
+mod recovery_postgres_tests;
+#[cfg(test)]
 mod restriction_race_postgres_tests;
 
 impl RelayActionSink {
