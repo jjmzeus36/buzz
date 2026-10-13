@@ -371,6 +371,9 @@ test-unit:
         cargo test -p buzz-auth --doc
         cargo nextest run -p buzz-voice --lib
         cargo nextest run -p buzz-media --test stream_errors --no-tests=fail
+        # Media validators and quota production uploads use a loopback fixture;
+        # live S3 tests remain ignored and run in their dedicated lane.
+        cargo nextest run -p buzz-media --lib --tests
         cargo nextest run -p buzz-cli
         # buzz-acp owns the relay-to-agent trust boundary. Run its tests here so
         # forged relay events cannot regain a path into agent routing unnoticed.
@@ -493,6 +496,7 @@ test-unit:
         cargo nextest run -p buzz-acp --lib
     else
         ./scripts/run-tests.sh unit
+        cargo test -p buzz-media --lib --tests
     fi
 
 # Run integration tests only (starts services if needed)

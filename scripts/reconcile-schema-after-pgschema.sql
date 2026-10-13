@@ -260,6 +260,8 @@ BEGIN
 END $$;
 
 SELECT attach_community_write_fence('event_idempotency_keys'::regclass);
+SELECT attach_community_write_fence('media_quota_accounts'::regclass);
+SELECT attach_community_write_fence('media_quota_objects'::regclass);
 
 INSERT INTO event_idempotency_reaper_cursor (id, after_community_id)
 VALUES (1, NULL)
