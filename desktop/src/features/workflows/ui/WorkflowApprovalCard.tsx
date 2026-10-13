@@ -5,9 +5,7 @@ type WorkflowApprovalCardProps = {
 };
 
 export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
-  const isExpired = new Date(approval.expiresAt) < new Date();
-
-  if (approval.status !== "pending" || isExpired) {
+  if (approval.status !== "pending") {
     return null;
   }
 

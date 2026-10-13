@@ -5,7 +5,7 @@ use crate::client::{
     BuzzClient,
 };
 use crate::error::CliError;
-use crate::validate::{parse_uuid, read_or_stdin, sdk_err, validate_uuid};
+use crate::validate::{parse_uuid, read_or_stdin, sdk_err, validate_hex64, validate_uuid};
 
 // TODO(phase-4): Replace raw nostr::EventBuilder usage with buzz-sdk builder functions
 
@@ -203,20 +203,30 @@ pub async fn cmd_trigger_workflow(
 }
 
 /// Approve or deny a workflow step — sign and submit a kind:46030 (grant) or 46031 (deny) event.
+/// Accept the reference returned by approval reads, or a legacy raw UUID token.
 pub async fn cmd_approve_step(
     client: &BuzzClient,
-    approval_token: &str,
+    approval_ref_or_token: &str,
     approved: bool,
     note: Option<&str>,
 ) -> Result<(), CliError> {
-    validate_uuid(approval_token)?;
-
     let content = note.unwrap_or("");
-
-    // The relay expects d-tag = hex(SHA256(token)), not the raw token UUID.
-    let token_hash = hex::encode(Sha256::digest(approval_token.as_bytes()));
+    // Read APIs already return hex(SHA256(token)); only legacy raw UUIDs need
+    // hashing. References are canonical lowercase, as stored by the relay.
+    let approval_ref = if approval_ref_or_token.len() == 64 {
+        validate_hex64(approval_ref_or_token)?;
+        approval_ref_or_token.to_ascii_lowercase()
+    } else {
+        validate_uuid(approval_ref_or_token).map_err(|_| {
+            CliError::Usage(
+                "approval reference must be 64 hexadecimal characters or a legacy UUID token"
+                    .into(),
+            )
+        })?;
+        hex::encode(Sha256::digest(approval_ref_or_token.as_bytes()))
+    };
     let builder =
-        buzz_sdk::build_workflow_approval(&token_hash, approved, content).map_err(sdk_err)?;
+        buzz_sdk::build_workflow_approval(&approval_ref, approved, content).map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
@@ -245,12 +255,109 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
             cmd_get_workflow_runs(client, &workflow, limit).await
         }
         WorkflowsCmd::Approve {
-            token,
+            approval_ref,
             approved,
             note,
         } => {
             // approved is already a bool — no parse_bool_flag needed
-            cmd_approve_step(client, &token, approved, note.as_deref()).await
+            cmd_approve_step(client, &approval_ref, approved, note.as_deref()).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{routing::post, Json, Router};
+    use nostr::{Event, Keys};
+    use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn approval_cli_submits_read_references_and_legacy_tokens() {
+        let captured = Arc::new(Mutex::new(Vec::<Event>::new()));
+        let events = captured.clone();
+        let app = Router::new().route(
+            "/events",
+            post(move |Json(event): Json<Event>| {
+                let events = events.clone();
+                async move {
+                    event.verify().unwrap();
+                    let id = event.id.to_hex();
+                    events.lock().unwrap().push(event);
+                    Json(serde_json::json!({"event_id": id, "accepted": true, "message": ""}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let private_key = Keys::generate().secret_key().to_secret_hex();
+        let reference = "ab".repeat(32);
+        let token = "00000000-0000-4000-8000-000000000001";
+        let legacy_reference = hex::encode(Sha256::digest(token.as_bytes()));
+
+        for (flag, input, approved, expected) in [
+            ("--approval-ref", reference.clone(), true, reference.clone()),
+            (
+                "--approval-ref",
+                reference.to_uppercase(),
+                false,
+                reference.clone(),
+            ),
+            ("--token", reference.clone(), false, reference.clone()),
+            ("--token", token.to_owned(), true, legacy_reference),
+        ] {
+            let approved = approved.to_string();
+            assert_eq!(
+                crate::run_from_args([
+                    "buzz",
+                    "--relay",
+                    &relay,
+                    "--private-key",
+                    &private_key,
+                    "workflows",
+                    "approve",
+                    flag,
+                    &input,
+                    "--approved",
+                    &approved,
+                    "--note",
+                    "reviewed",
+                ])
+                .await,
+                0,
+                "input: {input}",
+            );
+            let event = captured.lock().unwrap().last().unwrap().clone();
+            assert_eq!(
+                event.kind.as_u16(),
+                if approved == "true" { 46030 } else { 46031 }
+            );
+            assert_eq!(event.content, "reviewed");
+            assert!(event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["d", &expected]));
+        }
+        for input in ["admin".to_owned(), "ab".repeat(31), "gg".repeat(32)] {
+            assert_eq!(
+                crate::run_from_args([
+                    "buzz",
+                    "--relay",
+                    &relay,
+                    "--private-key",
+                    &private_key,
+                    "workflows",
+                    "approve",
+                    "--approval-ref",
+                    &input,
+                ])
+                .await,
+                1,
+            );
+        }
+        assert_eq!(captured.lock().unwrap().len(), 4);
+        server.abort();
     }
 }

@@ -1,4 +1,4 @@
-//! Live destructive versioned-bucket deletion coverage against docker-compose MinIO.
+//! Live destructive versioned-bucket deletion coverage against a local S3 fixture.
 //!
 //! This exercises the S3-compatible path that community deletion relies on when
 //! a bucket has versioning enabled: list object versions/delete markers with
@@ -12,9 +12,9 @@
 //! cargo test -p buzz-media --test versioned_minio -- --ignored --nocapture
 //! ```
 //!
-//! The test creates and removes its own bucket. The MinIO container name is
-//! overridable with `BUZZ_MINIO_CONTAINER`; credentials/endpoint/region/addressing
-//! use the same `BUZZ_S3_*` env vars as `static_creds_minio`.
+//! The test creates and removes its own bucket using the AWS CLI (`aws` on PATH).
+//! Credentials/endpoint/region/addressing use the same `BUZZ_S3_*` env vars as
+//! `static_creds_minio`. No vendor-specific client or container name is required.
 
 use std::process::Command;
 
@@ -46,37 +46,42 @@ fn minio_config(bucket: String) -> MediaConfig {
     }
 }
 
-fn run_mc(args: &[String]) -> Result<(), String> {
-    let container = env_or("BUZZ_MINIO_CONTAINER", "buzz-minio");
-    let output = Command::new("docker")
-        .arg("exec")
-        .arg(container)
-        .arg("mc")
+// Use the public S3 administration API instead of executing MinIO's bundled
+// client inside a particular container. This also exercises maintained S3
+// fixtures such as RustFS. Only synthetic test buckets are created here.
+fn run_s3_admin(config: &MediaConfig, args: &[&str]) -> Result<(), String> {
+    let output = Command::new("aws")
+        .args([
+            "--endpoint-url",
+            &config.s3_endpoint,
+            "--region",
+            &config.s3_region,
+        ])
+        .args([
+            "--no-cli-pager",
+            "--cli-connect-timeout",
+            "10",
+            "--cli-read-timeout",
+            "30",
+            "s3api",
+        ])
         .args(args)
+        .env("AWS_ACCESS_KEY_ID", &config.s3_access_key)
+        .env("AWS_SECRET_ACCESS_KEY", &config.s3_secret_key)
+        .env_remove("AWS_SESSION_TOKEN")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
         .output()
-        .map_err(|err| format!("failed to execute docker/mc: {err}"))?;
+        .map_err(|err| format!("failed to execute AWS CLI: {err}"))?;
     if output.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "mc {:?} failed with status {}\nstdout:\n{}\nstderr:\n{}",
-            args,
+            "S3 administration failed with status {}\nstdout:\n{}\nstderr:\n{}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ))
     }
-}
-
-fn mc_alias(access_key: &str, secret_key: &str) -> Result<(), String> {
-    run_mc(&[
-        "alias".to_string(),
-        "set".to_string(),
-        "local".to_string(),
-        "http://localhost:9000".to_string(),
-        access_key.to_string(),
-        secret_key.to_string(),
-    ])
 }
 
 async fn list_all_versions(
@@ -128,18 +133,12 @@ fn refs_from(entries: &[buzz_media::storage::ObjectVersionEntry]) -> Vec<ObjectV
 }
 
 #[tokio::test]
-#[ignore = "requires live docker-compose MinIO; permanently deletes exact test object versions"]
+#[ignore = "requires local S3 fixture and AWS CLI; permanently deletes exact test object versions"]
 async fn never_versioned_bucket_lists_null_versions_and_exact_delete_empties_listing() {
     let bucket = format!("buzz-media-never-versioned-{}", std::process::id());
-    let bucket_path = format!("local/{bucket}");
     let config = minio_config(bucket.clone());
-    mc_alias(&config.s3_access_key, &config.s3_secret_key).expect("configure mc alias");
-    run_mc(&[
-        "mb".to_string(),
-        "--ignore-existing".to_string(),
-        bucket_path.clone(),
-    ])
-    .expect("create isolated never-versioned test bucket");
+    run_s3_admin(&config, &["create-bucket", "--bucket", &bucket])
+        .expect("create isolated never-versioned test bucket");
 
     let storage = MediaStorage::new(&config).expect("static MinIO storage client");
     let prefix = format!("_test/never-versioned-{}/", uuid::Uuid::new_v4());
@@ -177,28 +176,27 @@ async fn never_versioned_bucket_lists_null_versions_and_exact_delete_empties_lis
         "final ListObjectVersions must be empty after deleting the exact null version"
     );
 
-    run_mc(&["rb".to_string(), "--force".to_string(), bucket_path.clone()])
+    run_s3_admin(&config, &["delete-bucket", "--bucket", &bucket])
         .expect("remove isolated never-versioned test bucket");
 }
 
 #[tokio::test]
-#[ignore = "requires live docker-compose MinIO; permanently deletes exact test object versions"]
+#[ignore = "requires local S3 fixture and AWS CLI; permanently deletes exact test object versions"]
 async fn versioned_bucket_exact_version_delete_reaches_final_list_versions_emptiness() {
     let bucket = format!("buzz-media-versioned-{}", std::process::id());
-    let bucket_path = format!("local/{bucket}");
     let config = minio_config(bucket.clone());
-    mc_alias(&config.s3_access_key, &config.s3_secret_key).expect("configure mc alias");
-    run_mc(&[
-        "mb".to_string(),
-        "--ignore-existing".to_string(),
-        bucket_path.clone(),
-    ])
-    .expect("create isolated versioned test bucket");
-    run_mc(&[
-        "version".to_string(),
-        "enable".to_string(),
-        bucket_path.clone(),
-    ])
+    run_s3_admin(&config, &["create-bucket", "--bucket", &bucket])
+        .expect("create isolated versioned test bucket");
+    run_s3_admin(
+        &config,
+        &[
+            "put-bucket-versioning",
+            "--bucket",
+            &bucket,
+            "--versioning-configuration",
+            "Status=Enabled",
+        ],
+    )
     .expect("enable bucket versioning");
 
     let storage = MediaStorage::new(&config).expect("static MinIO storage client");
@@ -321,11 +319,16 @@ async fn versioned_bucket_exact_version_delete_reaches_final_list_versions_empti
         "final ListObjectVersions must be empty after exact-version deletion: {remaining:?}"
     );
 
-    if run_mc(&[
-        "version".to_string(),
-        "suspend".to_string(),
-        bucket_path.clone(),
-    ])
+    if run_s3_admin(
+        &config,
+        &[
+            "put-bucket-versioning",
+            "--bucket",
+            &bucket,
+            "--versioning-configuration",
+            "Status=Suspended",
+        ],
+    )
     .is_ok()
     {
         let suspended_key = format!("{prefix}suspended.bin");
@@ -353,11 +356,15 @@ async fn versioned_bucket_exact_version_delete_reaches_final_list_versions_empti
             suspended_delete.versioned_keys.is_empty(),
             "{suspended_delete:?}"
         );
-        assert!(list_all_versions(&storage, &prefix, 2).await.is_empty());
+        let suspended_remaining = list_all_versions(&storage, &prefix, 2).await;
+        assert!(
+            suspended_remaining.is_empty(),
+            "suspended entries {suspended_entries:?}; delete {suspended_delete:?}; remaining {suspended_remaining:?}"
+        );
     } else {
-        eprintln!("MinIO mc did not support version suspend; enabled-versioning coverage passed");
+        eprintln!("S3 fixture did not support version suspend; enabled-versioning coverage passed");
     }
 
-    run_mc(&["rb".to_string(), "--force".to_string(), bucket_path.clone()])
+    run_s3_admin(&config, &["delete-bucket", "--bucket", &bucket])
         .expect("remove isolated versioned test bucket");
 }

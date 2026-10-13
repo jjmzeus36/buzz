@@ -21,6 +21,9 @@ use crate::error::{DbError, Result};
 use crate::Db;
 use buzz_datastore_tracing::datastore_span;
 
+mod approval;
+pub use approval::*;
+
 // -- Token hashing ------------------------------------------------------------
 
 /// Default maximum rows returned by list queries. Callers may request fewer.
@@ -827,6 +830,20 @@ pub async fn create_workflow_run(
     Ok(id)
 }
 
+/// Fetch only a run's workflow ID for fresh authority checks without loading its trace.
+pub async fn get_workflow_run_workflow_id(
+    pool: &PgPool,
+    community_id: CommunityId,
+    id: Uuid,
+) -> Result<Uuid> {
+    sqlx::query_scalar("SELECT workflow_id FROM workflow_runs WHERE community_id = $1 AND id = $2")
+        .bind(community_id.as_uuid())
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("workflow_run {id}")))
+}
+
 /// Fetch a single workflow run by ID, scoped to its community.
 pub async fn get_workflow_run(
     pool: &PgPool,
@@ -1288,6 +1305,16 @@ impl Db {
             trigger_context,
         )
         .await
+    }
+
+    /// Fetch only the workflow ID, scoped to its community, without loading run data.
+    #[datastore_span(name = "get_workflow_run_workflow_id", system = "postgresql")]
+    pub async fn get_workflow_run_workflow_id(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+    ) -> Result<Uuid> {
+        crate::workflow::get_workflow_run_workflow_id(&self.pool, community_id, id).await
     }
 
     /// Fetch a single workflow run, scoped to its community.
