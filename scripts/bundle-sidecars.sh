@@ -31,10 +31,10 @@ fi
 
 missing=()
 for bin in "${SIDECARS[@]}"; do
-    [[ -f "$SRC_DIR/${bin}${EXE}" ]] || missing+=("${bin}${EXE}")
+    [[ -f "$SRC_DIR/${bin}${EXE}" && -s "$SRC_DIR/${bin}${EXE}" ]] || missing+=("${bin}${EXE}")
 done
 if [[ ${#missing[@]} -gt 0 ]]; then
-    echo "Error: missing release binaries in $SRC_DIR: ${missing[*]}" >&2
+    echo "Error: missing or empty release binaries in $SRC_DIR: ${missing[*]}" >&2
     echo "Run '$BUILD_HINT' first." >&2
     exit 1
 fi

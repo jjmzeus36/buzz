@@ -60,6 +60,8 @@ jobs:
               - '.github/workflows/ci.yml'
               - '.github/workflows/_ci-*.yml'
               - 'scripts/run-tests.sh'
+              - 'scripts/bundle-sidecars.sh'
+              - 'scripts/test-bundle-sidecars.sh'
               - 'docker-compose.yml'
               - 'deploy/s3-fixture/**'
               - 'scripts/test-s3-fixture-private.sh'
@@ -101,6 +103,8 @@ jobs:
         run: scripts/test-relay-image-eligibility-workflow.sh
       - name: Desktop release candidate contract
         run: scripts/test-desktop-release-candidate.sh
+      - name: Desktop sidecar bundling contract
+        run: bash scripts/test-bundle-sidecars.sh
       - name: OSS desktop promotion contract
         run: |
           scripts/test-oss-desktop-promotion.sh
