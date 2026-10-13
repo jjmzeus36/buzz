@@ -62,6 +62,9 @@ jobs:
               - 'scripts/run-tests.sh'
               - 'scripts/bundle-sidecars.sh'
               - 'scripts/test-bundle-sidecars.sh'
+              - 'scripts/ensure-s3-fixture.sh'
+              - 'scripts/test-dev-helper-contracts.py'
+              - 'scripts/verify-vendored-neteq.mjs'
               - 'docker-compose.yml'
               - 'deploy/s3-fixture/**'
               - 'scripts/test-s3-fixture-private.sh'
@@ -105,10 +108,13 @@ jobs:
         run: scripts/test-desktop-release-candidate.sh
       - name: Desktop sidecar bundling contract
         run: bash scripts/test-bundle-sidecars.sh
+      - name: Local service and packaging helper contracts
+        run: python3 scripts/test-dev-helper-contracts.py
       - name: OSS desktop promotion contract
         run: |
           scripts/test-oss-desktop-promotion.sh
           scripts/test-oss-desktop-promotion-behavior.sh
+          python3 scripts/test-promote-manifest.py
       - name: Mobile release contract
         run: |
           scripts/test-mobile-release-contract.sh

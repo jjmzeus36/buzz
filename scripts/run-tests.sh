@@ -133,6 +133,9 @@ run_unit_tests() {
   run_test_step "buzz-voice tests" \
     cargo test -p buzz-voice --lib -- --nocapture
 
+  run_required_cargo_test "buzz-media streamed S3 regression tests" \
+    cargo test -p buzz-media --test stream_errors -- --nocapture
+
   run_test_step "buzz-cli tests" \
     cargo test -p buzz-cli -- --nocapture
 
