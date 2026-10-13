@@ -376,6 +376,24 @@ mod tests {
     }
 
     #[test]
+    fn numeric_fields_respect_explicit_string_tags_and_yaml_digit_separators() {
+        for field in ["temperature", "max_context_tokens"] {
+            let yaml = format!(
+                "---\nname: bot\ndisplay_name: Bot\ndescription: Test\n{field}: !!str 42\n---\n"
+            );
+            assert!(
+                parse_persona_md(&yaml).is_err(),
+                "explicit string in {field}"
+            );
+        }
+        let yaml = "---\nname: bot\ndisplay_name: Bot\ndescription: Test\nmax_context_tokens: 1_000\n---\n";
+        assert_eq!(
+            parse_persona_md(yaml).unwrap().max_context_tokens,
+            Some(1000)
+        );
+    }
+
+    #[test]
     fn parse_with_body() {
         let src = "---\nname: bot\ndisplay_name: Bot\ndescription: A bot.\n---\nYou are Bot.\n";
         let p = parse_persona_md(src).unwrap();
