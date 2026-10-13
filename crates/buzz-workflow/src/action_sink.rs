@@ -14,6 +14,9 @@ pub enum ActionSinkError {
     /// An input parameter is malformed (e.g. invalid UUID).
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// Current membership or moderation policy forbids the action.
+    #[error("not authorized: {0}")]
+    Authorization(String),
     /// The target channel does not exist.
     #[error("channel not found: {0}")]
     ChannelNotFound(String),
@@ -46,6 +49,17 @@ impl From<ActionSinkError> for crate::WorkflowError {
 /// Returns `Pin<Box<dyn Future>>` for dyn-compatibility — required because
 /// `WorkflowEngine` stores `Arc<dyn ActionSink>`.
 pub trait ActionSink: Send + Sync {
+    /// Set the workflow channel's topic with current member authority, retaining
+    /// owner attribution and publishing the relay's NIP-29 metadata snapshot.
+    /// The destination is the stored workflow channel, never trigger input.
+    fn set_channel_topic(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        topic: &str,
+        owner_pubkey: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ActionSinkError>> + Send + '_>>;
+
     /// Post a message to a channel on behalf of a workflow owner.
     ///
     /// - `community_id`: the server-resolved community that owns the workflow

@@ -1,6 +1,8 @@
 part of 'channels_provider_test.dart';
 
 void _liveSubscriptionTests() {
+  _canonicalLifecycleTests();
+  _canonicalPendingScopeTest();
   const myPk = 'me';
 
   test(
@@ -56,14 +58,31 @@ void _liveSubscriptionTests() {
 
     final channels = await container.read(channelsProvider.future);
     expect(channels, hasLength(257));
-    await _waitUntil(() => session.subscribeFilters.length == 3);
+    await _waitUntil(() => session.subscribeFilters.length == 6);
 
     expect(
-      session.subscribeFilters.map((filter) => filter.tags['#h']!.length),
+      session.subscribeFilters
+          .where((filter) => filter.tags.containsKey('#h'))
+          .map((filter) => filter.tags['#h']!.length),
       [128, 128, 1],
     );
     expect(
-      session.subscribeFilters.expand((filter) => filter.tags['#h']!).toSet(),
+      session.subscribeFilters
+          .where((filter) => filter.tags.containsKey('#h'))
+          .expand((filter) => filter.tags['#h']!)
+          .toSet(),
+      channelIds.toSet(),
+    );
+    final metadataFilters = session.subscribeFilters.where(
+      (filter) => filter.kinds.contains(39000),
+    );
+    expect(metadataFilters.map((filter) => filter.tags['#d']!.length), [
+      128,
+      128,
+      1,
+    ]);
+    expect(
+      metadataFilters.expand((filter) => filter.tags['#d']!).toSet(),
       channelIds.toSet(),
     );
   });
@@ -85,7 +104,7 @@ void _liveSubscriptionTests() {
       addTearDown(container.dispose);
 
       await container.read(channelsProvider.future);
-      await _waitUntil(() => session.activeSubscriptionCount == 1);
+      await _waitUntil(() => session.activeSubscriptionCount == 2);
       final initialSubscribeCount = session.totalSubscribeCount;
 
       await container.read(channelsProvider.notifier).refresh();
@@ -93,7 +112,7 @@ void _liveSubscriptionTests() {
 
       expect(session.totalSubscribeCount, initialSubscribeCount);
       expect(session.unsubscribeCount, 0);
-      expect(session.subscribeFilters, hasLength(1));
+      expect(session.subscribeFilters, hasLength(2));
     },
   );
 
@@ -108,7 +127,7 @@ void _liveSubscriptionTests() {
     addTearDown(container.dispose);
 
     await container.read(channelsProvider.future);
-    await _waitUntil(() => session.activeSubscriptionCount == 2);
+    await _waitUntil(() => session.activeSubscriptionCount == 4);
 
     session.memberships = [
       for (final id in [...channelIds.take(128), addedId])
@@ -119,10 +138,10 @@ void _liveSubscriptionTests() {
         _meta(id: id, name: id),
     ];
     await container.read(channelsProvider.notifier).refresh();
-    await _waitUntil(() => session.totalSubscribeCount == 3);
+    await _waitUntil(() => session.totalSubscribeCount == 6);
 
-    expect(session.activeSubscriptionCount, 2);
-    expect(session.unsubscribeCount, 1);
+    expect(session.activeSubscriptionCount, 4);
+    expect(session.unsubscribeCount, 2);
     expect(session.activeChannels, {...channelIds.take(128), addedId});
   });
 
@@ -140,7 +159,7 @@ void _liveSubscriptionTests() {
       final container = _buildContainer(session: session);
       addTearDown(container.dispose);
       await container.read(channelsProvider.future);
-      await _waitUntil(() => session.activeSubscriptionCount == 2);
+      await _waitUntil(() => session.activeSubscriptionCount == 4);
 
       session.memberships.add(_membership(addedId, myPk));
       session.metadata.add(_meta(id: addedId, name: addedId));
@@ -163,9 +182,9 @@ void _liveSubscriptionTests() {
       } finally {
         session.resumePausedSubscribe();
       }
-      await _waitUntil(() => session.unsubscribeCount == 2);
-      expect(session.totalSubscribeCount, 4);
-      expect(session.activeSubscriptionCount, 2);
+      await _waitUntil(() => session.unsubscribeCount == 4);
+      expect(session.totalSubscribeCount, 8);
+      expect(session.activeSubscriptionCount, 4);
       expect(session.activeChannels, {...channelIds, addedId});
     },
   );
@@ -186,7 +205,7 @@ void _liveSubscriptionTests() {
       final container = _buildContainer(session: session);
       addTearDown(container.dispose);
       await container.read(channelsProvider.future);
-      await _waitUntil(() => session.activeSubscriptionCount == 1);
+      await _waitUntil(() => session.activeSubscriptionCount == 2);
       session.memberships = [
         _membership(_channelB, myPk),
         _membership(_channelD, myPk),
@@ -216,9 +235,9 @@ void _liveSubscriptionTests() {
       );
 
       await container.read(channelsProvider.notifier).refresh();
-      await _waitUntil(() => session.unsubscribeCount == 1);
+      await _waitUntil(() => session.unsubscribeCount == 2);
       expect(session.activeChannels, {_channelB, _channelD});
-      expect(session.activeSubscriptionCount, 1);
+      expect(session.activeSubscriptionCount, 2);
     },
   );
 
@@ -236,7 +255,7 @@ void _liveSubscriptionTests() {
       final container = _buildContainer(session: session);
       addTearDown(container.dispose);
       await container.read(channelsProvider.future);
-      await _waitUntil(() => session.activeSubscriptionCount == 2);
+      await _waitUntil(() => session.activeSubscriptionCount == 4);
 
       session.memberships.add(_membership(addedId, myPk));
       session.metadata.add(_meta(id: addedId, name: addedId));
@@ -259,7 +278,7 @@ void _liveSubscriptionTests() {
       await _waitUntil(() => session.activeChannels.contains(addedId));
 
       expect(session.activeChannels, containsAll({...channelIds, addedId}));
-      expect(session.activeSubscriptionCount, 2);
+      expect(session.activeSubscriptionCount, 4);
     },
   );
 
@@ -274,7 +293,7 @@ void _liveSubscriptionTests() {
       final container = _buildContainer(session: session);
       addTearDown(container.dispose);
       await container.read(channelsProvider.future);
-      await _waitUntil(() => session.activeSubscriptionCount == 2);
+      await _waitUntil(() => session.activeSubscriptionCount == 4);
 
       for (var cycle = 0; cycle < 7; cycle++) {
         final addedId = _generatedChannelId(99 - cycle);
@@ -290,7 +309,7 @@ void _liveSubscriptionTests() {
         await container.read(channelsProvider.notifier).refresh();
         await _settle();
         expect(session.activeChannels, containsAll(channelIds));
-        expect(session.activeSubscriptionCount, lessThanOrEqualTo(3));
+        expect(session.activeSubscriptionCount, lessThanOrEqualTo(6));
       }
     },
   );
@@ -305,7 +324,7 @@ void _liveSubscriptionTests() {
       final container = _buildContainer(session: session);
       addTearDown(container.dispose);
       await container.read(channelsProvider.future);
-      await _waitUntil(() => session.activeSubscriptionCount == 1);
+      await _waitUntil(() => session.activeSubscriptionCount == 2);
       session.memberships.add(_membership(_channelB, myPk));
       session.metadata.add(_meta(id: _channelB, name: 'b'));
       session.pauseNextSubscribe();
@@ -320,7 +339,7 @@ void _liveSubscriptionTests() {
       } finally {
         session.resumePausedSubscribe();
       }
-      await _waitUntil(() => session.unsubscribeCount == 2);
+      await _waitUntil(() => session.unsubscribeCount == 3);
       expect(session.activeChannels, isEmpty);
       expect(session.activeSubscriptionCount, 0);
     },
@@ -333,7 +352,7 @@ void _liveSubscriptionTests() {
     );
     final container = _buildContainer(session: session);
     await container.read(channelsProvider.future);
-    await _waitUntil(() => session.activeSubscriptionCount == 1);
+    await _waitUntil(() => session.activeSubscriptionCount == 2);
     session.memberships.add(_membership(_channelB, myPk));
     session.metadata.add(_meta(id: _channelB, name: 'b'));
     session.pauseNextSubscribe();
@@ -341,7 +360,7 @@ void _liveSubscriptionTests() {
     await session.nextSubscribeStarted;
     container.dispose();
     session.resumePausedSubscribe();
-    await _waitUntil(() => session.unsubscribeCount == 2);
+    await _waitUntil(() => session.unsubscribeCount == 3);
     expect(session.activeSubscriptionCount, 0);
   });
 
@@ -357,7 +376,7 @@ void _liveSubscriptionTests() {
     addTearDown(container.dispose);
 
     await container.read(channelsProvider.future);
-    await _waitUntil(() => session.activeSubscriptionCount == 1);
+    await _waitUntil(() => session.activeSubscriptionCount == 2);
     session.memberships = [];
     session.metadata = [];
 
@@ -365,7 +384,7 @@ void _liveSubscriptionTests() {
     await _waitUntil(() => session.activeSubscriptionCount == 0);
 
     expect(session.activeChannels, isEmpty);
-    expect(session.unsubscribeCount, 1);
+    expect(session.unsubscribeCount, 2);
   });
 
   test(
@@ -393,10 +412,10 @@ void _liveSubscriptionTests() {
       await container.read(channelsProvider.future);
 
       session.resumePausedSubscribe();
-      await _waitUntil(() => session.activeChannels.contains(_channelB));
+      await _waitUntil(() => session.activeSubscriptionCount == 2);
 
       expect(session.activeChannels, {_channelB});
-      expect(session.activeSubscriptionCount, 1);
+      expect(session.activeSubscriptionCount, 2);
       expect(session.unsubscribeCount, 1);
     },
   );
@@ -413,3 +432,222 @@ NostrEvent _liveMessage(String channelId) => NostrEvent(
   content: 'live update',
   sig: 'sig',
 );
+
+void _canonicalLifecycleTests() {
+  test(
+    'metadata REQs share bounded member scope and deletion unsubscribes both filters',
+    () async {
+      final session = _FakeRelaySession(
+        memberships: [
+          _membership(_channelA, 'me'),
+          _membership(_channelD, 'me'),
+        ],
+        metadata: [
+          _meta(id: _channelA, name: 'a', visibility: 'private'),
+          _meta(id: _channelB, name: 'public non-member'),
+          _meta(id: _channelD, name: 'archived', archived: true),
+        ],
+      );
+      final container = _buildContainer(session: session);
+      addTearDown(container.dispose);
+      await container.read(channelsProvider.future);
+      await _waitUntil(() => session.activeSubscriptionCount == 2);
+      final metadataFilter = session.subscribeFilters.singleWhere(
+        (filter) => filter.kinds.contains(39000),
+      );
+      expect(metadataFilter.tags, {
+        '#d': [_channelA],
+      });
+      expect(metadataFilter.kinds, [39000]);
+      expect(metadataFilter.limit, 0);
+      final callbacks = [
+        for (final (_, callback, _) in session._subscriptions.values) callback,
+      ];
+      final initialRequests = session.membershipRequestCount;
+      session.emit(_meta(id: _channelB, name: 'foreign public metadata'));
+      session.emit(
+        NostrEvent(
+          id: 'wrong-kind',
+          pubkey: 'relay',
+          createdAt: 30,
+          kind: EventKind.systemMessage,
+          tags: [
+            ['d', _channelA],
+          ],
+          content: '{}',
+          sig: 'sig',
+        ),
+      );
+      await _settle();
+      expect(session.membershipRequestCount, initialRequests);
+      session.memberships = [];
+      session.metadata = [];
+      await container.read(channelsProvider.notifier).refresh();
+      await _waitUntil(() => session.activeSubscriptionCount == 0);
+      expect(session.unsubscribeCount, 2);
+      final requests = session.membershipRequestCount;
+      for (final callback in callbacks) {
+        callback(_meta(id: _channelA, name: 'late', topic: 'late'));
+        callback(_topicNotice('late'));
+      }
+      await _settle();
+      expect(session.membershipRequestCount, requests);
+      expect(container.read(channelsProvider).requireValue, isEmpty);
+    },
+  );
+
+  test(
+    'community switch fences retired metadata callbacks with the same channel id',
+    () async {
+      final session = _FakeRelaySession(
+        memberships: [_membership(_channelA, 'me')],
+        metadata: [_meta(id: _channelA, name: 'a', topic: 'old community')],
+      );
+      final container = _buildContainer(session: session);
+      addTearDown(container.dispose);
+      await container.read(channelsProvider.future);
+      await _waitUntil(() => session.activeSubscriptionCount == 2);
+      final callback = session._subscriptions.values
+          .singleWhere((entry) => entry.$1.kinds.contains(39000))
+          .$2;
+      session.metadata = [
+        _meta(id: _channelA, name: 'a', topic: 'new community'),
+      ];
+      container
+          .read(relayConfigProvider.notifier)
+          .update(baseUrl: 'https://new-community.example');
+      await container.read(channelsProvider.future);
+      await _waitUntil(() => session.totalSubscribeCount == 4);
+      final details = await container.read(
+        channelDetailsProvider(_channelA).future,
+      );
+      final requests = session.membershipRequestCount;
+      callback(_meta(id: _channelA, name: 'late', topic: 'old community'));
+      await _settle();
+      expect(session.membershipRequestCount, requests);
+      expect(
+        await container.read(channelDetailsProvider(_channelA).future),
+        same(details),
+      );
+      expect(session.activeSubscriptionCount, 2);
+      expect(session.unsubscribeCount, 2);
+    },
+  );
+
+  test(
+    'disposal retires the message half while metadata readiness is pending',
+    () async {
+      final session = _FakeRelaySession(
+        memberships: [_membership(_channelA, 'me')],
+        metadata: [_meta(id: _channelA, name: 'a')],
+      );
+      session.pauseNextSubscribe(metadata: true);
+      final container = _buildContainer(session: session);
+      await container.read(channelsProvider.future);
+      await session.nextSubscribeStarted;
+      expect(session.activeSubscriptionCount, 1);
+      final callback = session._subscriptions.values.single.$2;
+      container.dispose();
+      expect(session.activeSubscriptionCount, 0);
+      final requests = session.membershipRequestCount;
+      callback(_topicNotice('late'));
+      session.resumePausedSubscribe();
+      await _waitUntil(() => session.unsubscribeCount == 2);
+      expect(session.activeSubscriptionCount, 0);
+      expect(session.membershipRequestCount, requests);
+    },
+  );
+
+  test(
+    'metadata admission failure tears down its message half and can retry',
+    () async {
+      final session = _FakeRelaySession(
+        memberships: [_membership(_channelA, 'me')],
+        metadata: [_meta(id: _channelA, name: 'a')],
+      );
+      session.metadataSubscribeFailures = 1;
+      final container = _buildContainer(session: session);
+      addTearDown(container.dispose);
+      await container.read(channelsProvider.future);
+      await _waitUntil(() => session.unsubscribeCount == 1);
+      expect(session.activeSubscriptionCount, 0);
+      await container.read(channelsProvider.notifier).refresh();
+      await _waitUntil(() => session.activeSubscriptionCount == 2);
+      expect(session.totalSubscribeCount, 4);
+    },
+  );
+
+  test(
+    'terminal metadata closure retires both filters until reconnect',
+    () async {
+      final session = _FakeRelaySession(
+        memberships: [_membership(_channelA, 'me')],
+        metadata: [_meta(id: _channelA, name: 'a')],
+      );
+      final container = _buildContainer(session: session);
+      addTearDown(container.dispose);
+      await container.read(channelsProvider.future);
+      await _waitUntil(() => session.activeSubscriptionCount == 2);
+      final callback = session._subscriptions.values
+          .singleWhere((entry) => entry.$1.kinds.contains(39000))
+          .$2;
+      session.closeSubscriptionContaining(
+        _channelA,
+        'restricted: terminal metadata',
+        metadata: true,
+      );
+      expect(session.activeSubscriptionCount, 0);
+      final requests = session.membershipRequestCount;
+      callback(_meta(id: _channelA, name: 'late'));
+      await _settle();
+      expect(session.membershipRequestCount, requests);
+      await container.read(channelsProvider.notifier).refresh();
+      await _settle();
+      expect(session.totalSubscribeCount, 2);
+      session.setStatus(SessionStatus.disconnected);
+      session.setStatus(SessionStatus.connected);
+      await _waitUntil(() => session.activeSubscriptionCount == 2);
+      expect(session.totalSubscribeCount, 4);
+    },
+  );
+}
+
+// A second filter can be awaiting readiness after its message sibling is live.
+void _canonicalPendingScopeTest() {
+  test(
+    'community switch retires metadata subscription pending readiness',
+    () async {
+      final session = _FakeRelaySession(
+        memberships: [_membership(_channelA, 'me')],
+        metadata: [_meta(id: _channelA, name: 'a')],
+      );
+      session.pauseNextSubscribe(metadata: true);
+      final container = _buildContainer(session: session);
+      addTearDown(container.dispose);
+      await container.read(channelsProvider.future);
+      await session.nextSubscribeStarted;
+      final oldMessage = session._subscriptions.values.single.$2;
+      session.memberships = [_membership(_channelB, 'me')];
+      session.metadata = [_meta(id: _channelB, name: 'b')];
+      container
+          .read(relayConfigProvider.notifier)
+          .update(baseUrl: 'https://new-community.example');
+      await container.read(channelsProvider.future);
+      expect(session.activeChannels, isEmpty);
+      final requests = session.membershipRequestCount;
+      oldMessage(_topicNotice('retired'));
+      session.resumePausedSubscribe();
+      await _waitUntil(() => session.activeSubscriptionCount == 2);
+      expect(session.unsubscribeCount, 2);
+      expect(session.activeChannels, {_channelB});
+      expect(
+        session.subscribeFilters
+            .singleWhere((filter) => filter.kinds.contains(39000))
+            .tags['#d'],
+        [_channelB],
+      );
+      await _settle();
+      expect(session.membershipRequestCount, requests);
+    },
+  );
+}

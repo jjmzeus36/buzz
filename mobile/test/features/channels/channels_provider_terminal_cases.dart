@@ -25,7 +25,7 @@ void _terminalSubscriptionTests() {
             container.read(channelsProvider).requireValue.single.id,
             _channelA,
           );
-          expect(session.totalSubscribeCount, 1);
+          expect(session.totalSubscribeCount, beforeReady ? 1 : 2);
           final initialMemberships = session.membershipRequestCount;
           clock.elapse(const Duration(milliseconds: 2));
           final historyAfterClose = session.historyFilters.length;
@@ -40,7 +40,7 @@ void _terminalSubscriptionTests() {
           expect(session.membershipRequestCount, initialMemberships);
           expect(session.historyFilters.length, historyAfterClose);
           expect(session.queryBatches.length, batchesAfterClose);
-          expect(session.totalSubscribeCount, 1);
+          expect(session.totalSubscribeCount, beforeReady ? 1 : 2);
           expect(logs.length, logsAfterClose);
           expect(clock.periodicTimerCount, 1);
           expect(clock.nonPeriodicTimerCount, 0);
@@ -50,7 +50,7 @@ void _terminalSubscriptionTests() {
           final pollStart = session.membershipRequestCount;
           for (var i = 0; i < 3; i++) {
             clock.elapse(const Duration(seconds: 60));
-            expect(session.totalSubscribeCount, 1);
+            expect(session.totalSubscribeCount, beforeReady ? 1 : 2);
             expect(session.activeSubscriptionCount, 0);
             expect(logs.length, logsAfterClose);
             expect(clock.periodicTimerCount, 1);
@@ -66,7 +66,7 @@ void _terminalSubscriptionTests() {
           unawaited(container.read(channelsProvider.notifier).refresh());
           clock.flushMicrotasks();
           clock.elapse(const Duration(milliseconds: 2));
-          expect(session.totalSubscribeCount, 1);
+          expect(session.totalSubscribeCount, beforeReady ? 1 : 2);
           expect(logs.length, logsAfterClose);
         } finally {
           container.dispose();
@@ -74,7 +74,7 @@ void _terminalSubscriptionTests() {
         }
         clock.elapse(const Duration(seconds: 60));
         expect(clock.pendingTimers, isEmpty);
-        expect(session.totalSubscribeCount, 1);
+        expect(session.totalSubscribeCount, beforeReady ? 1 : 2);
       },
     );
   }
@@ -90,7 +90,7 @@ void _terminalSubscriptionTests() {
         final requests = session.membershipRequestCount;
         container.dispose();
         clock.elapse(const Duration(minutes: 3));
-        expect(session.totalSubscribeCount, 1);
+        expect(session.totalSubscribeCount, beforeReady ? 1 : 2);
         expect(session.membershipRequestCount, requests);
         expect(session.activeSubscriptionCount, 0);
         expect(clock.pendingTimers, isEmpty);
@@ -115,7 +115,7 @@ void _terminalSubscriptionTests() {
         clock.flushMicrotasks();
         clock.elapse(const Duration(milliseconds: 2));
         clock.elapse(const Duration(milliseconds: 20));
-        expect(session.totalSubscribeCount, attempt);
+        expect(session.totalSubscribeCount, attempt * 2);
         expect(session.rejectionCount, attempt);
         expect(session.activeSubscriptionCount, 0);
         expect(
@@ -128,12 +128,12 @@ void _terminalSubscriptionTests() {
       clock.flushMicrotasks();
       session.setStatus(SessionStatus.connected);
       clock.flushMicrotasks();
-      expect(session.totalSubscribeCount, 5);
+      expect(session.totalSubscribeCount, 10);
       expect(session.activeChannels, {_channelA});
       oldClosed();
       clock.flushMicrotasks();
       expect(session.activeChannels, {_channelA});
-      expect(session.totalSubscribeCount, 5);
+      expect(session.totalSubscribeCount, 10);
     } finally {
       container.dispose();
     }
@@ -154,14 +154,14 @@ void _terminalSubscriptionTests() {
         session.metadata.add(_meta(id: _channelB, name: 'b'));
         unawaited(container.read(channelsProvider.notifier).refresh());
         clock.flushMicrotasks();
-        expect(session.totalSubscribeCount, 2);
+        expect(session.totalSubscribeCount, 4);
         expect(session.activeChannels, {_channelA, _channelB});
         // Removing then rejoining is a meaningful transition even if it returns
         // to an earlier filter; obsolete quarantine keys must not leak forever.
         session.memberships.removeLast();
         unawaited(container.read(channelsProvider.notifier).refresh());
         clock.flushMicrotasks();
-        expect(session.totalSubscribeCount, 3);
+        expect(session.totalSubscribeCount, 6);
         expect(session.activeChannels, {_channelA});
       } finally {
         container.dispose();
@@ -191,7 +191,7 @@ void _terminalSubscriptionTests() {
           }
           container.read(channelsProvider);
           clock.flushMicrotasks();
-          expect(session.totalSubscribeCount, 2);
+          expect(session.totalSubscribeCount, 4);
           expect(session.activeChannels, {_channelA});
         } finally {
           container.dispose();

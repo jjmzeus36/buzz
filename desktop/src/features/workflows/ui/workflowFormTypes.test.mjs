@@ -315,3 +315,37 @@ test("absent reply_in_thread parses as false", () => {
   assert.equal(parsed.ok, true);
   assert.equal(parsed.state.steps[0].replyInThread, false);
 });
+
+test("topic form preserves explicit clear, Unicode, whitespace, and templates", () => {
+  for (const topic of ["", "  ", "Cafe\u0301 ??\n  ", "{{trigger.text}}"]) {
+    const state = {
+      ...DEFAULT_FORM_STATE,
+      name: "Topic update",
+      trigger: { on: "webhook" },
+      steps: [{ id: "topic", action: "set_channel_topic", topic }],
+    };
+    const yaml = formStateToYaml(state);
+    assert.equal(parseYaml(yaml).steps[0].topic, topic);
+    assert.equal(accepted(yaml).steps[0].topic, topic);
+  }
+  const blank = {
+    ...DEFAULT_FORM_STATE,
+    name: "Clear topic",
+    steps: [{ id: "topic", action: "set_channel_topic" }],
+  };
+  assert.equal(parseYaml(formStateToYaml(blank)).steps[0].topic, "");
+});
+
+test("topic YAML still rejects missing or non-string values", () => {
+  for (const topicField of [
+    "",
+    "    topic: null\n",
+    "    topic: 3\n",
+    "    topic: true\n",
+  ]) {
+    const result = yamlToFormState(
+      `name: Invalid topic\ntrigger:\n  on: webhook\nsteps:\n  - id: topic\n    action: set_channel_topic\n${topicField}`,
+    );
+    assert.equal(result.ok, false);
+  }
+});
