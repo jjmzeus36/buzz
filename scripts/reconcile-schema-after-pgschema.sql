@@ -693,3 +693,10 @@ BEGIN
         RAISE EXCEPTION 'events primary key has an unexpected shape after pgschema apply: %', actual_columns;
     END IF;
 END $$;
+
+-- Metadata refresh intents are source-transaction state, including fresh desired schemas.
+SELECT attach_community_write_fence('channel_metadata_refresh'::regclass);
+INSERT INTO channel_metadata_refresh (community_id, channel_id)
+SELECT c.community_id, c.id FROM channels c JOIN communities t ON t.id = c.community_id
+WHERE c.deleted_at IS NULL AND t.archived_at IS NULL AND t.deletion_state = 'active'
+ON CONFLICT (community_id, channel_id) DO NOTHING;

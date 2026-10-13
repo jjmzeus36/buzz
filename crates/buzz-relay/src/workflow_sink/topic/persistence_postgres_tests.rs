@@ -66,6 +66,48 @@ async fn workflow_topic_real_insert_failure_rolls_back_and_metadata_failure_fail
             // is reported as failed execution, never a completed step.
             assert_eq!(after.topic.as_deref(), Some("new"));
             assert_eq!(notices_after.len(), notices_before.len() + 1);
+
+            // A later source change must win recovery: never replay the failed
+            // historical workflow action (or create another system notice).
+            state
+                .db
+                .set_topic(community, channel, "newest", &owner.public_key().to_bytes())
+                .await
+                .unwrap();
+            let claimed = state.db.claim_metadata_refreshes().await.unwrap();
+            assert!(claimed
+                .iter()
+                .any(|claim| claim.community_id == community && claim.channel_id == channel));
+            // Simulate a process exiting after its claim commits. Expiration
+            // makes the durable work available to a fresh worker invocation.
+            let mut expiry = state.db.begin_event_write_transaction().await.unwrap();
+            sqlx::query("UPDATE channel_metadata_refresh SET lease_until = NOW() - INTERVAL '1 second' WHERE community_id = $1 AND channel_id = $2")
+                .bind(community.as_uuid()).bind(channel).execute(&mut *expiry).await.unwrap();
+            expiry.commit().await.unwrap();
+            crate::metadata_refresh::refresh_pending_metadata(&state)
+                .await
+                .unwrap();
+            let recovered = events(&state, community, channel, KIND_NIP29_GROUP_METADATA).await;
+            assert_eq!(recovered.len(), 1);
+            recovered[0].event.verify().unwrap();
+            assert!(recovered[0]
+                .event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["topic", "newest"]));
+            assert_eq!(
+                events(&state, community, channel, KIND_SYSTEM_MESSAGE)
+                    .await
+                    .len(),
+                notices_after.len()
+            );
+            assert!(state
+                .db
+                .claim_metadata_refreshes()
+                .await
+                .unwrap()
+                .iter()
+                .all(|claim| claim.community_id != community || claim.channel_id != channel));
         }
     }
 }

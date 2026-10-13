@@ -22,6 +22,8 @@ pub struct LockedMetadataSnapshot {
     community_id: CommunityId,
     channel_id: Uuid,
     relay_pubkey: Vec<u8>,
+    refresh_version: Option<i64>,
+    replacement_persisted: bool,
     tx: Transaction<'static, Postgres>,
 }
 
@@ -146,6 +148,7 @@ impl LockedMetadataSnapshot {
             Some(self.channel_id),
         )
         .await?;
+        self.replacement_persisted = true;
         Ok((
             StoredEvent::with_received_at(event.clone(), received_at, Some(self.channel_id), true),
             true,
@@ -154,7 +157,22 @@ impl LockedMetadataSnapshot {
 
     /// Commit the discovery replacement and release all snapshot locks.
     pub async fn release(self) -> Result<()> {
-        self.tx.commit().await?;
+        let mut tx = self.tx;
+        if let Some(version) = self.refresh_version.filter(|_| self.replacement_persisted) {
+            // The generation was captured BEFORE source reads. A mutation
+            // committed afterwards cannot be acknowledged by this snapshot.
+            sqlx::query(
+                "UPDATE channel_metadata_refresh \
+                 SET completed_version = GREATEST(completed_version, $3) \
+                 WHERE community_id = $1 AND channel_id = $2",
+            )
+            .bind(self.community_id.as_uuid())
+            .bind(self.channel_id)
+            .bind(version)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -176,6 +194,16 @@ pub async fn lock_metadata_snapshot(
     )
     .await?;
     let mut tx = Transaction::begin(connection, None).await?;
+    // Never read this after capturing participants: a concurrent member write
+    // could then advance the generation beyond the captured source snapshot.
+    let refresh_version: Option<i64> = sqlx::query_scalar(
+        "SELECT requested_version FROM channel_metadata_refresh \
+         WHERE community_id = $1 AND channel_id = $2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     let replacement_lock = crate::replaceable::event_replacement_lock_key(
         community_id,
         buzz_core::kind::KIND_NIP29_GROUP_METADATA as i32,
@@ -193,6 +221,18 @@ pub async fn lock_metadata_snapshot(
         .bind(community_id.as_uuid())
         .execute(&mut *tx)
         .await?;
+    let active: Option<bool> = sqlx::query_scalar(
+        "SELECT TRUE FROM communities WHERE id = $1 AND archived_at IS NULL \
+         AND deleted_at IS NULL AND deletion_state = 'active' FOR SHARE",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_optional(&mut *tx)
+    .await?;
+    if active != Some(true) {
+        return Err(DbError::AccessDenied(
+            "metadata publication requires an active community".into(),
+        ));
+    }
     sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))")
         .bind(format!(
             "buzz_channel_ttl:{}:{}",
@@ -238,6 +278,8 @@ pub async fn lock_metadata_snapshot(
         community_id,
         channel_id,
         relay_pubkey: relay_pubkey.to_vec(),
+        refresh_version,
+        replacement_persisted: false,
         tx,
     })
 }
