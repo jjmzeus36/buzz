@@ -1,4 +1,4 @@
-//! Transaction-held moderation authority for workflow topic source writes.
+//! Transaction-held moderation authority for canonical channel source writes.
 
 use buzz_core::CommunityId;
 use sqlx::{Postgres, Transaction};
@@ -16,6 +16,18 @@ pub(super) async fn lock_unrestricted_principal(
     community: CommunityId,
     principal: &[u8],
 ) -> Result<()> {
+    lock_unrestricted_principal_with_owner(tx, community, principal, None).await
+}
+
+/// Include a cryptographically proven owner even when optional user mapping
+/// materialization failed. This trusted value supplements persisted ownership;
+/// it never replaces it, and owner timeouts still do not restrict the agent.
+pub(super) async fn lock_unrestricted_principal_with_owner(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+    principal: &[u8],
+    trusted_owner: Option<&[u8]>,
+) -> Result<()> {
     sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2) ON CONFLICT DO NOTHING")
         .bind(community.as_uuid())
         .bind(principal)
@@ -31,6 +43,9 @@ pub(super) async fn lock_unrestricted_principal(
     let mut keys = vec![principal.to_vec()];
     if let Some(owner) = owner {
         keys.push(owner);
+    }
+    if let Some(owner) = trusted_owner {
+        keys.push(owner.to_vec());
     }
     // Both creation and share locking use the same order; agents can share an
     // owner or refer to another principal, so unordered inserts can deadlock.

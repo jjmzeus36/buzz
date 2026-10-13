@@ -69,3 +69,6 @@ pub use reminder::DueReminder;
 pub use usage::UsageMetricsLeader;
 
 use buzz_core::CommunityId;
+
+/// Atomic accepted NIP-29 channel commands.
+pub use store::channel_command;
